@@ -1,0 +1,297 @@
+"""Read and optionally plot Langmuir XY-plane NPZ output files.
+
+Invocation examples:
+
+    python read_langmuir_xy_npz.py path/to/run_langmuir_xy.npz
+    python read_langmuir_xy_npz.py path/to/run_langmuir_xy.npz --plot
+
+The first form prints a compact inventory and Te-fit quality counts. The
+``--plot`` form also opens a quick four-panel summary plot with poor Te fits
+marked on the Te map.
+
+Useful exported arrays:
+
+    source_file, geometry
+        Input filename and geometry marker.
+    scale_to_interferometer_density, interferometer_line_averaged_density_m3
+        Interferometer density scaling settings used by the analysis.
+    x_cm, y_cm
+        One-dimensional coordinate axes.
+    X_cm, Y_cm
+        Two-dimensional spatial coordinate meshes with the same shape as the
+        XY maps.
+    time_s
+        Time axis for the XY-plane sequence.
+
+    te_eV, vp_V, vf_V, ies_A, iis_A, isat_A, n_e_m3
+        Primary exported maps reflecting the processing choices in
+        ``langmuir_xy_analysis.py``. Here ``ies`` is electron saturation current and
+        ``iis`` is ion saturation current.
+    te_raw_eV, vp_raw_V, vf_raw_V, ies_raw_A, iis_raw_A, n_e_raw_m3
+        Raw extracted maps before optional neighbor smoothing or spike cleanup.
+    te_processed_eV, vp_processed_V, vf_processed_V, ies_processed_A,
+    iis_processed_A, n_e_processed_m3
+        Post-processed maps.
+    vp_spike_mask
+        Binary spike rejection mask for plasma potential.
+
+    vsweep_mean_V, isweep_mean_A
+        Mean voltage/current traces for the XY-plane dataset.
+    vsweep_mean_smoothed_V, isweep_mean_smoothed_A
+        Smoothed mean traces.
+    isweep_dc_offsets_A
+        DC offsets applied to each sweep when ``subtract_dc`` was enabled.
+
+    iv_voltage_grid_V, iv_current_grid_A, iv_didv_grid_A_per_V, iv_te_fit_mask
+        Per-location interpolated I-V curves and Te fit masks.
+
+    te_fit_r2, te_fit_rmse_logI, te_fit_npts,
+    te_fit_vstart_V, te_fit_vstop_V, te_fit_slope_logI_per_V,
+    te_fit_intercept_logI, te_fit_i0_A, te_subtract_i0,
+    te_fit_passed_r2, te_fit_candidate_count
+        Te fit diagnostics and selection metadata.
+
+    xy_shape_info, trace_spatial_shape, dt_s, te_min_r2
+        Geometry and diagnostic metadata.
+
+    summary_plot_path, all_iv_plot_path
+        Saved file paths for diagnostic plots.
+    summary_plot_png, all_iv_curves_plot_png
+        Optional PNG bytes when plot generation was enabled.
+
+All map-like arrays use ``(ny, nx)`` indexing. Per-trace I-V arrays use
+``(ny, nx, iv_npts)`` indexing.
+
+From another Python script:
+
+    from read_langmuir_xy_npz import load_langmuir_xy_npz
+
+    data = load_langmuir_xy_npz("path/to/run_langmuir_xy.npz")
+    X = data["X_cm"]
+    Y = data["Y_cm"]
+    te = data["te_eV"]
+    vp = data["vp_V"]
+    vf = data["vf_V"]
+    # etc.
+"""
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+
+EXPECTED_LANGMUIR_XY_NPZ_KEYS = {
+    "source_file",
+    "geometry",
+    "x_cm",
+    "y_cm",
+    "X_cm",
+    "Y_cm",
+    "time_s",
+    "te_eV",
+    "vp_V",
+    "vf_V",
+    "ies_A",
+    "iis_A",
+    "isat_A",
+    "te_raw_eV",
+    "vp_raw_V",
+    "vf_raw_V",
+    "ies_raw_A",
+    "iis_raw_A",
+    "n_e_raw_m3",
+    "te_processed_eV",
+    "vp_processed_V",
+    "vf_processed_V",
+    "ies_processed_A",
+    "iis_processed_A",
+    "n_e_processed_m3",
+    "vp_spike_mask",
+    "vsweep_mean_V",
+    "isweep_mean_A",
+    "vsweep_mean_smoothed_V",
+    "isweep_mean_smoothed_A",
+    "iv_voltage_grid_V",
+    "iv_current_grid_A",
+    "iv_didv_grid_A_per_V",
+    "iv_te_fit_mask",
+    "te_fit_r2",
+    "te_fit_rmse_logI",
+    "te_fit_npts",
+    "te_fit_vstart_V",
+    "te_fit_vstop_V",
+    "te_fit_slope_logI_per_V",
+    "te_fit_intercept_logI",
+    "te_fit_i0_A",
+    "te_subtract_i0",
+    "te_fit_passed_r2",
+    "te_fit_candidate_count",
+    "xy_shape_info",
+    "n_e_m3",
+    "trace_spatial_shape",
+    "dt_s",
+    "te_min_r2",
+    "summary_plot_path",
+    "all_iv_plot_path",
+}
+OPTIONAL_LANGMUIR_XY_NPZ_KEYS = {
+    "summary_plot_png",
+    "all_iv_curves_plot_png",
+    "isweep_dc_offsets_A",
+    "scale_to_interferometer_density",
+    "interferometer_line_averaged_density_m3",
+}
+KNOWN_LANGMUIR_XY_NPZ_KEYS = EXPECTED_LANGMUIR_XY_NPZ_KEYS | OPTIONAL_LANGMUIR_XY_NPZ_KEYS
+
+
+def validate_langmuir_xy_npz(data):
+    """Validate loaded XY-plane NPZ contents against the expected schema."""
+    keys = set(data.keys())
+    missing = EXPECTED_LANGMUIR_XY_NPZ_KEYS - keys
+    extra = keys - KNOWN_LANGMUIR_XY_NPZ_KEYS
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing keys: {sorted(missing)}")
+        if extra:
+            details.append(f"unknown keys: {sorted(extra)}")
+        raise ValueError(
+            "Loaded NPZ file does not conform to expected Langmuir XY-plane schema: "
+            + "; ".join(details)
+        )
+    return data
+
+
+def load_langmuir_xy_npz(path):
+    """Load a Langmuir XY-plane .npz file into an in-memory dictionary."""
+    with np.load(path, allow_pickle=False) as npz:
+        data = {key: npz[key] for key in npz.files}
+    return validate_langmuir_xy_npz(data)
+
+
+def _scalar_text(value):
+    arr = np.asarray(value)
+    if arr.shape == ():
+        return str(arr.item())
+    return str(arr)
+
+
+def print_summary(data):
+    """Print a compact summary of a loaded Langmuir XY-plane NPZ result."""
+    print(f"source_file: {_scalar_text(data.get('source_file', ''))}")
+    print(f"geometry: {_scalar_text(data.get('geometry', ''))}")
+    if "scale_to_interferometer_density" in data:
+        print(
+            "scale_to_interferometer_density: "
+            f"{_scalar_text(data['scale_to_interferometer_density'])}"
+        )
+    if "interferometer_line_averaged_density_m3" in data:
+        print(
+            "interferometer_line_averaged_density_m3: "
+            f"{_scalar_text(data['interferometer_line_averaged_density_m3'])}"
+        )
+
+    for key in ("X_cm", "Y_cm", "te_eV", "vp_V", "vf_V", "ies_A", "iis_A", "n_e_m3", "te_fit_r2"):
+        if key in data:
+            arr = data[key]
+            print(f"{key}: shape={arr.shape}, dtype={arr.dtype}")
+
+    if "te_fit_r2" in data:
+        min_r2 = float(np.asarray(data.get("te_min_r2", 0.90)))
+        good = np.isfinite(data["te_fit_r2"])
+        poor = good & (data["te_fit_r2"] < min_r2)
+        print(f"finite Te fits: {np.count_nonzero(good)}")
+        print(f"Te fits below R^2 {min_r2:.2f}: {np.count_nonzero(poor)}")
+
+
+def plot_summary(data):
+    """Make a summary plot matching langmuir_xy_analysis.render_summary_plot."""
+    import matplotlib.pyplot as plt
+
+    X = data["X_cm"]
+    Y = data["Y_cm"]
+    panels = [
+        ((0, 0), "te_eV", "Electron Temperature", "T_e (eV)"),
+        ((0, 1), "vp_V", "Plasma Potential", "V_p (V)"),
+        ((1, 0), "vf_V", "Floating Potential", "V_f (V)"),
+        ((1, 1), "ies_A", "Electron Saturation Current", "I_es (A)"),
+        ((2, 0), "iis_A", "Ion Saturation Current", "I_is (A)"),
+        ((2, 1), "n_e_m3", "Electron Density", "n_e (m^-3)"),
+    ]
+
+    fig, axs = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
+
+    for (row, col), key, title, label in panels:
+        ax = axs[row, col]
+        if key not in data:
+            ax.axis("off")
+            continue
+
+        mesh = ax.pcolormesh(X, Y, data[key], shading="auto")
+        ax.set_title(title)
+        ax.set_xlabel("X (cm)")
+        ax.set_ylabel("Y (cm)")
+        ax.set_aspect("equal", adjustable="box")
+        cbar = fig.colorbar(mesh, ax=ax)
+        cbar.set_label(label)
+
+    if "te_fit_r2" in data and "te_min_r2" in data:
+        min_r2 = float(np.asarray(data["te_min_r2"]))
+        poor = np.isfinite(data["te_fit_r2"]) & (data["te_fit_r2"] < min_r2)
+        if np.any(poor):
+            ax = axs[0, 0]
+            ax.plot(X[poor], Y[poor], "rx", ms=5, mew=1.4, label=f"Te fit R^2 < {min_r2:.2f}")
+            ax.legend()
+
+    if "vp_spike_mask" in data:
+        vp_spike_mask = np.asarray(data["vp_spike_mask"]).astype(bool)
+        if np.any(vp_spike_mask):
+            axs[0, 1].plot(
+                X[vp_spike_mask],
+                Y[vp_spike_mask],
+                "ko",
+                ms=3,
+                label="flagged Vp spikes",
+            )
+            axs[0, 1].legend()
+
+    source_file = _scalar_text(data.get("source_file", "")).strip()
+    title = Path(source_file).name if source_file else "Langmuir XY-Plane NPZ Results"
+    fig.suptitle(title)
+    return fig
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Read and optionally plot Langmuir XY-plane NPZ output files.",
+        epilog=(
+            "Examples:\n"
+            "  python read_langmuir_xy_npz.py path/to/run_langmuir_xy.npz\n"
+            "  python read_langmuir_xy_npz.py path/to/run_langmuir_xy.npz --plot"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "npz_path",
+        nargs="?",
+        default=None,
+        help="Path to a *_langmuir_xy.npz file.",
+    )
+    parser.add_argument("--plot", action="store_true", help="Show a quick summary plot.")
+    args, extra = parser.parse_known_args()
+    if args.npz_path is None:
+        parser.print_help()
+        return
+
+    data = load_langmuir_xy_npz(args.npz_path)
+    print_summary(data)
+
+    if args.plot:
+        import matplotlib.pyplot as plt
+
+        plot_summary(data)
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
