@@ -1,8 +1,8 @@
 # %%
 import numpy as np
 import matplotlib
-%matplotlib qt
-# matplotlib.use('Qt5Agg')  # or 'TkAgg'
+# %matplotlib qt
+matplotlib.use('Qt5Agg')  # or 'TkAgg'
 # matplotlib.use('TkAgg')   # or 'Qt5Agg'
 import matplotlib.pyplot as plt
 from bapsflib import lapd
@@ -40,22 +40,19 @@ adc = "SIS 3301" #8-channel 14-bit 100 MS/s digitizer
 sis_config_name = "ions01_Lang_really_really"
 sis_config_name = "fast_lang_board3"
 
-# nx = 163
-# nshots = 5
-# nt_full = 712704
-nx = 81
-nshots = 1
-nt_full = 32768
+nx = 33
+nshots = 5
+nt_full = 612_352
 
-board = 3
-# vsweep_channel = 7
-# isweep_channel = 8
+board = 1
+# vsweep_channel = 1
+# isweep_channel = 2
 vsweep_channel = 0
 isweep_channel = 1
 
 vsweep_attenuation = 100.0
-isweep_attenuation = 2.0 #4.0
-isweep_resistance = 10.0 #1.0
+isweep_attenuation = 1.0 #4.0
+isweep_resistance = 2.0 #1.0
 probe_area = 4.0 * u.mm**2
 
 x = np.linspace(-31.0, 50.0, nx)
@@ -70,13 +67,13 @@ shotnum_start = data_offset + 1
 shotnum_end = nx * nshots + shotnum_start   # exclusive upper bound in slice(...)
 n_expected_shots = shotnum_end - shotnum_start
 
-# first_sweep_index = 550_000
+# first_sweep_index = 93_800
 # sweep_start_index = first_sweep_index + 1_500
 # sweep_end_index = first_sweep_index + 2_500
 # nt = sweep_end_index - sweep_start_index + 1
-first_sweep_index = 15000
+first_sweep_index = 93_800
 sweep_start_index = first_sweep_index
-sweep_end_index = 21000
+sweep_end_index = 96_200
 nt = sweep_end_index - sweep_start_index + 1
 
 isweep_dc_offset_start_index = first_sweep_index
