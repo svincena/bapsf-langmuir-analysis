@@ -31,32 +31,34 @@ analysis_processes = None  # None uses one fewer than the detected CPU count
 # enabled later to exclude shots whose Te fit did not meet te_min_r2.
 exclude_poor_fits_from_statistics = False
 
-# filename = "/Users/vincena/data/Vincena/ions01/05_Lang_x_p29_4mm2_facing_antenna_2_2026-04-04_18.19.56.hdf5"
-filename = "/Users/vincena/data/ie01/hdf/p37x_lang_35V_redo_fine.hdf5"
-digitizer = "SIS crate"
-digitizer = "SIS 3301" # for 3301, this is also the name of the adc
-# adc = "SIS 3302" #8-channel 16-bit 100 MS/s digitizer
-adc = "SIS 3301" #8-channel 14-bit 100 MS/s digitizer
-sis_config_name = "ions01_Lang_really_really"
-sis_config_name = "fast_lang_board3"
 
-nx = 33
+filename = "/Users/vincena/data/Columbia_Alfven_Wave/July2026/38_sweeps-p38-xline-400-1600-600-800G_5100A_minp25 2026-07-13 17.11.05.hdf5"
+# digitizer = "SIS 3301" # for 3301, this is also the name of the adc
+# adc = "SIS 3301" #8-channel 14-bit 100 MS/s digitizer
+adc = "SIS 3302" #8-channel 16-bit 100 MS/s digitizer
+digitizer = "SIS crate"
+sis_config_name = "siscf1-4ch-lang"
+
+
+
 nshots = 5
 nt_full = 612_352
 
+nx = 33
+x_min = -32.0
+x_max = 32.0
+x = np.linspace(x_min, x_max, nx)
+
 board = 1
-# vsweep_channel = 1
-# isweep_channel = 2
-vsweep_channel = 0
-isweep_channel = 1
+vsweep_channel = 1
+isweep_channel = 2
 
 vsweep_attenuation = 100.0
 isweep_attenuation = 1.0 #4.0
 isweep_resistance = 2.0 #1.0
 probe_area = 4.0 * u.mm**2
 
-x = np.linspace(-31.0, 50.0, nx)
-x = np.linspace(-10.0, 10.0, nx)
+
 
 # data_offset used if, say, skipping half the data where 2 probes move but only
 # one at a time and half the data is being taken on a probe when it's sitting at
@@ -596,7 +598,7 @@ isweep_full, _ = read_channel_xline(
     adc=adc,
     config_name=sis_config_name,
     scale_factor=isweep_attenuation / isweep_resistance,
-    negate=True,
+    negate=False,
 )
 print(f"Current data reshaped to (x, shots, time): {isweep_full.shape}")
 
