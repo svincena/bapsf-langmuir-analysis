@@ -28,15 +28,22 @@ Useful exported arrays:
         Post-processed profiles.
     te_fit_r2, te_fit_rmse_logI, te_fit_npts, te_fit_vstart_V, te_fit_vstop_V
         Te fit quality and fit-window diagnostics.
+    te_fit_i0_A
+        Legacy key containing the measured constant ion-saturation plateau
+        subtracted before the Maxwellian fit.
     te_fit_passed_r2
         Integer mask where 1 means the Te fit met ``te_min_r2``.
+    analysis_ok, analysis_valid_count, analysis_ok_shot
+        Overall fail-closed acceptance masks and accepted-shot counts. These,
+        rather than R-squared alone, identify scientifically valid results.
     iv_voltage_grid_V, iv_current_grid_A, iv_didv_grid_A_per_V, iv_te_fit_mask
         Per-location interpolated I-V curves and Te fit masks.
     summary_plot_png, all_iv_curves_plot_png
         Optional PNG bytes, present when plot generation was enabled.
 
-All profile arrays use ``(nx,)`` indexing. Per-trace I-V arrays use
-``(nx, iv_npts)`` indexing.
+Profiles use ``(nx,)`` indexing; scientific per-shot arrays use
+``(nx, nshots)``. Representative display I-V arrays use ``(nx, iv_npts)``,
+while their ``*_shot`` counterparts use ``(nx, nshots, iv_npts)``.
 
 From another Python script:
 
@@ -87,11 +94,21 @@ def print_summary(data):
             arr = data[key]
             print(f"{key}: shape={arr.shape}, dtype={arr.dtype}")
 
+    if "analysis_valid_count" in data:
+        print(
+            "accepted shot analyses: "
+            f"{int(np.sum(np.asarray(data['analysis_valid_count'])))}"
+        )
+    elif "te_raw_eV" in data:
+        print(
+            f"accepted spatial results: {np.count_nonzero(np.isfinite(data['te_raw_eV']))}"
+        )
+
     if "te_fit_r2" in data:
         min_r2 = float(np.asarray(data.get("te_min_r2", 0.90)))
         good = np.isfinite(data["te_fit_r2"])
         poor = good & (data["te_fit_r2"] < min_r2)
-        print(f"finite Te fits: {np.count_nonzero(good)}")
+        print(f"finite Te fit diagnostics: {np.count_nonzero(good)}")
         print(f"Te fits below R^2 {min_r2:.2f}: {np.count_nonzero(poor)}")
 
 
@@ -117,9 +134,20 @@ def plot_summary(data):
 
     if "te_fit_r2" in data and "te_min_r2" in data:
         min_r2 = float(np.asarray(data["te_min_r2"]))
-        poor = np.isfinite(data["te_fit_r2"]) & np.isfinite(data["te_eV"]) & (data["te_fit_r2"] < min_r2)
+        poor = (
+            np.isfinite(data["te_fit_r2"])
+            & np.isfinite(data["te_eV"])
+            & (data["te_fit_r2"] < min_r2)
+        )
         if np.any(poor):
-            axs[0, 0].plot(x[poor], data["te_eV"][poor], "rx", ms=6, mew=1.5, label=f"Te fit R^2 < {min_r2:.2f}")
+            axs[0, 0].plot(
+                x[poor],
+                data["te_eV"][poor],
+                "rx",
+                ms=6,
+                mew=1.5,
+                label=f"Te fit R^2 < {min_r2:.2f}",
+            )
             axs[0, 0].legend()
 
     fig.suptitle("Langmuir X-Line NPZ Results")
@@ -137,7 +165,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("npz_path", help="Path to a *_langmuir_xline.npz file.")
-    parser.add_argument("--plot", action="store_true", help="Show a quick summary plot.")
+    parser.add_argument(
+        "--plot", action="store_true", help="Show a quick summary plot."
+    )
     args = parser.parse_args()
 
     data = load_langmuir_xline_npz(args.npz_path)

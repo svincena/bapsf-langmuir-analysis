@@ -50,6 +50,12 @@ Useful exported arrays:
     te_fit_intercept_logI, te_fit_i0_A, te_subtract_i0,
     te_fit_passed_r2, te_fit_candidate_count
         Te fit diagnostics and selection metadata.
+        ``te_fit_i0_A`` is retained as a legacy key but now contains the
+        measured constant ion-saturation plateau subtracted from total current.
+        It is no longer an artificial positivity offset.
+    analysis_ok, analysis_valid_count, analysis_ok_shot
+        Overall fail-closed acceptance masks and accepted-shot counts. These,
+        rather than R-squared alone, identify scientifically valid results.
 
     xy_shape_info, trace_spatial_shape, dt_s, te_min_r2
         Geometry and diagnostic metadata.
@@ -59,8 +65,10 @@ Useful exported arrays:
     summary_plot_png, all_iv_curves_plot_png
         Optional PNG bytes when plot generation was enabled.
 
-All map-like arrays use ``(ny, nx)`` indexing. Per-trace I-V arrays use
-``(ny, nx, iv_npts)`` indexing.
+Maps use ``(ny, nx)`` indexing; scientific per-shot arrays use
+``(ny, nx, nshots)``. Representative display I-V arrays use
+``(ny, nx, iv_npts)``, while their ``*_shot`` counterparts use
+``(ny, nx, nshots, iv_npts)``.
 
 From another Python script:
 
@@ -134,30 +142,16 @@ EXPECTED_LANGMUIR_XY_NPZ_KEYS = {
     "summary_plot_path",
     "all_iv_plot_path",
 }
-OPTIONAL_LANGMUIR_XY_NPZ_KEYS = {
-    "summary_plot_png",
-    "all_iv_curves_plot_png",
-    "isweep_dc_offsets_A",
-    "scale_to_interferometer_density",
-    "interferometer_line_averaged_density_m3",
-}
-KNOWN_LANGMUIR_XY_NPZ_KEYS = EXPECTED_LANGMUIR_XY_NPZ_KEYS | OPTIONAL_LANGMUIR_XY_NPZ_KEYS
 
 
 def validate_langmuir_xy_npz(data):
-    """Validate loaded XY-plane NPZ contents against the expected schema."""
+    """Require the stable schema while allowing forward-compatible extras."""
     keys = set(data.keys())
     missing = EXPECTED_LANGMUIR_XY_NPZ_KEYS - keys
-    extra = keys - KNOWN_LANGMUIR_XY_NPZ_KEYS
-    if missing or extra:
-        details = []
-        if missing:
-            details.append(f"missing keys: {sorted(missing)}")
-        if extra:
-            details.append(f"unknown keys: {sorted(extra)}")
+    if missing:
         raise ValueError(
             "Loaded NPZ file does not conform to expected Langmuir XY-plane schema: "
-            + "; ".join(details)
+            f"missing keys: {sorted(missing)}"
         )
     return data
 
@@ -191,16 +185,36 @@ def print_summary(data):
             f"{_scalar_text(data['interferometer_line_averaged_density_m3'])}"
         )
 
-    for key in ("X_cm", "Y_cm", "te_eV", "vp_V", "vf_V", "ies_A", "iis_A", "n_e_m3", "te_fit_r2"):
+    for key in (
+        "X_cm",
+        "Y_cm",
+        "te_eV",
+        "vp_V",
+        "vf_V",
+        "ies_A",
+        "iis_A",
+        "n_e_m3",
+        "te_fit_r2",
+    ):
         if key in data:
             arr = data[key]
             print(f"{key}: shape={arr.shape}, dtype={arr.dtype}")
+
+    if "analysis_valid_count" in data:
+        print(
+            "accepted shot analyses: "
+            f"{int(np.sum(np.asarray(data['analysis_valid_count'])))}"
+        )
+    elif "te_raw_eV" in data:
+        print(
+            f"accepted spatial results: {np.count_nonzero(np.isfinite(data['te_raw_eV']))}"
+        )
 
     if "te_fit_r2" in data:
         min_r2 = float(np.asarray(data.get("te_min_r2", 0.90)))
         good = np.isfinite(data["te_fit_r2"])
         poor = good & (data["te_fit_r2"] < min_r2)
-        print(f"finite Te fits: {np.count_nonzero(good)}")
+        print(f"finite Te fit diagnostics: {np.count_nonzero(good)}")
         print(f"Te fits below R^2 {min_r2:.2f}: {np.count_nonzero(poor)}")
 
 
@@ -240,7 +254,14 @@ def plot_summary(data):
         poor = np.isfinite(data["te_fit_r2"]) & (data["te_fit_r2"] < min_r2)
         if np.any(poor):
             ax = axs[0, 0]
-            ax.plot(X[poor], Y[poor], "rx", ms=5, mew=1.4, label=f"Te fit R^2 < {min_r2:.2f}")
+            ax.plot(
+                X[poor],
+                Y[poor],
+                "rx",
+                ms=5,
+                mew=1.4,
+                label=f"Te fit R^2 < {min_r2:.2f}",
+            )
             ax.legend()
 
     if "vp_spike_mask" in data:
@@ -277,7 +298,9 @@ def main():
         default=None,
         help="Path to a *_langmuir_xy.npz file.",
     )
-    parser.add_argument("--plot", action="store_true", help="Show a quick summary plot.")
+    parser.add_argument(
+        "--plot", action="store_true", help="Show a quick summary plot."
+    )
     args, extra = parser.parse_known_args()
     if args.npz_path is None:
         parser.print_help()

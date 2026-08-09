@@ -1,7 +1,7 @@
 # %%
 import numpy as np
 import matplotlib
-%matplotlib qt
+matplotlib.use("Qt5Agg")
 # matplotlib.use('TkAgg')   # or 'Qt5Agg'
 import matplotlib.pyplot as plt
 from bapsflib import lapd
@@ -12,23 +12,22 @@ import multiprocessing as mp
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from scipy.signal import savgol_filter
-from langmuir_analysis import (
-    analyze_iv_trace,
-    choose_analysis_process_count,
+from langmuir_analysis import analyze_iv_trace
+from langmuir_diagnostics import (
     render_iv_diagnostic_plot as render_analysis_iv_diagnostic_plot,
 )
 
 
 save_results = True
 plot_results = True
+# Only enable with an independently measured plasma-off electronics baseline.
+# Using sweep samples would erase physical current and bias Vf and Iis.
 subtract_dc = False
+# Set True only when the sweep current has an independently established zero.
+current_zero_calibrated = False
 parallel_analysis = True
 analysis_processes = None  # None uses one fewer than the detected CPU count
 
-# Shot statistics.  Every shot is always fitted independently.  Leave this
-# False to include every finite fit in the per-location statistics; it can be
-# enabled later to exclude shots whose Te fit did not meet te_min_r2.
-exclude_poor_fits_from_statistics = False
 scale_to_interferometer_density = True  # if True, scales n_e by a constant factor to match interferometer line-averaged density; adjust the factor below as needed
 interferometer_line_averaged_density_m3 = 4.7e18  # m^-3; adjust as needed based on interferometer measurements
 
@@ -96,39 +95,35 @@ diagnostic_plot_output_dir = Path("output_diagnostic_plots")
 iv_npts = 512
 voltage_bin_width = 0.01  # volts; merges near-duplicate voltages before interpolation
 
-# Derivative smoothing on interpolated IV curve for plasma-potential detection.
-# Use None, "moving", or "savgol".
-vp_smoothing = "moving"
-vp_moving_average_width = 32
-iv_savgol_window = 17
-iv_savgol_order = 1
+# Derivative smoothing is specified in volts and is independent of the fixed
+# diagnostic-grid resolution.
+vp_smoothing = "savgol"
+vp_smoothing_width_V = 2.5
+vp_savgol_order = 2
 
-# Adaptive Te fit controls
-te_min_points = int(0.075 * iv_npts)
-te_max_points = int(0.25* iv_npts)
+# One Maxwellian fit on independent voltage-bin means.
+te_min_points = 12
 te_margin_from_vp = 1.0  # volts; require this much margin between the plasma potential and the nearest fit point
 te_current_floor_frac = 0.075  # exclude points where the current is less than this fraction of the electron saturation current
 te_min_eV = 0.1
 te_max_eV = 30.0
 te_min_r2 = 0.975
-te_subtract_i0 = True
+te_subtract_i0 = True  # legacy export name; I0 is now the measured ion plateau
 
 langmuir_analysis_config = {
     "iv_npts": iv_npts,
     "voltage_bin_width": voltage_bin_width,
     "vp_smoothing": vp_smoothing,
-    "vp_moving_average_width": vp_moving_average_width,
-    "iv_savgol_window": iv_savgol_window,
-    "iv_savgol_order": iv_savgol_order,
+    "vp_smoothing_width_V": vp_smoothing_width_V,
+    "vp_savgol_order": vp_savgol_order,
     "te_min_points": te_min_points,
-    "te_max_points": te_max_points,
     "te_margin_from_vp": te_margin_from_vp,
     "te_current_floor_frac": te_current_floor_frac,
     "te_min_eV": te_min_eV,
     "te_max_eV": te_max_eV,
     "te_min_r2": te_min_r2,
-    "te_subtract_i0": te_subtract_i0,
     "probe_area": probe_area,
+    "current_zero_calibrated": current_zero_calibrated,
 }
 
 # Optional post-processing controls on 2D maps
@@ -292,6 +287,16 @@ def analyze_trace_worker(task):
     return result
 
 
+def choose_analysis_process_count(n_traces, requested_processes=None):
+    """Choose a conservative worker count for independent trace fits."""
+    n_traces = int(n_traces)
+    if n_traces < 1:
+        return 0
+    if requested_processes is not None:
+        return max(1, min(int(requested_processes), n_traces))
+    return max(1, min((mp.cpu_count() or 1) - 1, n_traces))
+
+
 def _as_yx_half_window(half_window):
     if np.isscalar(half_window):
         hw = int(half_window)
@@ -369,6 +374,8 @@ def gaussian_neighbor_smooth_nanaware_2d(z, half_window=(1, 1), sigma=1.0):
 
     for iy in range(ny_map):
         for ix in range(nx_map):
+            if not np.isfinite(z[iy, ix]):
+                continue
             y0 = max(0, iy - hy)
             y1 = min(ny_map, iy + hy + 1)
             x0 = max(0, ix - hx)
@@ -577,14 +584,20 @@ def render_all_iv_curves_plot(x_coord, y_coord, iv_voltage_grid, iv_current_grid
 
     for flat_index in flat_indices:
         iy, ix = np.unravel_index(flat_index, iv_voltage_grid.shape[:2])
-        V = iv_voltage_grid[iy, ix]
-        I = iv_current_grid[iy, ix]
-        good = np.isfinite(V) & np.isfinite(I)
+        voltage_curve = iv_voltage_grid[iy, ix]
+        current_curve = iv_current_grid[iy, ix]
+        good = np.isfinite(voltage_curve) & np.isfinite(current_curve)
         if np.count_nonzero(good) < 2:
             continue
 
         frac = 0.5 if y_max == y_min else (y_coord[iy] - y_min) / (y_max - y_min)
-        ax.plot(V[good], I[good], color=cmap(frac), alpha=0.9, lw=1.2)
+        ax.plot(
+            voltage_curve[good],
+            current_curve[good],
+            color=cmap(frac),
+            alpha=0.9,
+            lw=1.2,
+        )
 
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=y_min, vmax=y_max))
     sm.set_array([])
@@ -652,6 +665,22 @@ vsweep = vsweep_full[..., sweep_start_index:sweep_end_index + 1]
 isweep = isweep_full[..., sweep_start_index:sweep_end_index + 1]
 
 if subtract_dc:
+    if isweep_dc_offset_start_index is None or isweep_dc_offset_end_index is None:
+        raise ValueError(
+            "subtract_dc requires an independently measured plasma-off interval"
+        )
+    if not (
+        0
+        <= isweep_dc_offset_start_index
+        <= isweep_dc_offset_end_index
+        < nt_full
+    ):
+        raise ValueError("the electronics-offset interval is outside the trace")
+    if not (
+        isweep_dc_offset_end_index < sweep_start_index
+        or isweep_dc_offset_start_index > sweep_end_index
+    ):
+        raise ValueError("the electronics-offset interval must not overlap the I-V sweep")
     print("Subtracting current DC offsets")
     isweep_dc_offset_portion = isweep_full[..., isweep_dc_offset_start_index:isweep_dc_offset_end_index + 1]
     isweep_dc_offsets = np.mean(isweep_dc_offset_portion, axis=-1)
@@ -661,7 +690,8 @@ file.close()
 print("Finished reading and reshaping data.")
 
 # %%
-# Lightly smooth every shot along the original sweep index
+# Optional time-domain products for visualization/export. The analysis itself
+# uses unsmoothed samples and performs averaging in voltage bins.
 
 time = np.arange(nt) * dt
 
@@ -706,10 +736,11 @@ vf_shot = np.full(trace_shape, np.nan)
 ies_shot = np.full(trace_shape, np.nan)
 iis_shot = np.full(trace_shape, np.nan)
 n_e_shot = np.full(trace_shape, np.nan)
+analysis_ok_shot = np.zeros(trace_shape, dtype=np.uint8)
 
 te_fit_r2_shot = np.full(trace_shape, np.nan)
 te_fit_rmse_shot = np.full(trace_shape, np.nan)
-te_fit_npts_shot = np.full(trace_shape, 0, dtype=int)
+te_fit_npts_shot = np.full(trace_shape, np.nan)
 te_fit_vstart_shot = np.full(trace_shape, np.nan)
 te_fit_vstop_shot = np.full(trace_shape, np.nan)
 te_fit_slope_shot = np.full(trace_shape, np.nan)
@@ -738,8 +769,8 @@ for flat_index in range(n_traces):
         (
             flat_index,
             idx,
-            vsweep_shot_smoothed.value[idx + (slice(None),)],
-            isweep_shot_smoothed.value[idx + (slice(None),)],
+            vsweep_shot.value[idx + (slice(None),)],
+            isweep_shot.value[idx + (slice(None),)],
             include_diagnostic_data,
             langmuir_analysis_config,
         )
@@ -776,16 +807,19 @@ if use_parallel_analysis:
             if result["iv_voltage_grid"] is None:
                 continue
 
-            te_shot[idx] = result["te_eV"]
-            vp_shot[idx] = result["vp_V"]
-            vf_shot[idx] = result["vf_V"]
-            ies_shot[idx] = result["ies_A"]
-            iis_shot[idx] = result["iis_A"]
-            n_e_shot[idx] = result.get("n_e_m3", np.nan)
+            analysis_ok_shot[idx] = int(result["ok"])
+            if result["ok"]:
+                te_shot[idx] = result["te_eV"]
+                vp_shot[idx] = result["vp_V"]
+                vf_shot[idx] = result["vf_V"]
+                ies_shot[idx] = result["ies_A"]
+                iis_shot[idx] = result["iis_A"]
+                n_e_shot[idx] = result.get("n_e_m3", np.nan)
 
             te_fit_r2_shot[idx] = result["te_fit_r2"]
             te_fit_rmse_shot[idx] = result["te_fit_rmse"]
-            te_fit_npts_shot[idx] = result["te_fit_npts"]
+            if result["te_fit_candidate_count"]:
+                te_fit_npts_shot[idx] = result["te_fit_npts"]
             te_fit_vstart_shot[idx] = result["te_fit_vstart"]
             te_fit_vstop_shot[idx] = result["te_fit_vstop"]
             te_fit_slope_shot[idx] = result["te_fit_slope"]
@@ -796,7 +830,8 @@ if use_parallel_analysis:
 
             iv_voltage_grid_shot[idx + (slice(None),)] = result["iv_voltage_grid"]
             iv_current_grid_shot[idx + (slice(None),)] = result["iv_current_grid"]
-            iv_didv_grid_shot[idx + (slice(None),)] = result["iv_didv_grid"]
+            if result["iv_didv_grid"] is not None:
+                iv_didv_grid_shot[idx + (slice(None),)] = result["iv_didv_grid"]
             iv_fit_mask_grid_shot[idx + (slice(None),)] = result["iv_fit_mask"]
 
             diagnostic_data = result["diagnostic_data"]
@@ -830,16 +865,19 @@ else:
         if result["iv_voltage_grid"] is None:
             continue
 
-        te_shot[idx] = result["te_eV"]
-        vp_shot[idx] = result["vp_V"]
-        vf_shot[idx] = result["vf_V"]
-        ies_shot[idx] = result["ies_A"]
-        iis_shot[idx] = result["iis_A"]
-        n_e_shot[idx] = result.get("n_e_m3", np.nan)
+        analysis_ok_shot[idx] = int(result["ok"])
+        if result["ok"]:
+            te_shot[idx] = result["te_eV"]
+            vp_shot[idx] = result["vp_V"]
+            vf_shot[idx] = result["vf_V"]
+            ies_shot[idx] = result["ies_A"]
+            iis_shot[idx] = result["iis_A"]
+            n_e_shot[idx] = result.get("n_e_m3", np.nan)
 
         te_fit_r2_shot[idx] = result["te_fit_r2"]
         te_fit_rmse_shot[idx] = result["te_fit_rmse"]
-        te_fit_npts_shot[idx] = result["te_fit_npts"]
+        if result["te_fit_candidate_count"]:
+            te_fit_npts_shot[idx] = result["te_fit_npts"]
         te_fit_vstart_shot[idx] = result["te_fit_vstart"]
         te_fit_vstop_shot[idx] = result["te_fit_vstop"]
         te_fit_slope_shot[idx] = result["te_fit_slope"]
@@ -850,7 +888,8 @@ else:
 
         iv_voltage_grid_shot[idx + (slice(None),)] = result["iv_voltage_grid"]
         iv_current_grid_shot[idx + (slice(None),)] = result["iv_current_grid"]
-        iv_didv_grid_shot[idx + (slice(None),)] = result["iv_didv_grid"]
+        if result["iv_didv_grid"] is not None:
+            iv_didv_grid_shot[idx + (slice(None),)] = result["iv_didv_grid"]
         iv_fit_mask_grid_shot[idx + (slice(None),)] = result["iv_fit_mask"]
 
         diagnostic_data = result["diagnostic_data"]
@@ -869,18 +908,14 @@ else:
             plt.show(block=False)
             plt.pause(example_pause_seconds)
             plt.close(fig)
-statistics_fit_mask = (
-    te_fit_passed_r2_shot.astype(bool)
-    if exclude_poor_fits_from_statistics
-    else np.ones(trace_shape, dtype=bool)
-)
-
-te_values, te_std_values, fit_count = shot_mean_and_std(te_shot, statistics_fit_mask)
-vp_values, vp_std_values, _ = shot_mean_and_std(vp_shot, statistics_fit_mask)
-vf_values, vf_std_values, _ = shot_mean_and_std(vf_shot, statistics_fit_mask)
-ies_values, ies_std_values, _ = shot_mean_and_std(ies_shot, statistics_fit_mask)
-iis_values, iis_std_values, _ = shot_mean_and_std(iis_shot, statistics_fit_mask)
-n_e_values, n_e_std_values, _ = shot_mean_and_std(n_e_shot, statistics_fit_mask)
+# Compatibility export: this mask now identifies accepted Te values only.
+statistics_fit_mask = np.isfinite(te_shot)
+te_values, te_std_values, fit_count = shot_mean_and_std(te_shot)
+vp_values, vp_std_values, _ = shot_mean_and_std(vp_shot)
+vf_values, vf_std_values, _ = shot_mean_and_std(vf_shot)
+ies_values, ies_std_values, _ = shot_mean_and_std(ies_shot)
+iis_values, iis_std_values, _ = shot_mean_and_std(iis_shot)
+n_e_values, n_e_std_values, _ = shot_mean_and_std(n_e_shot)
 
 te = te_values * u.eV
 vp = vp_values * u.V
@@ -903,9 +938,14 @@ te_fit_vstop, te_fit_vstop_std, _ = shot_mean_and_std(te_fit_vstop_shot)
 te_fit_slope, te_fit_slope_std, _ = shot_mean_and_std(te_fit_slope_shot)
 te_fit_intercept, te_fit_intercept_std, _ = shot_mean_and_std(te_fit_intercept_shot)
 te_fit_i0, te_fit_i0_std, _ = shot_mean_and_std(te_fit_i0_shot)
-te_fit_passed_r2 = np.all(te_fit_passed_r2_shot.astype(bool), axis=-1).astype(np.uint8)
+te_fit_passed_r2 = np.any(te_fit_passed_r2_shot.astype(bool), axis=-1).astype(np.uint8)
 te_fit_candidate_count = np.sum(te_fit_candidate_count_shot, axis=-1)
+analysis_valid_count = np.sum(analysis_ok_shot, axis=-1)
+analysis_ok = (analysis_valid_count > 0).astype(np.uint8)
 
+# Representative I-V products are visualization-only shot means.  They are
+# not used for physics, because individual sweep endpoints need not coincide.
+# Full per-shot grids are exported separately below.
 iv_voltage_grid = np.nanmean(iv_voltage_grid_shot, axis=-2)
 iv_current_grid = np.nanmean(iv_current_grid_shot, axis=-2)
 iv_didv_grid = np.nanmean(iv_didv_grid_shot, axis=-2)
@@ -1062,6 +1102,9 @@ if save_results:
         grp.create_dataset("n_e_std_m3", data=n_e_std.value)
         grp.create_dataset("isat_std_A", data=isat_std.value)
         grp.create_dataset("fit_count", data=fit_count)
+        grp.create_dataset("analysis_ok", data=analysis_ok)
+        grp.create_dataset("analysis_valid_count", data=analysis_valid_count)
+        grp.create_dataset("analysis_ok_shot", data=analysis_ok_shot)
         grp.create_dataset("statistics_fit_mask", data=statistics_fit_mask.astype(np.uint8))
 
         # Raw extracted profiles
@@ -1213,9 +1256,8 @@ if save_results:
         grp.attrs["iv_npts"] = iv_npts
         grp.attrs["voltage_bin_width_V"] = voltage_bin_width
         grp.attrs["vp_smoothing"] = "none" if vp_smoothing is None else str(vp_smoothing)
-        grp.attrs["vp_moving_average_width"] = vp_moving_average_width
-        grp.attrs["iv_savgol_window"] = iv_savgol_window
-        grp.attrs["iv_savgol_order"] = iv_savgol_order
+        grp.attrs["vp_smoothing_width_V"] = vp_smoothing_width_V
+        grp.attrs["vp_savgol_order"] = vp_savgol_order
         grp.attrs["parallel_analysis"] = int(parallel_analysis)
         grp.attrs["analysis_processes_requested"] = (
             -1 if analysis_processes is None else int(analysis_processes)
@@ -1224,14 +1266,20 @@ if save_results:
         grp.attrs["analysis_start_method"] = "fork" if use_parallel_analysis else "serial"
 
         grp.attrs["te_min_points"] = te_min_points
-        grp.attrs["te_max_points"] = te_max_points
         grp.attrs["te_margin_from_vp_V"] = te_margin_from_vp
         grp.attrs["te_current_floor_frac"] = te_current_floor_frac
         grp.attrs["te_subtract_i0"] = int(te_subtract_i0)
         grp.attrs["te_min_eV"] = te_min_eV
         grp.attrs["te_max_eV"] = te_max_eV
         grp.attrs["te_min_r2"] = te_min_r2
-        grp.attrs["exclude_poor_fits_from_statistics"] = int(exclude_poor_fits_from_statistics)
+        grp.attrs["analysis_model"] = (
+            "planar Maxwellian electrons; separate low-bias ion and high-bias "
+            "electron saturation plateaus"
+        )
+        grp.attrs["te_fit_i0_definition"] = "measured constant ion-saturation current"
+        grp.attrs["iv_npts_role"] = "fixed-size diagnostics only"
+        grp.attrs["current_zero_calibrated"] = int(current_zero_calibrated)
+        grp.attrs["subtract_dc"] = int(subtract_dc)
         grp.attrs["shot_standard_deviation_ddof"] = 1
         grp.attrs["per_shot_axis_order"] = "y,x,shot"
         grp.attrs["shot_statistics_stage"] = "individual fits before spatial post-processing"
@@ -1289,6 +1337,9 @@ if save_results:
         "n_e_std_m3": n_e_std.value,
         "isat_std_A": isat_std.value,
         "fit_count": fit_count,
+        "analysis_ok": analysis_ok,
+        "analysis_valid_count": analysis_valid_count,
+        "analysis_ok_shot": analysis_ok_shot,
         "statistics_fit_mask": statistics_fit_mask.astype(np.uint8),
         "te_raw_eV": te_raw.value,
         "vp_raw_V": vp_raw.value,
@@ -1347,7 +1398,6 @@ if save_results:
         "te_fit_i0_shot_A": te_fit_i0_shot,
         "te_fit_passed_r2_shot": te_fit_passed_r2_shot,
         "te_fit_candidate_count_shot": te_fit_candidate_count_shot,
-        "exclude_poor_fits_from_statistics": np.array(int(exclude_poor_fits_from_statistics)),
         "shot_standard_deviation_ddof": np.array(1),
         "per_shot_axis_order": np.array("y,x,shot"),
         "shot_statistics_stage": np.array("individual fits before spatial post-processing"),
@@ -1355,6 +1405,14 @@ if save_results:
         "trace_spatial_shape": np.array(spatial_shape, dtype=np.int64),
         "dt_s": np.array(dt),
         "te_min_r2": np.array(te_min_r2),
+        "analysis_model": np.array(
+            "planar Maxwellian electrons; separate low-bias ion and high-bias "
+            "electron saturation plateaus"
+        ),
+        "te_fit_i0_definition": np.array("measured constant ion-saturation current"),
+        "iv_npts_role": np.array("fixed-size diagnostics only"),
+        "current_zero_calibrated": np.array(int(current_zero_calibrated)),
+        "subtract_dc": np.array(int(subtract_dc)),
         "summary_plot_path": np.array("" if summary_plot_path is None else str(summary_plot_path)),
         "all_iv_plot_path": np.array("" if all_iv_plot_path is None else str(all_iv_plot_path)),
     }
