@@ -1,12 +1,12 @@
-"""Lean numerical core for planar Langmuir-probe I-V analysis.
+"""Numerical core for swept planar Langmuir-probe I-V analysis.
 
-The analysis assumes a monotonically swept probe with positive electron-
-collection current, a constant low-bias ion-saturation plateau, negligible
-ion collection on the high-bias electron plateau, and a Maxwellian electron-
-retarding branch. Traces that do not support those assumptions are rejected
-instead of being coerced into plausible-looking plasma parameters.
-Current must retain an independently calibrated absolute zero; zeroing the
-low-bias ion branch makes floating potential and ion current unidentifiable.
+The default quality checks allow the sloped saturation branches and modest
+non-Maxwellian structure normally seen in experimental probe curves.  An
+opt-in ideal-model mode additionally requires nearly flat saturation regions,
+a straight Maxwellian semilog branch, negligible electron leakage into the ion
+region, and agreement between two plasma-potential estimators.  Current must
+retain an independently calibrated absolute zero; zeroing the low-bias ion
+branch makes floating potential and ion current unidentifiable.
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ from scipy.signal import savgol_filter
 _MIN_CURVE_POINTS = 7
 _ION_WINDOW_FRACTION = 0.25
 _ION_MIN_POINTS = 5
-_ION_SIGNAL_TO_NOISE = 3.0
-_ION_MAX_TREND_FRACTION = 0.20
+_ION_ESTIMATE_MIN_SNR = 3.0
+_SATURATION_MAX_TREND_FRACTION = 0.20
 _TE_CURRENT_CEILING_FRACTION = 0.80
 _TE_MIN_LOG_SPAN = 1.0
 _TE_MAX_RELATIVE_SLOPE_UNCERTAINTY = 0.30
@@ -45,8 +45,10 @@ _DEFAULT_CONFIG = {
     "te_min_eV": 0.1,
     "te_max_eV": 30.0,
     "te_min_r2": 0.95,
+    "ion_min_snr": _ION_ESTIMATE_MIN_SNR,
     "probe_area": None,
     "current_zero_calibrated": False,
+    "enforce_ideal_model_checks": False,
 }
 
 
@@ -169,9 +171,14 @@ def _validated_config(config):
     if cfg["te_min_eV"] >= cfg["te_max_eV"]:
         raise ValueError("te_min_eV must be less than te_max_eV.")
 
-    if not isinstance(cfg["current_zero_calibrated"], (bool, np.bool_)):
-        raise ValueError("current_zero_calibrated must be a boolean.")
-    cfg["current_zero_calibrated"] = bool(cfg["current_zero_calibrated"])
+    cfg["ion_min_snr"] = float(cfg["ion_min_snr"])
+    if not np.isfinite(cfg["ion_min_snr"]) or cfg["ion_min_snr"] < 0:
+        raise ValueError("ion_min_snr must be finite and non-negative.")
+
+    for name in ("current_zero_calibrated", "enforce_ideal_model_checks"):
+        if not isinstance(cfg[name], (bool, np.bool_)):
+            raise ValueError(f"{name} must be a boolean.")
+        cfg[name] = bool(cfg[name])
 
     probe_area = cfg["probe_area"]
     if probe_area is not None:
@@ -408,7 +415,33 @@ def _sweep_direction_is_valid(V, bin_width):
     return bool(minority_travel <= _MAX_REVERSE_SWEEP_FRACTION * voltage_span)
 
 
-def _estimate_ion_current(voltage, current, vf):
+def _effective_sample_count(values):
+    """Estimate independent samples using the initial positive autocorrelation."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    n_values = values.size
+    if n_values < 2:
+        return float(n_values)
+
+    centered = values - np.mean(values)
+    variance_sum = float(np.dot(centered, centered))
+    if not np.isfinite(variance_sum) or variance_sum <= 0:
+        return float(n_values)
+
+    autocorrelation = np.correlate(centered, centered, mode="full")[
+        n_values - 1 :
+    ] / variance_sum
+    positive_lags = autocorrelation[1:]
+    nonpositive = np.flatnonzero(positive_lags <= 0)
+    if nonpositive.size:
+        positive_lags = positive_lags[: nonpositive[0]]
+    correlation_time = 1.0 + 2.0 * float(np.sum(positive_lags))
+    if not np.isfinite(correlation_time) or correlation_time <= 0:
+        return 1.0
+    return float(np.clip(n_values / correlation_time, 1.0, n_values))
+
+
+def _estimate_ion_current(voltage, current, vf, enforce_flatness=False):
     cutoff = voltage[0] + _ION_WINDOW_FRACTION * (vf - voltage[0])
     mask = np.isfinite(voltage) & np.isfinite(current) & (voltage <= cutoff)
     if np.count_nonzero(mask) < _ION_MIN_POINTS:
@@ -421,6 +454,10 @@ def _estimate_ion_current(voltage, current, vf):
     fitted = slope * V_ion + intercept
     residual = I_ion_samples - fitted
     ion_noise = float(1.4826 * np.median(np.abs(residual - np.median(residual))))
+    effective_sample_count = _effective_sample_count(residual)
+    median_standard_error = (
+        np.sqrt(np.pi / 2.0) * ion_noise / np.sqrt(effective_sample_count)
+    )
     trend_span = float(abs(slope) * np.ptp(V_ion))
     ion_magnitude = -ion_current
 
@@ -429,23 +466,38 @@ def _estimate_ion_current(voltage, current, vf):
             None,
             "ion-saturation current is not negative under the configured polarity",
         )
-    if ion_magnitude < _ION_SIGNAL_TO_NOISE * ion_noise:
-        return None, "ion-saturation current is not resolved above its noise"
-    if trend_span > _ION_MAX_TREND_FRACTION * ion_magnitude:
+    trend_fraction = trend_span / ion_magnitude
+    trend_exceeds_limit = trend_fraction > _SATURATION_MAX_TREND_FRACTION
+    if enforce_flatness and trend_exceeds_limit:
         return None, "low-bias current does not form a constant ion-saturation plateau"
 
     return {
         "current_A": ion_current,
         "noise_A": ion_noise,
+        "uncertainty_A": float(median_standard_error),
+        "snr": (
+            float(ion_magnitude / median_standard_error)
+            if median_standard_error > 0
+            else np.inf
+        ),
+        "effective_sample_count": effective_sample_count,
         "slope_A_per_V": float(slope),
         "intercept_A": float(intercept),
         "trend_span_A": trend_span,
+        "trend_fraction": trend_fraction,
+        "trend_exceeds_limit": trend_exceeds_limit,
         "mask": mask,
     }, None
 
 
-def _estimate_electron_saturation_current(V, measured_current, vp, ion_noise):
-    """Estimate the high-bias plateau where ion collection is negligible."""
+def _estimate_electron_saturation_current(
+    V,
+    measured_current,
+    vp,
+    ion_noise,
+    enforce_flatness=False,
+):
+    """Estimate electron saturation from the high-bias collection region."""
     cutoff = vp + 0.5 * (V[-1] - vp)
     mask = np.isfinite(V) & np.isfinite(measured_current) & (V >= cutoff)
     if np.count_nonzero(mask) < _ION_MIN_POINTS:
@@ -464,7 +516,9 @@ def _estimate_electron_saturation_current(V, measured_current, vp, ion_noise):
     residual = I_sat - fitted
     residual_noise = float(1.4826 * np.median(np.abs(residual - np.median(residual))))
     trend_span = float(abs(slope) * np.ptp(V_sat))
-    if trend_span > _ION_MAX_TREND_FRACTION * saturation_current:
+    trend_fraction = trend_span / saturation_current
+    trend_exceeds_limit = trend_fraction > _SATURATION_MAX_TREND_FRACTION
+    if enforce_flatness and trend_exceeds_limit:
         return None, "high-bias current does not form an electron-saturation plateau"
 
     return {
@@ -472,6 +526,8 @@ def _estimate_electron_saturation_current(V, measured_current, vp, ion_noise):
         "noise_A": residual_noise,
         "slope_A_per_V": float(slope),
         "trend_span_A": trend_span,
+        "trend_fraction": trend_fraction,
+        "trend_exceeds_limit": trend_exceeds_limit,
         "mask": mask,
     }, None
 
@@ -511,6 +567,7 @@ def _fit_electron_temperature(V, electron_current, I_es, vf, vp, ion_noise, cfg)
         "relative_slope_uncertainty": np.nan,
         "log_span": np.nan,
         "curvature_log": np.nan,
+        "curvature_detected": False,
         "te_eV_candidate": np.nan,
         "passed_r2": False,
         "valid": False,
@@ -567,6 +624,7 @@ def _fit_electron_temperature(V, electron_current, I_es, vf, vp, ion_noise, cfg)
             "relative_slope_uncertainty": float(relative_uncertainty),
             "log_span": log_span,
             "curvature_log": curvature_log,
+            "curvature_detected": curvature_detected,
             "te_eV_candidate": float(te_candidate),
             "passed_r2": bool(np.isfinite(r2) and r2 >= cfg["te_min_r2"]),
             "vstart": float(V_fit[0]),
@@ -595,7 +653,7 @@ def _fit_electron_temperature(V, electron_current, I_es, vf, vp, ion_noise, cfg)
             "electron-temperature slope uncertainty is too large",
         ),
         (
-            not curvature_detected,
+            not cfg["enforce_ideal_model_checks"] or not curvature_detected,
             "electron-retarding semilog branch has significant curvature",
         ),
     )
@@ -613,8 +671,10 @@ def _empty_result(trace_label):
         "trace_label": trace_label,
         "ok": False,
         "warnings": [],
+        "model_notes": [],
         "te_eV": np.nan,
         "vp_V": np.nan,
+        "vp_fit_V": np.nan,
         "vp_derivative_V": np.nan,
         "vf_V": np.nan,
         "ies_A": np.nan,
@@ -622,8 +682,14 @@ def _empty_result(trace_label):
         "n_e_m3": np.nan,
         "ion_current_A": np.nan,
         "ion_noise_A": np.nan,
+        "ion_current_uncertainty_A": np.nan,
+        "ion_current_snr": np.nan,
+        "ion_effective_sample_count": np.nan,
         "ion_fit_slope_A_per_V": np.nan,
         "electron_saturation_slope_A_per_V": np.nan,
+        "ion_saturation_trend_fraction": np.nan,
+        "electron_saturation_trend_fraction": np.nan,
+        "electron_leakage_fraction": np.nan,
         "te_fit_r2": np.nan,
         "te_fit_rmse": np.nan,
         "te_fit_npts": 0,
@@ -634,9 +700,10 @@ def _empty_result(trace_label):
         "te_fit_relative_uncertainty": np.nan,
         "te_fit_log_span": np.nan,
         "te_fit_curvature_log": np.nan,
+        "te_fit_curvature_flagged": False,
         "te_fit_valid": False,
-        # Compatibility aliases.  I0 is now the measured constant ion current,
-        # not the old artificial positivity shift; exactly one fit is attempted.
+        # Compatibility aliases. I0 is now the measured median ion-region
+        # current, not the old artificial positivity shift; one fit is attempted.
         "te_fit_i0": np.nan,
         "te_fit_subtract_i0": True,
         "te_fit_passed_r2": False,
@@ -656,10 +723,15 @@ def analyze_iv_trace(
     include_diagnostic_data=False,
     trace_label=None,
 ):
-    """Analyze one trace and return finite values only for accepted physics.
+    """Analyze one trace and return every estimate that could be calculated.
 
-    ``ok`` means Vf, Vp, both saturation plateaus, and the Maxwellian Te fit
-    passed. Density may still be NaN when ``probe_area`` is intentionally absent.
+    ``ok`` means that the measured sweep and numerical fit passed the enabled
+    quality checks. Experimental deviations from the ideal planar-Maxwellian
+    model are recorded in ``model_notes`` unless
+    ``enforce_ideal_model_checks`` is true. A quality-rejected trace can still
+    contain finite scalar estimates so callers can plot and inspect the fit;
+    ``warnings`` explains why it was not accepted. Density may be NaN when
+    ``probe_area`` is absent.
     """
     cfg = _validated_config(config)
     result = _empty_result(trace_label)
@@ -735,16 +807,37 @@ def analyze_iv_trace(
         return result
     result["vf_V"] = vf_value
     result["vp_derivative_V"] = vp_value
+    # The derivative estimate is a reportable plasma-potential measurement even
+    # if a later Maxwellian consistency check rejects the overall trace.
+    result["vp_V"] = vp_value
 
-    ion, ion_error = _estimate_ion_current(Vb, Ib, vf_value)
+    ion, ion_error = _estimate_ion_current(
+        Vb,
+        Ib,
+        vf_value,
+        enforce_flatness=cfg["enforce_ideal_model_checks"],
+    )
     if ion is None:
         result["warnings"].append(ion_error)
         return result
     result["ion_current_A"] = ion["current_A"]
     result["ion_noise_A"] = ion["noise_A"]
+    result["ion_current_uncertainty_A"] = ion["uncertainty_A"]
+    result["ion_current_snr"] = ion["snr"]
+    result["ion_effective_sample_count"] = ion["effective_sample_count"]
     result["ion_fit_slope_A_per_V"] = ion["slope_A_per_V"]
+    result["ion_saturation_trend_fraction"] = ion["trend_fraction"]
     result["iis_A"] = -ion["current_A"]
     result["te_fit_i0"] = ion["current_A"]
+    if ion["snr"] < cfg["ion_min_snr"]:
+        result["warnings"].append(
+            "ion-saturation current estimate is not resolved above its uncertainty"
+        )
+        return result
+    if ion["trend_exceeds_limit"]:
+        result["model_notes"].append(
+            "ion-saturation branch is sloped; median region current was used"
+        )
 
     ion_voltage_max = Vb[ion["mask"]][-1]
     derivative_ion_mask = Va <= ion_voltage_max
@@ -785,6 +878,7 @@ def analyze_iv_trace(
         Ib,
         vp_value,
         ion["noise_A"],
+        enforce_flatness=cfg["enforce_ideal_model_checks"],
     )
     if electron_saturation is None:
         result["warnings"].append(saturation_error)
@@ -792,6 +886,13 @@ def analyze_iv_trace(
     I_es = electron_saturation["current_A"]
     result["ies_A"] = I_es
     result["electron_saturation_slope_A_per_V"] = electron_saturation["slope_A_per_V"]
+    result["electron_saturation_trend_fraction"] = electron_saturation[
+        "trend_fraction"
+    ]
+    if electron_saturation["trend_exceeds_limit"]:
+        result["model_notes"].append(
+            "electron-saturation branch is sloped; median region current was used"
+        )
 
     te_fit = _fit_electron_temperature(
         Vb,
@@ -812,9 +913,36 @@ def analyze_iv_trace(
     result["te_fit_relative_uncertainty"] = te_fit["relative_slope_uncertainty"]
     result["te_fit_log_span"] = te_fit["log_span"]
     result["te_fit_curvature_log"] = te_fit["curvature_log"]
+    result["te_fit_curvature_flagged"] = te_fit["curvature_detected"]
     result["te_fit_passed_r2"] = te_fit["passed_r2"]
     result["te_fit_candidate_count"] = 1 if te_fit["npts"] else 0
     result["te_fit_valid"] = te_fit["valid"]
+    if te_fit["curvature_detected"]:
+        result["model_notes"].append(
+            "electron-retarding semilog branch has significant curvature"
+        )
+    # Retain the numerical fit result independently of the quality decision.
+    # This prevents a failed diagnostic gate from erasing an otherwise finite
+    # fit and leaving diagnostic/profile plots entirely blank.
+    result["te_eV"] = te_fit["te_eV_candidate"]
+
+    if np.isfinite(te_fit["slope"]) and te_fit["slope"] > 0:
+        fitted_vp = (np.log(I_es) - te_fit["intercept"]) / te_fit["slope"]
+        if np.isfinite(fitted_vp):
+            result["vp_fit_V"] = float(fitted_vp)
+
+    probe_area = cfg["probe_area"]
+    if (
+        probe_area is not None
+        and np.isfinite(result["te_eV"])
+        and result["te_eV"] > 0
+    ):
+        density = density_from_electron_saturation_current(
+            I_es,
+            result["te_eV"],
+            probe_area,
+        )
+        result["n_e_m3"] = density.to_value(u.m**-3)
 
     if te_fit["npts"]:
         selected_voltage = Vb[te_fit["fit_mask"]]
@@ -827,45 +955,45 @@ def analyze_iv_trace(
         electron_leakage = np.exp(
             te_fit["slope"] * ion_voltage_max + te_fit["intercept"]
         )
-        if electron_leakage > 0.02 * result["iis_A"]:
-            result["warnings"].append(
-                "negative-bias coverage is insufficient to isolate ion saturation"
-            )
-            return result
+        result["electron_leakage_fraction"] = electron_leakage / result["iis_A"]
+        if result["electron_leakage_fraction"] > 0.02:
+            message = "negative-bias coverage may include electron current in the ion estimate"
+            if cfg["enforce_ideal_model_checks"]:
+                result["warnings"].append(
+                    "negative-bias coverage is insufficient to isolate ion saturation"
+                )
+                return result
+            result["model_notes"].append(message)
 
     if not te_fit["valid"]:
         result["warnings"].append(te_fit["reason"])
         return result
 
-    fitted_vp = (np.log(I_es) - te_fit["intercept"]) / te_fit["slope"]
+    fitted_vp = result["vp_fit_V"]
     vp_tolerance = max(
         2 * cfg["voltage_bin_width"],
         min(0.5 * cfg["vp_smoothing_width_V"], 0.5 * te_fit["te_eV_candidate"]),
     )
-    if (
+    vp_estimators_disagree = (
         not np.isfinite(fitted_vp)
         or not vf_value < fitted_vp < Vb[-1]
         or abs(fitted_vp - vp_value) > vp_tolerance
-    ):
-        result["warnings"].append(
-            "derivative and retarding/saturation estimates of plasma potential disagree"
-        )
-        return result
+    )
+    if vp_estimators_disagree:
+        message = "derivative and retarding/saturation plasma-potential estimates disagree"
+        if cfg["enforce_ideal_model_checks"]:
+            result["warnings"].append(message)
+            return result
+        result["model_notes"].append(message)
 
-    result["vp_V"] = float(fitted_vp)
-    result["te_eV"] = te_fit["te_eV_candidate"]
-    probe_area = cfg["probe_area"]
+    # Use the fit extrapolation only when it is consistent with the measured
+    # derivative knee; otherwise retain the derivative-based Vp estimate.
+    if not vp_estimators_disagree:
+        result["vp_V"] = float(fitted_vp)
     if probe_area is None:
         result["warnings"].append(
             "missing probe_area; electron density was not calculated"
         )
-    else:
-        density = density_from_electron_saturation_current(
-            I_es,
-            result["te_eV"],
-            probe_area,
-        )
-        result["n_e_m3"] = density.to_value(u.m**-3)
 
     result["ok"] = True
     return result

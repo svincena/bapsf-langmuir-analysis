@@ -40,13 +40,25 @@ def build_iv_diagnostic_summary(result):
         summary.append(f"V fit = {vstart:.3g} to {vstop:.3g} V")
     ion_current = result.get("ion_current_A", np.nan)
     ion_noise = result.get("ion_noise_A", np.nan)
+    ion_uncertainty = result.get("ion_current_uncertainty_A", np.nan)
+    ion_snr = result.get("ion_current_snr", np.nan)
     vp_derivative = result.get("vp_derivative_V", np.nan)
     if np.isfinite(vp_derivative):
         summary.append(f"Vp derivative seed = {vp_derivative:.4g} V")
+    vp_fit = result.get("vp_fit_V", np.nan)
+    if np.isfinite(vp_fit):
+        summary.append(f"Vp fit extrapolation = {vp_fit:.4g} V")
     if np.isfinite(ion_current):
         summary.append(f"I_ion = {ion_current:.3g} A")
     if np.isfinite(ion_noise):
-        summary.append(f"ion MAD sigma = {ion_noise:.3g} A")
+        summary.append(f"ion residual MAD sigma = {ion_noise:.3g} A")
+    if np.isfinite(ion_uncertainty):
+        summary.append(f"I_ion uncertainty = {ion_uncertainty:.3g} A")
+    if np.isfinite(ion_snr):
+        summary.append(f"I_ion estimate SNR = {ion_snr:.3g}")
+    model_notes = result.get("model_notes", [])
+    if model_notes:
+        summary.append(f"ideal-model deviations = {len(model_notes)}")
     return summary
 
 

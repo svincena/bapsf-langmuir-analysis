@@ -129,7 +129,7 @@ def test_endpoint_derivative_peak_is_not_a_plasma_potential():
     )
 
 
-def test_failed_r2_gate_produces_no_temperature_or_density():
+def test_failed_r2_gate_reports_fit_but_marks_it_rejected():
     voltage, current, truth = _ideal_trace()
     electron_current = truth["ies_A"] * np.where(
         voltage <= truth["vp_V"],
@@ -151,8 +151,9 @@ def test_failed_r2_gate_produces_no_temperature_or_density():
 
     assert result["ok"] is False
     assert result["te_fit_passed_r2"] is False
-    assert np.isnan(result["te_eV"])
-    assert np.isnan(result["n_e_m3"])
+    assert np.isfinite(result["te_eV"])
+    assert np.isfinite(result["vp_V"])
+    assert np.isfinite(result["n_e_m3"])
 
 
 def test_density_value_and_equivalent_units():
@@ -246,19 +247,30 @@ def test_descending_quantity_sweep_matches_forward_float_sweep():
         assert descending[key] == pytest.approx(forward[key], rel=1e-10, abs=1e-12)
 
 
-def test_sloped_ion_branch_is_rejected():
+def test_sloped_ion_branch_is_allowed_by_default_and_strict_mode_rejects():
     voltage, current, _ = _ideal_trace()
     drift = 15e-6 * np.clip(voltage - voltage[0], 0, 8)
-    result = analyze_iv_trace(voltage, current + drift, _config())
+    relaxed = analyze_iv_trace(voltage, current + drift, _config())
+    strict = analyze_iv_trace(
+        voltage,
+        current + drift,
+        _config(enforce_ideal_model_checks=True),
+    )
 
-    assert result["ok"] is False
-    assert any("ion-saturation plateau" in warning for warning in result["warnings"])
+    assert relaxed["ok"] is True
+    assert any("sloped" in note for note in relaxed["model_notes"])
+    assert strict["ok"] is False
+    assert any("ion-saturation plateau" in warning for warning in strict["warnings"])
 
 
 def test_inadequate_negative_bias_coverage_is_rejected():
     voltage, current, _ = _ideal_trace()
     keep = voltage >= -2.0
-    result = analyze_iv_trace(voltage[keep], current[keep], _config())
+    result = analyze_iv_trace(
+        voltage[keep],
+        current[keep],
+        _config(enforce_ideal_model_checks=True),
+    )
 
     assert result["ok"] is False
     assert any("negative-bias coverage" in warning for warning in result["warnings"])
@@ -289,7 +301,7 @@ def test_absolute_current_zero_must_be_explicitly_calibrated():
     )
 
 
-def test_moderate_noise_recovers_solution_but_unresolved_ion_signal_rejects():
+def test_moderate_noise_recovers_solution_but_excessive_noise_rejects_fit():
     voltage, current, truth = _ideal_trace()
     rng = np.random.default_rng(20260809)
     moderate_noise = rng.normal(0.0, 50e-6, voltage.size)
@@ -304,7 +316,18 @@ def test_moderate_noise_recovers_solution_but_unresolved_ion_signal_rejects():
     assert recovered["ies_A"] == pytest.approx(truth["ies_A"], rel=0.04)
     assert recovered["n_e_m3"] == pytest.approx(truth["n_e_m3"], rel=0.06)
     assert rejected["ok"] is False
-    assert np.isnan(rejected["te_eV"])
+    assert np.isfinite(rejected["te_eV"])
+    assert any("R^2" in warning for warning in rejected["warnings"])
+
+
+def test_unresolved_regional_ion_estimate_is_rejected():
+    voltage, current, _ = _ideal_trace(ion_current_A=-2e-5)
+    noise = np.random.default_rng(77).normal(0.0, 200e-6, voltage.size)
+    result = analyze_iv_trace(voltage, current + noise, _config())
+
+    assert result["ok"] is False
+    assert result["ion_current_snr"] < 3.0
+    assert any("ion-saturation current estimate" in warning for warning in result["warnings"])
 
 
 def test_high_r2_bimaxwellian_branch_fails_curvature_gate():
@@ -331,9 +354,18 @@ def test_high_r2_bimaxwellian_branch_fails_curvature_gate():
         )
     )
 
-    result = analyze_iv_trace(voltage, ion_current + bimaxwellian_current, _config())
+    relaxed = analyze_iv_trace(voltage, ion_current + bimaxwellian_current, _config())
+    result = analyze_iv_trace(
+        voltage,
+        ion_current + bimaxwellian_current,
+        _config(enforce_ideal_model_checks=True),
+    )
 
+    assert relaxed["ok"] is True
+    assert any("curvature" in note for note in relaxed["model_notes"])
     assert result["te_fit_r2"] > 0.98
     assert result["ok"] is False
-    assert np.isnan(result["te_eV"])
+    assert np.isfinite(result["te_eV"])
+    assert np.isfinite(result["vp_V"])
+    assert np.isfinite(result["n_e_m3"])
     assert any("curvature" in warning for warning in result["warnings"])

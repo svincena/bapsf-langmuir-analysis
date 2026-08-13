@@ -10,6 +10,7 @@ import h5py
 import astropy.units as u
 import io
 import multiprocessing as mp
+from collections import Counter
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from scipy.signal import savgol_filter
@@ -21,11 +22,14 @@ from langmuir_diagnostics import (
 
 save_results = True
 plot_results = True
-# Only enable with an independently measured plasma-off electronics baseline.
-# Using the low-bias sweep samples would erase the physical ion current and Vf.
-subtract_dc = False
-# Set True only when the sweep current has an independently established zero.
-current_zero_calibrated = False
+# The first 128 samples provide a plasma-off electronics baseline, independent
+# of the later I-V sweep.  Do not replace this with low-bias sweep samples;
+# doing so would erase the physical ion current and bias Vf.
+subtract_dc = True
+current_zero_calibrated = True
+# Real probe saturation branches are normally sloped. Keep ideal planar-
+# Maxwellian consistency checks as diagnostics instead of rejecting good data.
+enforce_ideal_model_checks = False
 parallel_analysis = True
 analysis_processes = None  # None uses one fewer than the detected CPU count
 
@@ -75,8 +79,8 @@ sweep_start_index = first_sweep_index
 sweep_end_index = 96_200
 nt = sweep_end_index - sweep_start_index + 1
 
-isweep_dc_offset_start_index = None
-isweep_dc_offset_end_index = None
+isweep_dc_offset_start_index = 0
+isweep_dc_offset_end_index = 127
 
 isat_start_index = 0
 isat_end_index = 127
@@ -89,7 +93,7 @@ sg_smooth_order = 2
 
 
 # Example diagnostic plot controls
-diagnostic_plot_every = 8       # make an IV diagnostic plot every N x indices; 0 disables these plots
+diagnostic_plot_every = 2       # make an IV diagnostic plot every N x indices; 0 disables these plots
 example_pause_seconds = 1.0
 diagnostic_plot_output_dir = Path("output_diagnostic_plots")
 
@@ -110,7 +114,10 @@ te_current_floor_frac = 0.03
 te_min_eV = 0.05
 te_max_eV = 30.0
 te_min_r2 = 0.98
-te_subtract_i0 = True  # legacy export name; I0 is now the measured ion plateau
+# Uses autocorrelation-adjusted uncertainty of the regional median, not the
+# point-to-point residual scatter.
+ion_min_snr = 3.0
+te_subtract_i0 = True  # legacy export name; I0 is now the median ion-region current
 
 langmuir_analysis_config = {
     "iv_npts": iv_npts,
@@ -124,8 +131,10 @@ langmuir_analysis_config = {
     "te_min_eV": te_min_eV,
     "te_max_eV": te_max_eV,
     "te_min_r2": te_min_r2,
+    "ion_min_snr": ion_min_snr,
     "probe_area": probe_area,
     "current_zero_calibrated": current_zero_calibrated,
+    "enforce_ideal_model_checks": enforce_ideal_model_checks,
 }
 
 # Optional post-processing controls along x
@@ -483,16 +492,57 @@ def render_summary_plot(
     vp_raw=None,
     te_fit_r2=None,
     te_poor_fit_r2=None,
+    analysis_ok=None,
+    analysis_status=None,
     title="Langmuir X-Line Summary",
 ):
     fig, axs = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
 
-    def _plot_profile(ax, values, plot_title, y_label):
-        ax.plot(x, values.value)
+    finite_x = np.asarray(x)[np.isfinite(x)]
+    fit_accepted = (
+        None if analysis_ok is None else np.asarray(analysis_ok, dtype=bool)
+    )
+
+    def _finish_profile_axis(ax, plot_title, y_label):
         ax.set_title(plot_title)
         ax.set_xlabel("X (cm)")
         ax.set_ylabel(y_label)
+        if finite_x.size:
+            ax.set_xlim(np.min(finite_x), np.max(finite_x))
         ax.grid(True)
+
+    def _mark_empty(ax):
+        ax.text(
+            0.5,
+            0.5,
+            "No accepted values",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color="0.35",
+        )
+
+    def _plot_profile(ax, values, plot_title, y_label):
+        plot_values = np.asarray(values.value, dtype=float)
+        finite = np.isfinite(x) & np.isfinite(plot_values)
+        if np.any(finite):
+            ax.plot(np.asarray(x)[finite], plot_values[finite])
+            if fit_accepted is not None:
+                rejected = finite & ~fit_accepted
+                if np.any(rejected):
+                    ax.plot(
+                        np.asarray(x)[rejected],
+                        plot_values[rejected],
+                        "x",
+                        color="tab:orange",
+                        label="no accepted fits",
+                    )
+        else:
+            _mark_empty(ax)
+        _finish_profile_axis(ax, plot_title, y_label)
+        handles, _ = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend()
 
     _plot_profile(axs[0, 0], te, "Electron Temperature", "T_e (eV)")
     if te_fit_r2 is not None and te_poor_fit_r2 is not None:
@@ -508,18 +558,42 @@ def render_summary_plot(
             )
             axs[0, 0].legend()
 
-    axs[0, 1].plot(x, vp.value, label="Vp")
+    vp_values = np.asarray(vp.value, dtype=float)
+    vp_finite = np.isfinite(x) & np.isfinite(vp_values)
+    if np.any(vp_finite):
+        axs[0, 1].plot(np.asarray(x)[vp_finite], vp_values[vp_finite], label="Vp")
+        if fit_accepted is not None:
+            rejected = vp_finite & ~fit_accepted
+            if np.any(rejected):
+                axs[0, 1].plot(
+                    np.asarray(x)[rejected],
+                    vp_values[rejected],
+                    "x",
+                    color="tab:orange",
+                    label="no accepted fits",
+                )
+    any_vp_values = bool(np.any(vp_finite))
     if vp_raw is not None:
-        axs[0, 1].plot(x, vp_raw.value, alpha=0.35, label="Vp raw")
+        vp_raw_values = np.asarray(vp_raw.value, dtype=float)
+        vp_raw_finite = np.isfinite(x) & np.isfinite(vp_raw_values)
+        if np.any(vp_raw_finite):
+            axs[0, 1].plot(
+                np.asarray(x)[vp_raw_finite],
+                vp_raw_values[vp_raw_finite],
+                alpha=0.35,
+                label="Vp raw",
+            )
+            any_vp_values = True
     if vp_spike_mask is not None and vp_raw is not None:
         m = vp_spike_mask.astype(bool)
         if np.any(m):
             axs[0, 1].plot(x[m], vp_raw.value[m], "o", label="flagged spikes")
-    axs[0, 1].set_title("Plasma Potential")
-    axs[0, 1].set_xlabel("X (cm)")
-    axs[0, 1].set_ylabel("V_p (V)")
-    axs[0, 1].grid(True)
-    axs[0, 1].legend()
+    if not any_vp_values:
+        _mark_empty(axs[0, 1])
+    _finish_profile_axis(axs[0, 1], "Plasma Potential", "V_p (V)")
+    handles, _ = axs[0, 1].get_legend_handles_labels()
+    if handles:
+        axs[0, 1].legend()
 
     _plot_profile(axs[1, 0], vf, "Floating Potential", "V_f (V)")
     _plot_profile(axs[1, 1], ies, "Electron Saturation Current", "I_es (A)")
@@ -529,7 +603,8 @@ def render_summary_plot(
     else:
         axs[2, 1].axis("off")
 
-    fig.suptitle(title, fontsize=16)
+    summary_title = title if analysis_status is None else f"{title}\n{analysis_status}"
+    fig.suptitle(summary_title, fontsize=16)
     return fig
 
 
@@ -690,6 +765,7 @@ ies_shot = np.full(trace_shape, np.nan)
 iis_shot = np.full(trace_shape, np.nan)
 n_e_shot = np.full(trace_shape, np.nan)
 analysis_ok_shot = np.zeros(trace_shape, dtype=np.uint8)
+analysis_rejection_counts = Counter()
 
 te_fit_r2_shot = np.full(trace_shape, np.nan)
 te_fit_rmse_shot = np.full(trace_shape, np.nan)
@@ -759,17 +835,26 @@ if use_parallel_analysis:
             for warning in result["warnings"]:
                 print(f"{warning} at index {idx}")
 
+            if not result["ok"]:
+                reason = (
+                    result["warnings"][-1]
+                    if result["warnings"]
+                    else "unspecified analysis failure"
+                )
+                analysis_rejection_counts[reason] += 1
+
             if result["iv_voltage_grid"] is None:
                 continue
 
             analysis_ok_shot[idx] = int(result["ok"])
-            if result["ok"]:
-                te_shot[idx] = result["te_eV"]
-                vp_shot[idx] = result["vp_V"]
-                vf_shot[idx] = result["vf_V"]
-                ies_shot[idx] = result["ies_A"]
-                iis_shot[idx] = result["iis_A"]
-                n_e_shot[idx] = result.get("n_e_m3", np.nan)
+            # Keep every finite estimate for plotting and export.  The strict
+            # quality decision remains available separately in analysis_ok_shot.
+            te_shot[idx] = result["te_eV"]
+            vp_shot[idx] = result["vp_V"]
+            vf_shot[idx] = result["vf_V"]
+            ies_shot[idx] = result["ies_A"]
+            iis_shot[idx] = result["iis_A"]
+            n_e_shot[idx] = result.get("n_e_m3", np.nan)
 
             te_fit_r2_shot[idx] = result["te_fit_r2"]
             te_fit_rmse_shot[idx] = result["te_fit_rmse"]
@@ -815,17 +900,26 @@ else:
         for warning in result["warnings"]:
             print(f"{warning} at index {idx}")
 
+        if not result["ok"]:
+            reason = (
+                result["warnings"][-1]
+                if result["warnings"]
+                else "unspecified analysis failure"
+            )
+            analysis_rejection_counts[reason] += 1
+
         if result["iv_voltage_grid"] is None:
             continue
 
         analysis_ok_shot[idx] = int(result["ok"])
-        if result["ok"]:
-            te_shot[idx] = result["te_eV"]
-            vp_shot[idx] = result["vp_V"]
-            vf_shot[idx] = result["vf_V"]
-            ies_shot[idx] = result["ies_A"]
-            iis_shot[idx] = result["iis_A"]
-            n_e_shot[idx] = result.get("n_e_m3", np.nan)
+        # Keep every finite estimate for plotting and export.  The strict
+        # quality decision remains available separately in analysis_ok_shot.
+        te_shot[idx] = result["te_eV"]
+        vp_shot[idx] = result["vp_V"]
+        vf_shot[idx] = result["vf_V"]
+        ies_shot[idx] = result["ies_A"]
+        iis_shot[idx] = result["iis_A"]
+        n_e_shot[idx] = result.get("n_e_m3", np.nan)
 
         te_fit_r2_shot[idx] = result["te_fit_r2"]
         te_fit_rmse_shot[idx] = result["te_fit_rmse"]
@@ -860,7 +954,8 @@ else:
             plt.pause(example_pause_seconds)
             plt.close(fig)
 
-# Compatibility export: this mask now identifies accepted Te values only.
+# Compatibility export: this mask identifies locations with a reported Te fit.
+# Consult analysis_ok_shot to distinguish quality-accepted and rejected fits.
 statistics_fit_mask = np.isfinite(te_shot)
 te_values, te_std_values, fit_count = shot_mean_and_std(te_shot)
 vp_values, vp_std_values, _ = shot_mean_and_std(vp_shot)
@@ -894,6 +989,16 @@ te_fit_passed_r2 = np.any(te_fit_passed_r2_shot.astype(bool), axis=-1).astype(np
 te_fit_candidate_count = np.sum(te_fit_candidate_count_shot, axis=-1)
 analysis_valid_count = np.sum(analysis_ok_shot, axis=-1)
 analysis_ok = (analysis_valid_count > 0).astype(np.uint8)
+accepted_trace_count = int(np.sum(analysis_ok_shot))
+reported_trace_count = int(np.count_nonzero(np.isfinite(te_shot)))
+analysis_status = (
+    f"Reported {reported_trace_count}/{n_traces} finite fits; "
+    f"accepted {accepted_trace_count}/{n_traces} fits"
+)
+if analysis_rejection_counts:
+    common_reason, common_count = analysis_rejection_counts.most_common(1)[0]
+    analysis_status += f"; top rejection ({common_count}): {common_reason}"
+print(f"Analysis summary: {analysis_status}")
 
 # Backward-compatible representative I-V products are visualization-only shot
 # means.  They are not used for physics, because individual sweep endpoints
@@ -968,6 +1073,8 @@ if plot_results:
         vp_raw=vp_raw,
         te_fit_r2=te_fit_r2,
         te_poor_fit_r2=te_min_r2,
+        analysis_ok=analysis_ok,
+        analysis_status=analysis_status,
     )
 
     plot_buffer = io.BytesIO()
@@ -1134,6 +1241,8 @@ if save_results:
                 vp_raw=vp_raw,
                 te_fit_r2=te_fit_r2,
                 te_poor_fit_r2=te_min_r2,
+                analysis_ok=analysis_ok,
+                analysis_status=analysis_status,
             )
             plot_buffer = io.BytesIO()
             fig.savefig(plot_buffer, format="png", dpi=600)
@@ -1217,17 +1326,22 @@ if save_results:
         grp.attrs["te_min_eV"] = te_min_eV
         grp.attrs["te_max_eV"] = te_max_eV
         grp.attrs["te_min_r2"] = te_min_r2
+        grp.attrs["ion_min_snr"] = ion_min_snr
         grp.attrs["analysis_model"] = (
-            "planar Maxwellian electrons; separate low-bias ion and high-bias "
-            "electron saturation plateaus"
+            "single-temperature semilog fit; median low-bias ion and high-bias "
+            "electron-saturation region estimates"
         )
-        grp.attrs["te_fit_i0_definition"] = "measured constant ion-saturation current"
+        grp.attrs["te_fit_i0_definition"] = "median low-bias ion-region current"
         grp.attrs["iv_npts_role"] = "fixed-size diagnostics only"
         grp.attrs["current_zero_calibrated"] = int(current_zero_calibrated)
+        grp.attrs["enforce_ideal_model_checks"] = int(enforce_ideal_model_checks)
         grp.attrs["subtract_dc"] = int(subtract_dc)
         grp.attrs["shot_standard_deviation_ddof"] = 1
         grp.attrs["per_shot_axis_order"] = "x,shot"
         grp.attrs["shot_statistics_stage"] = "individual fits before spatial post-processing"
+        grp.attrs["profile_value_policy"] = (
+            "finite estimates retained; analysis_ok records fit acceptance"
+        )
 
         grp.attrs["enable_vp_spike_rejection"] = int(enable_vp_spike_rejection)
         grp.attrs["vp_spike_half_window"] = vp_spike_half_window
@@ -1344,17 +1458,22 @@ if save_results:
         "shot_standard_deviation_ddof": np.array(1),
         "per_shot_axis_order": np.array("x,shot"),
         "shot_statistics_stage": np.array("individual fits before spatial post-processing"),
+        "profile_value_policy": np.array(
+            "finite estimates retained; analysis_ok records fit acceptance"
+        ),
         "xline_shape_info": np.array([nx, nshots, nt_full, nt, iv_npts], dtype=np.int64),
         "trace_spatial_shape": np.array(spatial_shape, dtype=np.int64),
         "dt_s": np.array(dt),
         "te_min_r2": np.array(te_min_r2),
+        "ion_min_snr": np.array(ion_min_snr),
         "analysis_model": np.array(
-            "planar Maxwellian electrons; separate low-bias ion and high-bias "
-            "electron saturation plateaus"
+            "single-temperature semilog fit; median low-bias ion and high-bias "
+            "electron-saturation region estimates"
         ),
-        "te_fit_i0_definition": np.array("measured constant ion-saturation current"),
+        "te_fit_i0_definition": np.array("median low-bias ion-region current"),
         "iv_npts_role": np.array("fixed-size diagnostics only"),
         "current_zero_calibrated": np.array(int(current_zero_calibrated)),
+        "enforce_ideal_model_checks": np.array(int(enforce_ideal_model_checks)),
         "subtract_dc": np.array(int(subtract_dc)),
         "summary_plot_path": np.array("" if summary_plot_path is None else str(summary_plot_path)),
         "all_iv_plot_path": np.array("" if all_iv_plot_path is None else str(all_iv_plot_path)),
