@@ -22,6 +22,8 @@ from langmuir_diagnostics import (
 
 save_results = True
 plot_results = True
+# Draw shot-to-shot +/-1 sigma error bars when more than one shot is available.
+plot_summary_stds = True
 # The first 128 samples provide a plasma-off electronics baseline, independent
 # of the later I-V sweep.  Do not replace this with low-bias sweep samples;
 # doing so would erase the physical ion current and bias Vf.
@@ -488,6 +490,13 @@ def render_summary_plot(
     ies,
     iis,
     n_e=None,
+    te_std=None,
+    vp_std=None,
+    vf_std=None,
+    ies_std=None,
+    iis_std=None,
+    n_e_std=None,
+    plot_stds=False,
     vp_spike_mask=None,
     vp_raw=None,
     te_fit_r2=None,
@@ -522,11 +531,32 @@ def render_summary_plot(
             color="0.35",
         )
 
-    def _plot_profile(ax, values, plot_title, y_label):
+    def _plot_standard_deviations(ax, values, std, color):
+        if not plot_stds or std is None:
+            return
+
+        plot_values = np.asarray(values.value, dtype=float)
+        std_values = np.asarray(std.value, dtype=float)
+        finite = np.isfinite(x) & np.isfinite(plot_values) & np.isfinite(std_values)
+        if np.any(finite):
+            ax.errorbar(
+                np.asarray(x)[finite],
+                plot_values[finite],
+                yerr=std_values[finite],
+                fmt="none",
+                ecolor=color,
+                elinewidth=1.0,
+                capsize=3,
+                alpha=0.7,
+                label="shot-to-shot $\u00b11\u03c3$",
+            )
+
+    def _plot_profile(ax, values, std, plot_title, y_label):
         plot_values = np.asarray(values.value, dtype=float)
         finite = np.isfinite(x) & np.isfinite(plot_values)
         if np.any(finite):
-            ax.plot(np.asarray(x)[finite], plot_values[finite])
+            line = ax.plot(np.asarray(x)[finite], plot_values[finite])[0]
+            _plot_standard_deviations(ax, values, std, line.get_color())
             if fit_accepted is not None:
                 rejected = finite & ~fit_accepted
                 if np.any(rejected):
@@ -544,7 +574,7 @@ def render_summary_plot(
         if handles:
             ax.legend()
 
-    _plot_profile(axs[0, 0], te, "Electron Temperature", "T_e (eV)")
+    _plot_profile(axs[0, 0], te, te_std, "Electron Temperature", "T_e (eV)")
     if te_fit_r2 is not None and te_poor_fit_r2 is not None:
         poor_te_fit = np.isfinite(te_fit_r2) & np.isfinite(te.value) & (te_fit_r2 < te_poor_fit_r2)
         if np.any(poor_te_fit):
@@ -561,7 +591,12 @@ def render_summary_plot(
     vp_values = np.asarray(vp.value, dtype=float)
     vp_finite = np.isfinite(x) & np.isfinite(vp_values)
     if np.any(vp_finite):
-        axs[0, 1].plot(np.asarray(x)[vp_finite], vp_values[vp_finite], label="Vp")
+        vp_line = axs[0, 1].plot(
+            np.asarray(x)[vp_finite],
+            vp_values[vp_finite],
+            label="Vp",
+        )[0]
+        _plot_standard_deviations(axs[0, 1], vp, vp_std, vp_line.get_color())
         if fit_accepted is not None:
             rejected = vp_finite & ~fit_accepted
             if np.any(rejected):
@@ -595,11 +630,29 @@ def render_summary_plot(
     if handles:
         axs[0, 1].legend()
 
-    _plot_profile(axs[1, 0], vf, "Floating Potential", "V_f (V)")
-    _plot_profile(axs[1, 1], ies, "Electron Saturation Current", "I_es (A)")
-    _plot_profile(axs[2, 0], iis, "Ion Saturation Current", "I_is (A)")
+    _plot_profile(axs[1, 0], vf, vf_std, "Floating Potential", "V_f (V)")
+    _plot_profile(
+        axs[1, 1],
+        ies,
+        ies_std,
+        "Electron Saturation Current",
+        "I_es (A)",
+    )
+    _plot_profile(
+        axs[2, 0],
+        iis,
+        iis_std,
+        "Ion Saturation Current",
+        "I_is (A)",
+    )
     if n_e is not None:
-        _plot_profile(axs[2, 1], n_e, "Electron Density", "n_e (m^-3)")
+        _plot_profile(
+            axs[2, 1],
+            n_e,
+            n_e_std,
+            "Electron Density",
+            "n_e (m^-3)",
+        )
     else:
         axs[2, 1].axis("off")
 
@@ -1069,6 +1122,13 @@ if plot_results:
         ies_plot,
         iis_plot,
         n_e_plot,
+        te_std=te_std,
+        vp_std=vp_std,
+        vf_std=vf_std,
+        ies_std=ies_std,
+        iis_std=iis_std,
+        n_e_std=n_e_std,
+        plot_stds=plot_summary_stds and nshots > 1,
         vp_spike_mask=vp_spike_mask,
         vp_raw=vp_raw,
         te_fit_r2=te_fit_r2,
@@ -1237,6 +1297,13 @@ if save_results:
                 ies_plot,
                 iis_plot,
                 n_e_plot,
+                te_std=te_std,
+                vp_std=vp_std,
+                vf_std=vf_std,
+                ies_std=ies_std,
+                iis_std=iis_std,
+                n_e_std=n_e_std,
+                plot_stds=plot_summary_stds and nshots > 1,
                 vp_spike_mask=vp_spike_mask,
                 vp_raw=vp_raw,
                 te_fit_r2=te_fit_r2,
