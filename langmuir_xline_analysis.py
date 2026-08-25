@@ -24,6 +24,9 @@ save_results = True
 plot_results = True
 # Draw shot-to-shot +/-1 sigma error bars when more than one shot is available.
 plot_summary_stds = True
+# Integrate the normalized electron-density profile across x and report the
+# resulting effective profile width in the summary plot.
+calculate_shape_factor = True
 # The first 128 samples provide a plasma-off electronics baseline, independent
 # of the later I-V sweep.  Do not replace this with low-bias sweep samples;
 # doing so would erase the physical ion current and bias Vf.
@@ -35,30 +38,30 @@ enforce_ideal_model_checks = False
 parallel_analysis = True
 analysis_processes = None  # None uses one fewer than the detected CPU count
 
-filename = "/Users/vincena/data/Columbia_Alfven_Wave/July2026/38_sweeps-p38-xline-400-1600-600-800G_5100A_minp25 2026-07-13 17.11.05.hdf5"
+filename = '/Users/vincena/data/Mini_Magnetospheres/August2026/run_05_langmuir_xline_dipole_removed 2026-08-25 12.34.33.hdf5'
 # digitizer = "SIS 3301" # for 3301, this is also the name of the adc
 # adc = "SIS 3301" #8-channel 14-bit 100 MS/s digitizer
 adc = "SIS 3302" #8-channel 16-bit 100 MS/s digitizer
 digitizer = "SIS crate"
-sis_config_name = "siscf1-4ch-lang"
+sis_config_name = "Isat_Isweep_Vsweep_282624S_50MHz"
 
 
 
 nshots = 5
-nt_full = 612_352
+nt_full = 282_624
 
-nx = 33
-x_min = -32.0
-x_max = 32.0
+nx = 81
+x_min = -37.5
+x_max = 37.5
 x = np.linspace(x_min, x_max, nx)
 
-board = 1
-vsweep_channel = 1
+board = 2
+vsweep_channel = 3
 isweep_channel = 2
 
 vsweep_attenuation = 100.0
 isweep_attenuation = 1.0 #4.0
-isweep_resistance = 2.0 #1.0
+isweep_resistance = 3.1 #1.0
 probe_area = 4.0 * u.mm**2
 
 
@@ -72,13 +75,10 @@ shotnum_start = data_offset + 1
 shotnum_end = nx * nshots + shotnum_start   # exclusive upper bound in slice(...)
 n_expected_shots = shotnum_end - shotnum_start
 
-# first_sweep_index = 93_800
-# sweep_start_index = first_sweep_index + 1_500
-# sweep_end_index = first_sweep_index + 2_500
-# nt = sweep_end_index - sweep_start_index + 1
-first_sweep_index = 93_800
+
+first_sweep_index = 5010
 sweep_start_index = first_sweep_index
-sweep_end_index = 96_200
+sweep_end_index = 10000
 nt = sweep_end_index - sweep_start_index + 1
 
 isweep_dc_offset_start_index = 0
@@ -100,7 +100,7 @@ example_pause_seconds = 1.0
 diagnostic_plot_output_dir = Path("output_diagnostic_plots")
 
 # Interpolated monotonic I-V grid parameters
-iv_npts = 1024
+iv_npts = 2048
 voltage_bin_width = 0.05  # volts; merges near-duplicate voltages before interpolation
 
 # Derivative smoothing is specified in volts and therefore does not change when
@@ -114,7 +114,7 @@ te_min_points = 12
 te_margin_from_vp = 0.2  # volts
 te_current_floor_frac = 0.03
 te_min_eV = 0.05
-te_max_eV = 30.0
+te_max_eV = 20.0
 te_min_r2 = 0.98
 # Uses autocorrelation-adjusted uncertainty of the regional median, not the
 # point-to-point residual scatter.
@@ -196,6 +196,41 @@ def save_diagnostic_figure(fig, output_dir, filename_stem, dpi=600):
     fig.savefig(path, format="png", dpi=dpi)
     print(f"Saved diagnostic plot: {path}")
     return path
+
+
+def electron_density_profile_shape_factor(x_cm, electron_density_profile):
+    """Integrate peak-normalized electron density over x and return meters."""
+    x_values_cm = np.asarray(x_cm, dtype=float)
+    profile_values = np.asarray(
+        getattr(electron_density_profile, "value", electron_density_profile),
+        dtype=float,
+    )
+
+    if x_values_cm.shape != profile_values.shape:
+        raise ValueError(
+            "x coordinates and electron-density profile must have the same shape; "
+            f"got {x_values_cm.shape} and {profile_values.shape}."
+        )
+
+    finite = np.isfinite(x_values_cm) & np.isfinite(profile_values)
+    if np.count_nonzero(finite) < 2:
+        return np.nan * u.m
+
+    x_values_m = (x_values_cm[finite] * u.cm).to_value(u.m)
+    finite_profile = profile_values[finite]
+    profile_maximum = np.max(finite_profile)
+    if not np.isfinite(profile_maximum) or profile_maximum == 0.0:
+        return np.nan * u.m
+
+    normalized_profile = finite_profile / profile_maximum
+    # Apply the trapezoidal rule after converting the position samples to
+    # meters, so the dimensionless normalized profile integrates to a length.
+    shape_factor_m = np.sum(
+        np.diff(x_values_m)
+        * 0.5
+        * (normalized_profile[:-1] + normalized_profile[1:])
+    )
+    return shape_factor_m * u.m
 
 
 def read_channel_xline(
@@ -503,6 +538,7 @@ def render_summary_plot(
     te_poor_fit_r2=None,
     analysis_ok=None,
     analysis_status=None,
+    shape_factor=None,
     title="Langmuir X-Line Summary",
 ):
     fig, axs = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
@@ -653,6 +689,22 @@ def render_summary_plot(
             "Electron Density",
             "n_e (m^-3)",
         )
+        if shape_factor is not None:
+            shape_factor_m = u.Quantity(shape_factor).to_value(u.m)
+            shape_factor_text = (
+                f"Shape factor = {shape_factor_m:.4g} m"
+                if np.isfinite(shape_factor_m)
+                else "Shape factor unavailable"
+            )
+            axs[2, 1].text(
+                0.03,
+                0.95,
+                shape_factor_text,
+                transform=axs[2, 1].transAxes,
+                ha="left",
+                va="top",
+                bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"},
+            )
     else:
         axs[2, 1].axis("off")
 
@@ -1105,6 +1157,13 @@ vf_plot = vf_processed if enable_neighbor_smoothing else vf_raw
 ies_plot = ies_processed if (ies_processed is not None and enable_neighbor_smoothing) else ies_raw
 iis_plot = iis_processed if (iis_processed is not None and enable_neighbor_smoothing) else iis_raw
 n_e_plot = n_e_processed if (n_e_processed is not None and enable_neighbor_smoothing) else n_e_raw
+
+# Use the same raw or post-processed density profile displayed in the summary.
+shape_factor = (
+    electron_density_profile_shape_factor(x, n_e_plot)
+    if calculate_shape_factor
+    else None
+)
 # %%
 # Plot results
 
@@ -1135,6 +1194,7 @@ if plot_results:
         te_poor_fit_r2=te_min_r2,
         analysis_ok=analysis_ok,
         analysis_status=analysis_status,
+        shape_factor=shape_factor,
     )
 
     plot_buffer = io.BytesIO()
@@ -1310,6 +1370,7 @@ if save_results:
                 te_poor_fit_r2=te_min_r2,
                 analysis_ok=analysis_ok,
                 analysis_status=analysis_status,
+                shape_factor=shape_factor,
             )
             plot_buffer = io.BytesIO()
             fig.savefig(plot_buffer, format="png", dpi=600)
