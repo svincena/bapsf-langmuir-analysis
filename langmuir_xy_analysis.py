@@ -26,6 +26,9 @@ plot_results = True
 subtract_dc = False
 # Set True only when the sweep current has an independently established zero.
 current_zero_calibrated = False
+# Set this to match the current polarity from the acquisition electronics. The
+# analysis expects negative ion current and positive electron current.
+negate_Isweep_current = True
 # Real probe saturation branches are normally sloped. Keep ideal planar-
 # Maxwellian consistency checks as diagnostics instead of rejecting good data.
 enforce_ideal_model_checks = False
@@ -558,6 +561,7 @@ def render_summary_plot(
     vp_raw=None,
     te_fit_r2=None,
     te_poor_fit_r2=None,
+    analysis_ok=None,
     analysis_status=None,
     title="Langmuir XY-Plane Summary"
 ):
@@ -572,6 +576,34 @@ def render_summary_plot(
         _plot_map(axs[2, 1], x_mesh, y_mesh, n_e.value, "Electron Density", "n_e (m^-3)")
     else:
         axs[2, 1].axis("off")
+
+    # Keep finite estimates visible while marking locations where no shot fit
+    # passed the full acceptance policy.
+    if analysis_ok is not None:
+        fit_accepted = np.asarray(analysis_ok, dtype=bool)
+        maps = (
+            (axs[0, 0], te.value),
+            (axs[0, 1], vp.value),
+            (axs[1, 0], vf.value),
+            (axs[1, 1], ies.value),
+            (axs[2, 0], iis.value),
+        )
+        if n_e is not None:
+            maps += ((axs[2, 1], n_e.value),)
+        for ax, values in maps:
+            values = np.asarray(values, dtype=float)
+            if fit_accepted.shape != values.shape:
+                continue
+            rejected = np.isfinite(values) & ~fit_accepted
+            if np.any(rejected):
+                ax.plot(
+                    x_mesh[rejected],
+                    y_mesh[rejected],
+                    "x",
+                    color="tab:orange",
+                    label="no accepted fits",
+                )
+                ax.legend()
 
     if te_fit_r2 is not None and te_poor_fit_r2 is not None:
         poor_te_fit = np.isfinite(te_fit_r2) & (te_fit_r2 < te_poor_fit_r2)
@@ -687,7 +719,7 @@ isweep_full, _ = read_channel_xy(
     config_name=sis_config_name,
     scale_factor=isweep_attenuation / isweep_resistance,
     flipup=True,
-    negate=True,
+    negate=negate_Isweep_current,
 )
 print(f"Current data reshaped to (y, x, shots, time): {isweep_full.shape}")
 
@@ -1089,6 +1121,7 @@ if plot_results:
         vp_raw=vp_raw,
         te_fit_r2=te_fit_r2,
         te_poor_fit_r2=te_min_r2,
+        analysis_ok=analysis_ok,
         analysis_status=analysis_status,
         title=f"{Path(filename).stem} - Langmuir XY-plane Summary",
     )
@@ -1251,10 +1284,12 @@ if save_results:
                 vf_plot,
                 ies_plot,
                 iis_plot,
+                n_e_plot,
                 vp_spike_mask=vp_spike_mask,
                 vp_raw=vp_raw,
                 te_fit_r2=te_fit_r2,
                 te_poor_fit_r2=te_min_r2,
+                analysis_ok=analysis_ok,
                 analysis_status=analysis_status,
             )
             plot_buffer = io.BytesIO()
@@ -1343,11 +1378,15 @@ if save_results:
         grp.attrs["te_fit_i0_definition"] = "median low-bias ion-region current"
         grp.attrs["iv_npts_role"] = "fixed-size diagnostics only"
         grp.attrs["current_zero_calibrated"] = int(current_zero_calibrated)
+        grp.attrs["negate_Isweep_current"] = int(negate_Isweep_current)
         grp.attrs["enforce_ideal_model_checks"] = int(enforce_ideal_model_checks)
         grp.attrs["subtract_dc"] = int(subtract_dc)
         grp.attrs["shot_standard_deviation_ddof"] = 1
         grp.attrs["per_shot_axis_order"] = "y,x,shot"
         grp.attrs["shot_statistics_stage"] = "individual fits before spatial post-processing"
+        grp.attrs["profile_value_policy"] = (
+            "finite estimates retained; analysis_ok records fit acceptance"
+        )
 
         grp.attrs["enable_vp_spike_rejection"] = int(enable_vp_spike_rejection)
         grp.attrs["vp_spike_half_window_y"] = _as_yx_half_window(vp_spike_half_window)[0]
@@ -1466,6 +1505,9 @@ if save_results:
         "shot_standard_deviation_ddof": np.array(1),
         "per_shot_axis_order": np.array("y,x,shot"),
         "shot_statistics_stage": np.array("individual fits before spatial post-processing"),
+        "profile_value_policy": np.array(
+            "finite estimates retained; analysis_ok records fit acceptance"
+        ),
         "xy_shape_info": np.array([ny, nx, nshots, nt_full, nt, iv_npts], dtype=np.int64),
         "trace_spatial_shape": np.array(spatial_shape, dtype=np.int64),
         "dt_s": np.array(dt),
@@ -1478,6 +1520,7 @@ if save_results:
         "te_fit_i0_definition": np.array("median low-bias ion-region current"),
         "iv_npts_role": np.array("fixed-size diagnostics only"),
         "current_zero_calibrated": np.array(int(current_zero_calibrated)),
+        "negate_Isweep_current": np.array(int(negate_Isweep_current)),
         "enforce_ideal_model_checks": np.array(int(enforce_ideal_model_checks)),
         "subtract_dc": np.array(int(subtract_dc)),
         "summary_plot_path": np.array("" if summary_plot_path is None else str(summary_plot_path)),

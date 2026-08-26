@@ -5,9 +5,9 @@ Invocation examples:
     python read_langmuir_xy_npz.py path/to/run_langmuir_xy.npz
     python read_langmuir_xy_npz.py path/to/run_langmuir_xy.npz --plot
 
-The first form prints a compact inventory and Te-fit quality counts. The
-``--plot`` form also opens a quick four-panel summary plot with poor Te fits
-marked on the Te map.
+The first form prints a compact inventory, acquisition-polarity settings, and
+Te-fit quality counts. The ``--plot`` form opens a six-panel summary matching
+the plot produced by ``langmuir_xy_analysis.py``.
 
 Useful exported arrays:
 
@@ -32,6 +32,8 @@ Useful exported arrays:
     te_processed_eV, vp_processed_V, vf_processed_V, ies_processed_A,
     iis_processed_A, n_e_processed_m3
         Post-processed maps.
+    te_std_eV, vp_std_V, vf_std_V, ies_std_A, iis_std_A, n_e_std_m3
+        Shot-to-shot sample standard deviations for the primary maps.
     vp_spike_mask
         Binary spike rejection mask for plasma potential.
 
@@ -54,8 +56,11 @@ Useful exported arrays:
         measured constant ion-saturation plateau subtracted from total current.
         It is no longer an artificial positivity offset.
     analysis_ok, analysis_valid_count, analysis_ok_shot
-        Overall fail-closed acceptance masks and accepted-shot counts. These,
-        rather than R-squared alone, identify scientifically valid results.
+        Overall acceptance masks and accepted-shot counts. Finite estimates
+        are retained for inspection while these arrays record fit acceptance.
+    current_zero_calibrated, negate_Isweep_current, subtract_dc
+        Current calibration, acquisition-polarity, and offset-subtraction
+        settings used to produce the exported maps.
 
     xy_shape_info, trace_spatial_shape, dt_s, te_min_r2
         Geometry and diagnostic metadata.
@@ -186,6 +191,14 @@ def print_summary(data):
         )
 
     for key in (
+        "current_zero_calibrated",
+        "negate_Isweep_current",
+        "subtract_dc",
+    ):
+        if key in data:
+            print(f"{key}: {_scalar_text(data[key])}")
+
+    for key in (
         "X_cm",
         "Y_cm",
         "te_eV",
@@ -234,6 +247,11 @@ def plot_summary(data):
     ]
 
     fig, axs = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
+    analysis_ok = (
+        np.asarray(data["analysis_ok"], dtype=bool)
+        if "analysis_ok" in data
+        else None
+    )
 
     for (row, col), key, title, label in panels:
         ax = axs[row, col]
@@ -241,13 +259,45 @@ def plot_summary(data):
             ax.axis("off")
             continue
 
-        mesh = ax.pcolormesh(X, Y, data[key], shading="auto")
+        values = np.asarray(data[key], dtype=float)
+        finite = np.isfinite(values)
+        if np.any(finite):
+            mesh = ax.pcolormesh(X, Y, values, shading="auto")
+            cbar = fig.colorbar(mesh, ax=ax)
+            cbar.set_label(label)
+        else:
+            finite_x = np.asarray(X)[np.isfinite(X)]
+            finite_y = np.asarray(Y)[np.isfinite(Y)]
+            if finite_x.size:
+                ax.set_xlim(np.min(finite_x), np.max(finite_x))
+            if finite_y.size:
+                ax.set_ylim(np.min(finite_y), np.max(finite_y))
+            ax.text(
+                0.5,
+                0.5,
+                "No accepted values",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                color="0.35",
+            )
+
+        if analysis_ok is not None and analysis_ok.shape == values.shape:
+            rejected = finite & ~analysis_ok
+            if np.any(rejected):
+                ax.plot(
+                    X[rejected],
+                    Y[rejected],
+                    "x",
+                    color="tab:orange",
+                    label="no accepted fits",
+                )
+                ax.legend()
+
         ax.set_title(title)
         ax.set_xlabel("X (cm)")
         ax.set_ylabel("Y (cm)")
         ax.set_aspect("equal", adjustable="box")
-        cbar = fig.colorbar(mesh, ax=ax)
-        cbar.set_label(label)
 
     if "te_fit_r2" in data and "te_min_r2" in data:
         min_r2 = float(np.asarray(data["te_min_r2"]))
