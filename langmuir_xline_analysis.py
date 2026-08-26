@@ -60,6 +60,8 @@ sis_config_name = "Isat_Isweep_Vsweep_282624S_50MHz"
 f_microwave = 288e9 * u.Hz
 N_passes = 2.0
 interferometer_phase = 35 * u.rad
+# This coefficient is 1 / (c * r_e), where c is the speed of light and r_e
+# is the classical electron radius. The explicit /rad cancels the phase unit.
 interferometer_physical_constant = 1.18e6 * u.s / u.m**2 / u.rad
 interferometer_scaling = (
     interferometer_physical_constant
