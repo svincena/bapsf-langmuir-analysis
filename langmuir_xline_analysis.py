@@ -22,23 +22,32 @@ from langmuir_diagnostics import (
 
 save_results = True
 plot_results = True
+
 # Draw shot-to-shot +/-1 sigma error bars when more than one shot is available.
 plot_summary_stds = True
+
 # Integrate the normalized electron-density profile across x and report the
 # resulting effective profile width in the summary plot.
 calculate_shape_factor = True
+
 # The first 128 samples provide a plasma-off electronics baseline, independent
 # of the later I-V sweep.  Do not replace this with low-bias sweep samples;
 # doing so would erase the physical ion current and bias Vf.
-subtract_dc = True
+subtract_dc = False
 current_zero_calibrated = True
+# Set this to match the current polarity from the acquisition electronics. The
+# analysis expects negative ion current and positive electron current.
+negate_Isweep_current = True
+
 # Real probe saturation branches are normally sloped. Keep ideal planar-
 # Maxwellian consistency checks as diagnostics instead of rejecting good data.
 enforce_ideal_model_checks = False
+
+# Use multiprocessing to analyze independent traces in parallel.
 parallel_analysis = True
 analysis_processes = None  # None uses one fewer than the detected CPU count
 
-filename = '/Users/vincena/data/Mini_Magnetospheres/August2026/run_05_langmuir_xline_dipole_removed 2026-08-25 12.34.33.hdf5'
+filename = '/Users/vincena/data/Mini_Magnetospheres/August2026/run_06_langmuir_xline_dipole_removed 2026-08-26 09.33.06.hdf5'
 # digitizer = "SIS 3301" # for 3301, this is also the name of the adc
 # adc = "SIS 3301" #8-channel 14-bit 100 MS/s digitizer
 adc = "SIS 3302" #8-channel 16-bit 100 MS/s digitizer
@@ -78,7 +87,7 @@ n_expected_shots = shotnum_end - shotnum_start
 
 first_sweep_index = 5010
 sweep_start_index = first_sweep_index
-sweep_end_index = 10000
+sweep_end_index = 15000
 nt = sweep_end_index - sweep_start_index + 1
 
 isweep_dc_offset_start_index = 0
@@ -789,7 +798,7 @@ isweep_full, _ = read_channel_xline(
     adc=adc,
     config_name=sis_config_name,
     scale_factor=isweep_attenuation / isweep_resistance,
-    negate=False,
+    negate=negate_Isweep_current,
 )
 print(f"Current data reshaped to (x, shots, time): {isweep_full.shape}")
 
@@ -1462,6 +1471,7 @@ if save_results:
         grp.attrs["te_fit_i0_definition"] = "median low-bias ion-region current"
         grp.attrs["iv_npts_role"] = "fixed-size diagnostics only"
         grp.attrs["current_zero_calibrated"] = int(current_zero_calibrated)
+        grp.attrs["negate_Isweep_current"] = int(negate_Isweep_current)
         grp.attrs["enforce_ideal_model_checks"] = int(enforce_ideal_model_checks)
         grp.attrs["subtract_dc"] = int(subtract_dc)
         grp.attrs["shot_standard_deviation_ddof"] = 1
@@ -1601,6 +1611,7 @@ if save_results:
         "te_fit_i0_definition": np.array("median low-bias ion-region current"),
         "iv_npts_role": np.array("fixed-size diagnostics only"),
         "current_zero_calibrated": np.array(int(current_zero_calibrated)),
+        "negate_Isweep_current": np.array(int(negate_Isweep_current)),
         "enforce_ideal_model_checks": np.array(int(enforce_ideal_model_checks)),
         "subtract_dc": np.array(int(subtract_dc)),
         "summary_plot_path": np.array("" if summary_plot_path is None else str(summary_plot_path)),
