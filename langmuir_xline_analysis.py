@@ -55,6 +55,19 @@ digitizer = "SIS crate"
 sis_config_name = "Isat_Isweep_Vsweep_282624S_50MHz"
 
 
+# Microwave interferometer calibration. This combination produces the
+# measured line-integrated electron density in m^-2.
+f_microwave = 288e9 * u.Hz
+N_passes = 2.0
+interferometer_phase = 35 * u.rad
+interferometer_physical_constant = 1.18e6 * u.s / u.m**2 / u.rad
+interferometer_scaling = (
+    interferometer_physical_constant
+    * f_microwave
+    * interferometer_phase
+    / N_passes
+)
+
 
 nshots = 5
 nt_full = 282_624
@@ -240,6 +253,41 @@ def electron_density_profile_shape_factor(x_cm, electron_density_profile):
         * (normalized_profile[:-1] + normalized_profile[1:])
     )
     return shape_factor_m * u.m
+
+
+def scale_density_profile_to_interferometer(
+    electron_density_profile,
+    line_integrated_density,
+    shape_factor,
+):
+    """Normalize density to unit peak and calibrate it to an interferometer."""
+    density = u.Quantity(electron_density_profile).to(u.m**-3)
+    density_values = np.asarray(density.value, dtype=float)
+    normalized_density = np.full(density_values.shape, np.nan, dtype=float)
+    finite = np.isfinite(density_values)
+    if not np.any(finite):
+        return normalized_density, normalized_density * u.m**-3, np.nan
+
+    density_maximum = np.max(density_values[finite])
+    shape_factor_m = u.Quantity(shape_factor).to(u.m)
+    line_integrated_density = u.Quantity(line_integrated_density).to(u.m**-2)
+    if (
+        not np.isfinite(density_maximum)
+        or density_maximum <= 0.0
+        or not np.isfinite(shape_factor_m.value)
+        or shape_factor_m <= 0.0 * u.m
+        or not np.isfinite(line_integrated_density.value)
+        or line_integrated_density <= 0.0 * u.m**-2
+    ):
+        return normalized_density, normalized_density * u.m**-3, np.nan
+
+    normalized_density[finite] = density_values[finite] / density_maximum
+    peak_density = (line_integrated_density / shape_factor_m).to(u.m**-3)
+    scaled_density = normalized_density * peak_density
+    density_scale = (peak_density / (density_maximum * u.m**-3)).to_value(
+        u.dimensionless_unscaled
+    )
+    return normalized_density, scaled_density, density_scale
 
 
 def read_channel_xline(
@@ -1168,11 +1216,34 @@ iis_plot = iis_processed if (iis_processed is not None and enable_neighbor_smoot
 n_e_plot = n_e_processed if (n_e_processed is not None and enable_neighbor_smoothing) else n_e_raw
 
 # Use the same raw or post-processed density profile displayed in the summary.
-shape_factor = (
-    electron_density_profile_shape_factor(x, n_e_plot)
-    if calculate_shape_factor
-    else None
-)
+shape_factor = None
+electron_density_normalized = None
+if calculate_shape_factor:
+    shape_factor = electron_density_profile_shape_factor(x, n_e_plot)
+    (
+        electron_density_normalized,
+        n_e_plot,
+        density_scale,
+    ) = scale_density_profile_to_interferometer(
+        n_e_plot,
+        interferometer_scaling,
+        shape_factor,
+    )
+    if np.isfinite(density_scale):
+        # Preserve consistency between the calibrated density and its
+        # shot-to-shot uncertainty in the summary plot.
+        n_e_std = n_e_std * density_scale
+        print(
+            "Scaled normalized electron density to the interferometer "
+            f"line-integrated density; peak n_e = {np.nanmax(n_e_plot):.4g}."
+        )
+    else:
+        print(
+            "Warning: electron density could not be normalized and scaled "
+            "because its maximum, shape factor, or interferometer scaling "
+            "is not finite and positive."
+        )
+        n_e_std = np.full(n_e_std.shape, np.nan) * u.m**-3
 # %%
 # Plot results
 
@@ -1261,6 +1332,11 @@ if save_results:
                 grp.create_dataset("n_e_m3", data=getattr(n_e_plot, "value", n_e_plot))
         except Exception:
             pass
+        if calculate_shape_factor and electron_density_normalized is not None:
+            grp.create_dataset(
+                "n_e_normalized",
+                data=electron_density_normalized,
+            )
         grp.create_dataset("isat_A", data=isat_mean.value)
 
         # Per-shot fitted quantities and their per-location sample deviations
@@ -1472,6 +1548,13 @@ if save_results:
         grp.attrs["iv_npts_role"] = "fixed-size diagnostics only"
         grp.attrs["current_zero_calibrated"] = int(current_zero_calibrated)
         grp.attrs["negate_Isweep_current"] = int(negate_Isweep_current)
+        grp.attrs["calculate_shape_factor"] = int(calculate_shape_factor)
+        grp.attrs["shape_factor_m"] = (
+            np.nan if shape_factor is None else shape_factor.to_value(u.m)
+        )
+        grp.attrs["interferometer_line_integrated_density_m2"] = (
+            interferometer_scaling.to_value(u.m**-2)
+        )
         grp.attrs["enforce_ideal_model_checks"] = int(enforce_ideal_model_checks)
         grp.attrs["subtract_dc"] = int(subtract_dc)
         grp.attrs["shot_standard_deviation_ddof"] = 1
@@ -1536,6 +1619,11 @@ if save_results:
         "analysis_ok_shot": analysis_ok_shot,
         "statistics_fit_mask": statistics_fit_mask.astype(np.uint8),
         "n_e_m3": (n_e_plot.value if hasattr(n_e_plot, "value") else n_e_plot) if n_e_plot is not None else np.full_like(x, np.nan),
+        "n_e_normalized": (
+            electron_density_normalized
+            if electron_density_normalized is not None
+            else np.full_like(x, np.nan, dtype=float)
+        ),
         "te_raw_eV": te_raw.value,
         "vp_raw_V": vp_raw.value,
         "vf_raw_V": vf_raw.value,
@@ -1612,6 +1700,13 @@ if save_results:
         "iv_npts_role": np.array("fixed-size diagnostics only"),
         "current_zero_calibrated": np.array(int(current_zero_calibrated)),
         "negate_Isweep_current": np.array(int(negate_Isweep_current)),
+        "calculate_shape_factor": np.array(int(calculate_shape_factor)),
+        "shape_factor_m": np.array(
+            np.nan if shape_factor is None else shape_factor.to_value(u.m)
+        ),
+        "interferometer_line_integrated_density_m2": np.array(
+            interferometer_scaling.to_value(u.m**-2)
+        ),
         "enforce_ideal_model_checks": np.array(int(enforce_ideal_model_checks)),
         "subtract_dc": np.array(int(subtract_dc)),
         "summary_plot_path": np.array("" if summary_plot_path is None else str(summary_plot_path)),
