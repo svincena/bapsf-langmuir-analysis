@@ -1,4 +1,4 @@
-"""Plotting helpers for results produced by :mod:`langmuir_analysis`."""
+"""Plotting helpers for results produced by :mod:`langmuir_analysis_core`."""
 
 import numpy as np
 

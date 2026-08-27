@@ -1,999 +1,3426 @@
-"""Numerical core for swept planar Langmuir-probe I-V analysis.
+"""Analyze swept Langmuir-probe data along an x line or across an xy plane.
 
-The default quality checks allow the sloped saturation branches and modest
-non-Maxwellian structure normally seen in experimental probe curves.  An
-opt-in ideal-model mode additionally requires nearly flat saturation regions,
-a straight Maxwellian semilog branch, negligible electron leakage into the ion
-region, and agreement between two plasma-potential estimators.  Current must
-retain an independently calibrated absolute zero; zeroing the low-bias ion
-branch makes floating potential and ion current unidentifiable.
+Set ``analysis_geometry`` in the user-controls section to select the complete
+geometry-specific acquisition, post-processing, plotting, and export pipeline.
+The trace-level numerical analysis remains in :mod:`langmuir_analysis_core`.
 """
 
-from __future__ import annotations
-
-from collections.abc import Mapping
+# %% Imports
+import io
+import multiprocessing as mp
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 
 import astropy.units as u
-from astropy.constants import e, k_B, m_e
+from bapsflib import lapd
+import h5py
+import matplotlib
 import numpy as np
 from scipy.signal import savgol_filter
 
+matplotlib.use("Qt5Agg")
+# matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
 
-_MIN_CURVE_POINTS = 7
-_ION_WINDOW_FRACTION = 0.25
-_ION_MIN_POINTS = 5
-_ION_ESTIMATE_MIN_SNR = 3.0
-_SATURATION_MAX_TREND_FRACTION = 0.20
-_TE_CURRENT_CEILING_FRACTION = 0.80
-_TE_MIN_LOG_SPAN = 1.0
-_TE_MAX_RELATIVE_SLOPE_UNCERTAINTY = 0.30
-_TE_MAX_CURVATURE_LOG = 0.05
-_TE_CURVATURE_SIGNIFICANCE = 3.0
-_ELECTRON_SIGNAL_TO_NOISE = 5.0
-_MAX_REVERSE_SWEEP_FRACTION = 0.05
+from langmuir_analysis_core import analyze_iv_trace
+from langmuir_diagnostics import (
+    render_iv_diagnostic_plot as render_analysis_iv_diagnostic_plot,
+)
 
 
-_DEFAULT_CONFIG = {
-    "iv_npts": 600,
-    "voltage_bin_width": 0.05,
-    "vp_smoothing": "savgol",
-    "vp_smoothing_width_V": 2.5,
-    "vp_savgol_order": 2,
-    "te_min_points": 8,
-    "te_margin_from_vp": 0.2,
-    "te_current_floor_frac": 0.03,
-    "te_min_eV": 0.1,
-    "te_max_eV": 30.0,
-    "te_min_r2": 0.95,
-    "ion_min_snr": _ION_ESTIMATE_MIN_SNR,
-    "probe_area": None,
-    "current_zero_calibrated": False,
-    "enforce_ideal_model_checks": False,
-}
+# %% User controls
+# Select exactly one complete analysis pipeline.
+analysis_geometry = "x_line"  # "x_line" or "xy_plane"
 
-
-def density_from_electron_saturation_current(
-    I_esat,
-    Te,
-    probe_area,
-    use_abs=False,
-):
-    """Compute density from the planar Maxwellian random-electron flux.
-
-    Unitless inputs are interpreted as amperes, electronvolts, and square
-    metres, respectively.  ``use_abs`` is available only for an explicitly
-    verified reversed-current convention; the default rejects a non-positive
-    electron saturation current so polarity errors are not hidden.
-    """
-    if not isinstance(I_esat, u.Quantity):
-        I_esat = np.asarray(I_esat) * u.A
-    if not isinstance(Te, u.Quantity):
-        Te = np.asarray(Te) * u.eV
-    if not isinstance(probe_area, u.Quantity):
-        probe_area = np.asarray(probe_area) * u.m**2
-
-    I_esat = I_esat.to(u.A)
-    probe_area = probe_area.to(u.m**2)
-
-    if use_abs:
-        I_esat = np.abs(I_esat)
-
-    if np.any(~np.isfinite(I_esat.value)) or np.any(I_esat <= 0 * u.A):
-        raise ValueError("I_esat must be finite and positive.")
-    if np.any(~np.isfinite(probe_area.value)) or np.any(probe_area <= 0 * u.m**2):
-        raise ValueError("probe_area must be finite and positive.")
-    if np.any(~np.isfinite(Te.value)) or np.any(Te <= 0 * Te.unit):
-        raise ValueError("Te must be finite and positive.")
-
-    if Te.unit.is_equivalent(u.K):
-        Te_energy = (k_B * Te).to(u.J)
-    else:
-        Te_energy = Te.to(u.J)
-
-    electron_flux_speed = np.sqrt(Te_energy / (2 * np.pi * m_e))
-    density = I_esat / (e.si * probe_area * electron_flux_speed)
-    return density.to(u.m**-3)
-
-
-def _as_float_1d(values, name, unit=None):
-    if isinstance(values, u.Quantity):
-        if unit is None:
-            values = values.value
-        else:
-            values = values.to_value(unit)
-    array = np.asarray(values, dtype=float)
-    if array.ndim != 1:
-        raise ValueError(f"{name} must be one-dimensional.")
-    return array
-
-
-def _validate_trace_arrays(voltage, current):
-    voltage = _as_float_1d(voltage, "V", u.V)
-    current = _as_float_1d(current, "I", u.A)
-    if voltage.size != current.size:
-        raise ValueError("V and I must have the same length.")
-    return voltage, current
-
-
-def _validated_config(config):
-    if config is None:
-        config = {}
-    if not isinstance(config, Mapping):
-        raise TypeError("config must be a mapping.")
-
-    unknown = set(config) - set(_DEFAULT_CONFIG)
-    if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"Unknown Langmuir analysis config key(s): {names}.")
-
-    cfg = {**_DEFAULT_CONFIG, **config}
-
-    integer_fields = {
-        "iv_npts": _MIN_CURVE_POINTS,
-        "vp_savgol_order": 1,
-        "te_min_points": 3,
-    }
-    for name, minimum in integer_fields.items():
-        value = cfg[name]
-        if (
-            isinstance(value, (bool, np.bool_))
-            or int(value) != value
-            or value < minimum
-        ):
-            raise ValueError(f"{name} must be an integer >= {minimum}.")
-        cfg[name] = int(value)
-
-    positive_fields = (
-        "voltage_bin_width",
-        "vp_smoothing_width_V",
-        "te_min_eV",
-        "te_max_eV",
+_SUPPORTED_ANALYSIS_GEOMETRIES = {"x_line", "xy_plane"}
+if analysis_geometry not in _SUPPORTED_ANALYSIS_GEOMETRIES:
+    choices = ", ".join(sorted(_SUPPORTED_ANALYSIS_GEOMETRIES))
+    raise ValueError(
+        f"analysis_geometry must be one of {{{choices}}}; "
+        f"got {analysis_geometry!r}."
     )
-    for name in positive_fields:
-        value = float(cfg[name])
-        if not np.isfinite(value) or value <= 0:
-            raise ValueError(f"{name} must be finite and positive.")
-        cfg[name] = value
 
-    cfg["te_margin_from_vp"] = float(cfg["te_margin_from_vp"])
-    if not np.isfinite(cfg["te_margin_from_vp"]) or cfg["te_margin_from_vp"] < 0:
-        raise ValueError("te_margin_from_vp must be finite and non-negative.")
+# Both geometries use the same current interferometer calibration.  The
+# resulting line-integrated electron density has units of m^-2.
+calculate_shape_factor = True
+f_microwave = 288e9 * u.Hz
+N_passes = 2.0
+interferometer_phase = 35 * u.rad
+# This coefficient is 1 / (c * r_e), where c is the speed of light and r_e
+# is the classical electron radius. The explicit /rad cancels the phase unit.
+interferometer_physical_constant = 1.18e6 * u.s / u.m**2 / u.rad
+interferometer_scaling = (
+    interferometer_physical_constant
+    * f_microwave
+    * interferometer_phase
+    / N_passes
+)
 
-    cfg["te_current_floor_frac"] = float(cfg["te_current_floor_frac"])
-    if not 0 <= cfg["te_current_floor_frac"] < _TE_CURRENT_CEILING_FRACTION:
-        raise ValueError(
-            f"te_current_floor_frac must be in [0, {_TE_CURRENT_CEILING_FRACTION})."
-        )
+if analysis_geometry == "x_line":
+    save_results = True
+    plot_results = True
 
-    cfg["te_min_r2"] = float(cfg["te_min_r2"])
-    if not 0 <= cfg["te_min_r2"] <= 1:
-        raise ValueError("te_min_r2 must be between 0 and 1.")
-    if cfg["te_min_eV"] >= cfg["te_max_eV"]:
-        raise ValueError("te_min_eV must be less than te_max_eV.")
+    # Draw shot-to-shot +/-1 sigma error bars when more than one shot is available.
+    plot_summary_stds = True
 
-    cfg["ion_min_snr"] = float(cfg["ion_min_snr"])
-    if not np.isfinite(cfg["ion_min_snr"]) or cfg["ion_min_snr"] < 0:
-        raise ValueError("ion_min_snr must be finite and non-negative.")
+    # The first 128 samples provide a plasma-off electronics baseline, independent
+    # of the later I-V sweep.  Do not replace this with low-bias sweep samples;
+    # doing so would erase the physical ion current and bias Vf.
+    subtract_dc = False
+    current_zero_calibrated = True
+    # Set this to match the current polarity from the acquisition electronics. The
+    # analysis expects negative ion current and positive electron current.
+    negate_Isweep_current = True
 
-    for name in ("current_zero_calibrated", "enforce_ideal_model_checks"):
-        if not isinstance(cfg[name], (bool, np.bool_)):
-            raise ValueError(f"{name} must be a boolean.")
-        cfg[name] = bool(cfg[name])
+    # Real probe saturation branches are normally sloped. Keep ideal planar-
+    # Maxwellian consistency checks as diagnostics instead of rejecting good data.
+    enforce_ideal_model_checks = False
 
-    probe_area = cfg["probe_area"]
-    if probe_area is not None:
-        if isinstance(probe_area, u.Quantity):
-            try:
-                area_value = np.asarray(probe_area.to_value(u.m**2), dtype=float)
-            except u.UnitConversionError as error:
-                raise ValueError("probe_area must have units of area.") from error
-        else:
-            area_value = np.asarray(probe_area, dtype=float)
-        if area_value.shape != () or not np.isfinite(area_value) or area_value <= 0:
-            raise ValueError("probe_area must be a finite positive scalar.")
+    # Use multiprocessing to analyze independent traces in parallel.
+    parallel_analysis = True
+    analysis_processes = None  # None uses one fewer than the detected CPU count
 
-    smoothing = cfg["vp_smoothing"]
-    smoothing = "none" if smoothing is None else str(smoothing).lower()
-    if smoothing not in {"none", "moving", "savgol"}:
-        raise ValueError("vp_smoothing must be None, 'moving', or 'savgol'.")
-    cfg["vp_smoothing"] = smoothing
-    return cfg
+    filename = '/Users/vincena/data/Mini_Magnetospheres/August2026/run_06_langmuir_xline_dipole_removed 2026-08-26 09.33.06.hdf5'
+    # digitizer = "SIS 3301" # for 3301, this is also the name of the adc
+    # adc = "SIS 3301" #8-channel 14-bit 100 MS/s digitizer
+    adc = "SIS 3302" #8-channel 16-bit 100 MS/s digitizer
+    digitizer = "SIS crate"
+    sis_config_name = "Isat_Isweep_Vsweep_282624S_50MHz"
 
 
-def bin_average_by_voltage(voltage, current, bin_width):
-    """Return finite voltage-bin means sorted in strictly increasing voltage."""
-    voltage, current = _validate_trace_arrays(voltage, current)
-    bin_width = float(bin_width)
-    if not np.isfinite(bin_width) or bin_width <= 0:
-        raise ValueError("bin_width must be finite and positive.")
+    nshots = 5
+    nt_full = 282_624
 
-    good = np.isfinite(voltage) & np.isfinite(current)
-    voltage = voltage[good]
-    current = current[good]
-    if voltage.size < 2:
-        return None, None
+    nx = 81
+    x_min = -37.5
+    x_max = 37.5
+    x = np.linspace(x_min, x_max, nx)
 
-    order = np.argsort(voltage, kind="stable")
-    voltage = voltage[order]
-    current = current[order]
-    bin_ids = np.floor((voltage - voltage[0]) / bin_width).astype(np.int64)
-    _, inverse = np.unique(bin_ids, return_inverse=True)
-    counts = np.bincount(inverse)
-    Vb = np.bincount(inverse, weights=voltage) / counts
-    Ib = np.bincount(inverse, weights=current) / counts
+    board = 2
+    vsweep_channel = 3
+    isweep_channel = 2
 
-    keep = np.isfinite(Vb) & np.isfinite(Ib)
-    Vb = Vb[keep]
-    Ib = Ib[keep]
-    keep = np.concatenate(([True], np.diff(Vb) > 0))
-    Vb = Vb[keep]
-    Ib = Ib[keep]
-    if Vb.size < 2:
-        return None, None
-    return Vb, Ib
+    vsweep_attenuation = 100.0
+    isweep_attenuation = 1.0 #4.0
+    isweep_resistance = 3.1 #1.0
+    probe_area = 4.0 * u.mm**2
 
 
-def make_monotonic_iv_curve(bias, current, npts=600, bin_width=0.05):
-    """Bin a sweep and make separate analysis and fixed-size display grids."""
-    voltage, current = _validate_trace_arrays(bias, current)
-    if (
-        isinstance(npts, (bool, np.bool_))
-        or int(npts) != npts
-        or npts < _MIN_CURVE_POINTS
-    ):
-        raise ValueError(f"npts must be an integer >= {_MIN_CURVE_POINTS}.")
 
-    Vb, Ib = bin_average_by_voltage(voltage, current, bin_width=bin_width)
-    if Vb is None or Vb.size < _MIN_CURVE_POINTS:
-        return None
+    # data_offset used if, say, skipping half the data where 2 probes move but only
+    # one at a time and half the data is being taken on a probe when it's sitting at
+    # the start or end of its motion list
+    data_offset = 0
 
-    V_grid = np.linspace(Vb[0], Vb[-1], int(npts))
-    I_grid = np.interp(V_grid, Vb, Ib)
+    shotnum_start = data_offset + 1
+    shotnum_end = nx * nshots + shotnum_start   # exclusive upper bound in slice(...)
+    n_expected_shots = shotnum_end - shotnum_start
 
-    typical_spacing = max(np.median(np.diff(Vb)), 0.5 * float(bin_width))
-    if not np.isfinite(typical_spacing) or typical_spacing <= 0:
-        return None
-    analysis_npts = min(
-        max(4 * Vb.size, _MIN_CURVE_POINTS),
-        max(
-            _MIN_CURVE_POINTS,
-            int(np.ceil((Vb[-1] - Vb[0]) / typical_spacing)) + 1,
-        ),
-    )
-    V_analysis = np.linspace(Vb[0], Vb[-1], analysis_npts)
-    I_analysis = np.interp(V_analysis, Vb, Ib)
 
-    return {
-        "V_raw": voltage,
-        "I_raw": current,
-        "V_binned": Vb,
-        "I_binned": Ib,
-        "V_analysis": V_analysis,
-        "I_analysis": I_analysis,
-        "V_grid": V_grid,
-        "I_grid": I_grid,
+    first_sweep_index = 5010
+    sweep_start_index = first_sweep_index
+    sweep_end_index = 15000
+    nt = sweep_end_index - sweep_start_index + 1
+
+    isweep_dc_offset_start_index = 0
+    isweep_dc_offset_end_index = 127
+
+    isat_start_index = 0
+    isat_end_index = 127
+
+    # Smoothing along original time-ordered sweep
+    # sg_smooth_bins = 8
+    # sg_smooth_order = 1
+    sg_smooth_bins = 32
+    sg_smooth_order = 2
+
+
+    # Example diagnostic plot controls
+    diagnostic_plot_every = 2       # make an IV diagnostic plot every N x indices; 0 disables these plots
+    example_pause_seconds = 1.0
+    diagnostic_plot_output_dir = Path("output_diagnostic_plots")
+
+    # Interpolated monotonic I-V grid parameters
+    iv_npts = 2048
+    voltage_bin_width = 0.05  # volts; merges near-duplicate voltages before interpolation
+
+    # Derivative smoothing is specified in volts and therefore does not change when
+    # the fixed-size diagnostic grid resolution changes.
+    vp_smoothing = "savgol"
+    vp_smoothing_width_V = 2.5
+    vp_savgol_order = 2
+
+    # One Maxwellian fit on independent voltage-bin means.
+    te_min_points = 12
+    te_margin_from_vp = 0.2  # volts
+    te_current_floor_frac = 0.03
+    te_min_eV = 0.05
+    te_max_eV = 20.0
+    te_min_r2 = 0.98
+    # Uses autocorrelation-adjusted uncertainty of the regional median, not the
+    # point-to-point residual scatter.
+    ion_min_snr = 3.0
+    te_subtract_i0 = True  # legacy export name; I0 is now the median ion-region current
+
+    langmuir_analysis_config = {
+        "iv_npts": iv_npts,
+        "voltage_bin_width": voltage_bin_width,
+        "vp_smoothing": vp_smoothing,
+        "vp_smoothing_width_V": vp_smoothing_width_V,
+        "vp_savgol_order": vp_savgol_order,
+        "te_min_points": te_min_points,
+        "te_margin_from_vp": te_margin_from_vp,
+        "te_current_floor_frac": te_current_floor_frac,
+        "te_min_eV": te_min_eV,
+        "te_max_eV": te_max_eV,
+        "te_min_r2": te_min_r2,
+        "ion_min_snr": ion_min_snr,
+        "probe_area": probe_area,
+        "current_zero_calibrated": current_zero_calibrated,
+        "enforce_ideal_model_checks": enforce_ideal_model_checks,
     }
 
+    # Optional post-processing controls along x
+    enable_vp_spike_rejection = True
+    vp_spike_half_window = 2          # neighbors on each side for local median
+    vp_spike_threshold_V = 5.0        # flag if |Vp - local median| exceeds this
+    vp_replace_flagged_with_local_interp = True
 
-def find_floating_potential_from_iv(voltage, current, upper_bound=None):
-    """Return the highest genuinely bracketed negative-to-positive crossing."""
-    voltage, current = _validate_trace_arrays(voltage, current)
-    finite = np.isfinite(voltage) & np.isfinite(current)
-    voltage = voltage[finite]
-    current = current[finite]
-    if voltage.size < 2 or np.any(np.diff(voltage) <= 0):
-        return np.nan * u.V
+    enable_neighbor_smoothing = True
+    neighbor_smooth_half_window = 1   # 1 means 3-point neighborhood, 2 means 5-point
+    neighbor_smooth_sigma = 1.0       # gaussian-like weighting in index space
 
-    candidates = np.flatnonzero((current[:-1] < 0) & (current[1:] >= 0))
-    if upper_bound is not None:
-        if isinstance(upper_bound, u.Quantity):
-            upper_bound = upper_bound.to_value(u.V)
-        candidates = candidates[voltage[candidates] < float(upper_bound)]
-    if candidates.size == 0:
-        return np.nan * u.V
+    make_all_iv_diagnostic_plot = True
 
-    index = candidates[-1]
-    v1, v2 = voltage[index : index + 2]
-    i1, i2 = current[index : index + 2]
-    if i2 == i1:
-        return np.nan * u.V
-    return (v1 - i1 * (v2 - v1) / (i2 - i1)) * u.V
+else:  # analysis_geometry == "xy_plane"
+    save_results = True
+    plot_results = True
+    # Only enable with an independently measured plasma-off electronics baseline.
+    # Using sweep samples would erase physical current and bias Vf and Iis.
+    subtract_dc = False
+    # Set True only when the sweep current has an independently established zero.
+    current_zero_calibrated = False
+    # Set this to match the current polarity from the acquisition electronics. The
+    # analysis expects negative ion current and positive electron current.
+    negate_Isweep_current = True
+    # Real probe saturation branches are normally sloped. Keep ideal planar-
+    # Maxwellian consistency checks as diagnostics instead of rejecting good data.
+    enforce_ideal_model_checks = False
+    parallel_analysis = True
+    analysis_processes = None  # None uses one fewer than the detected CPU count
 
+    # Use the measured x-line nearest this y location to calculate the profile
+    # shape factor that calibrates the complete xy density map.
+    interferometer_profile_y_cm = 0.0
 
-def _window_points(length, voltage_step, smoothing_width, polyorder=0):
-    points = max(1, int(round(smoothing_width / voltage_step)))
-    if points % 2 == 0:
-        points += 1
-    minimum = polyorder + 2
-    if minimum % 2 == 0:
-        minimum += 1
-    points = max(points, minimum)
-    maximum = length if length % 2 == 1 else length - 1
-    return min(points, maximum)
+    filename ="/Users/vincena/data/Gekelman/Sparse_Alfven/Vp_p25_then_Lang_p35 2026-02-11 16.59.11.hdf5"
+    #filename = "/Users/vincena/data/Gekelman/Sparse_Alfven/Vp_p30_then_Lang_p15 2026-02-14 14.13.18.hdf5"
+    # filename = "/Users/vincena/data/Gekelman/Sparse_Alfven/Vp_p35_then_Lang_p25_take2 2026-02-13 10.30.51.hdf5"
+    digitizer = "SIS crate"
+    adc = "SIS 3302"
 
-
-def find_plasma_potential_from_iv(
-    voltage,
-    current,
-    vf=None,
-    smoothing="savgol",
-    smoothing_width_V=2.5,
-    savgol_order=2,
-):
-    """Estimate Vp from an interior maximum of a physically smoothed dI/dV."""
-    voltage, current = _validate_trace_arrays(voltage, current)
-    if (
-        voltage.size < _MIN_CURVE_POINTS
-        or np.any(~np.isfinite(voltage))
-        or np.any(~np.isfinite(current))
-    ):
-        return np.nan * u.V, np.full(voltage.shape, np.nan, dtype=float)
-    if np.any(np.diff(voltage) <= 0):
-        return np.nan * u.V, np.full(voltage.shape, np.nan, dtype=float)
-
-    voltage_step = float(np.median(np.diff(voltage)))
-    smoothing_name = "none" if smoothing is None else str(smoothing).lower()
-    edge_points = 1
-
-    if smoothing_name == "none":
-        dIdV = np.gradient(current, voltage)
-    elif smoothing_name == "moving":
-        window = _window_points(len(current), voltage_step, smoothing_width_V)
-        kernel = np.ones(window, dtype=float) / window
-        weights = np.convolve(np.ones_like(current), kernel, mode="same")
-        current_smooth = np.convolve(current, kernel, mode="same") / weights
-        dIdV = np.gradient(current_smooth, voltage)
-        edge_points = max(1, window // 2)
-    elif smoothing_name == "savgol":
-        window = _window_points(
-            len(current), voltage_step, smoothing_width_V, savgol_order
-        )
-        if window <= savgol_order:
-            return np.nan * u.V, np.full(voltage.shape, np.nan, dtype=float)
-        dIdV = savgol_filter(
-            current,
-            window_length=window,
-            polyorder=savgol_order,
-            deriv=1,
-            delta=voltage_step,
-            mode="interp",
-        )
-        edge_points = max(1, window // 2)
+    i = filename.find("Vp_p")
+    value = int(filename[i + len("Vp_p")]) if i != -1 else None
+    if value == 2:
+        sis_config_name = "64kS_100MHz_div_32__Lang_longtime"
     else:
-        raise ValueError("smoothing must be None, 'moving', or 'savgol'.")
+        sis_config_name = "65kS_Langmuir_and_16kS_antenna_currents"
 
-    search = np.isfinite(dIdV)
-    search[: edge_points + 1] = False
-    search[-(edge_points + 1) :] = False
-    if vf is not None:
-        vf_value = vf.to_value(u.V) if isinstance(vf, u.Quantity) else float(vf)
-        if np.isfinite(vf_value):
-            search &= voltage > vf_value
+    nx=31
+    ny=31
+    nshots = 8
+    nt_full = 65536
 
-    indices = np.flatnonzero(search)
-    if indices.size < 3:
-        return np.nan * u.V, dIdV
-    index = indices[np.argmax(dIdV[indices])]
-    if (
-        index in (indices[0], indices[-1])
-        or not np.isfinite(dIdV[index])
-        or dIdV[index] <= 0
-    ):
-        return np.nan * u.V, dIdV
+    board = 4
+    vsweep_channel = 4
+    isweep_channel = 5
 
-    post_start = min(len(voltage), index + edge_points)
-    post_stop = len(voltage) - edge_points
-    if post_stop - post_start < 3:
-        return np.nan * u.V, dIdV
-    post_slope = np.nanmedian(dIdV[post_start:post_stop])
-    if np.isfinite(post_slope) and post_slope >= 0.5 * dIdV[index]:
-        return np.nan * u.V, dIdV
+    vsweep_attenuation = 100.0
+    isweep_attenuation = 4.0
+    isweep_resistance = 1.0
+    probe_area = 4.0 * u.mm**2  # effective probe area for current density calculations; adjust as needed
 
-    return voltage[index] * u.V, dIdV
+    x = np.linspace(-15.0, 15.0, nx)
+    y = np.linspace(-15.0, 15.0, ny)
+    X, Y = np.meshgrid(x, y, indexing="xy")
+
+    # data_offset used if, say, skipping half the data where 2 probes move but only
+    # one at a time and half the data is being taken on a probe when it's sitting at
+    # the start or end of its motion list
+    data_offset = nx*ny*nshots # offset beyond the VP plane data to get to the Langmuir plane data
+
+    shotnum_start = data_offset + 1
+    shotnum_end = ny * nx * nshots + shotnum_start   # exclusive upper bound in slice(...)
+    n_expected_shots = shotnum_end - shotnum_start
+
+    first_sweep_index = 950  # index of the first sample in the sweep portion of the trace; adjust if needed based on oscilloscope timing and sweep shape
+    sweep_start_index = first_sweep_index
+    sweep_end_index = first_sweep_index + 1450
+    nt = sweep_end_index - sweep_start_index + 1
+
+    isweep_dc_offset_start_index = 64000#first_sweep_index
+    isweep_dc_offset_end_index = isweep_dc_offset_start_index + 1024 - 1
+
+    isat_start_index = 0
+    isat_end_index = 127
+
+    # Smoothing along original time-ordered sweep
+    sg_smooth_bins = 17
+    sg_smooth_order = 1
+
+    # Example diagnostic plot controls
+    diagnostic_plot_every = nx*nshots     # make an IV diagnostic plot every N trace indices; 0 disables these plots
+    example_pause_seconds = 1.0
+    diagnostic_plot_output_dir = Path("output_diagnostic_plots")
+
+    # Interpolated monotonic I-V grid parameters
+    iv_npts = 512
+    voltage_bin_width = 0.01  # volts; merges near-duplicate voltages before interpolation
+
+    # Derivative smoothing is specified in volts and is independent of the fixed
+    # diagnostic-grid resolution.
+    vp_smoothing = "savgol"
+    vp_smoothing_width_V = 2.5
+    vp_savgol_order = 2
+
+    # One Maxwellian fit on independent voltage-bin means.
+    te_min_points = 12
+    te_margin_from_vp = 1.0  # volts; require this much margin between the plasma potential and the nearest fit point
+    te_current_floor_frac = 0.075  # exclude points where the current is less than this fraction of the electron saturation current
+    te_min_eV = 0.1
+    te_max_eV = 30.0
+    te_min_r2 = 0.975
+    # Uses autocorrelation-adjusted uncertainty of the regional median, not the
+    # point-to-point residual scatter.
+    ion_min_snr = 3.0
+    te_subtract_i0 = True  # legacy export name; I0 is now the median ion-region current
+
+    langmuir_analysis_config = {
+        "iv_npts": iv_npts,
+        "voltage_bin_width": voltage_bin_width,
+        "vp_smoothing": vp_smoothing,
+        "vp_smoothing_width_V": vp_smoothing_width_V,
+        "vp_savgol_order": vp_savgol_order,
+        "te_min_points": te_min_points,
+        "te_margin_from_vp": te_margin_from_vp,
+        "te_current_floor_frac": te_current_floor_frac,
+        "te_min_eV": te_min_eV,
+        "te_max_eV": te_max_eV,
+        "te_min_r2": te_min_r2,
+        "ion_min_snr": ion_min_snr,
+        "probe_area": probe_area,
+        "current_zero_calibrated": current_zero_calibrated,
+        "enforce_ideal_model_checks": enforce_ideal_model_checks,
+    }
+
+    # Optional post-processing controls on 2D maps
+    enable_vp_spike_rejection = True
+    vp_spike_half_window = (1, 1)     # neighbors on each side in (y, x) for local median
+    vp_spike_threshold_V = 5.0        # flag if |Vp - local median| exceeds this
+    vp_replace_flagged_with_local_median = True
+
+    enable_neighbor_smoothing = True
+    neighbor_smooth_half_window = (1, 1)  # 1 means 3-point neighborhood in that dimension
+    neighbor_smooth_sigma = 2.0       # gaussian-like weighting in index space
+
+    make_all_iv_diagnostic_plot = True
 
 
-def _sweep_direction_is_valid(V, bin_width):
-    finite_voltage = V[np.isfinite(V)]
-    if finite_voltage.size < _MIN_CURVE_POINTS:
-        return False
-    voltage_span = np.ptp(finite_voltage)
-    if voltage_span < (_MIN_CURVE_POINTS - 1) * bin_width:
-        return False
-
-    block_count = min(25, finite_voltage.size // 3)
-    block_medians = np.array(
-        [np.median(block) for block in np.array_split(finite_voltage, block_count)]
-    )
-    increments = np.diff(block_medians)
-    material = np.abs(increments) >= max(bin_width, 0.01 * voltage_span)
-    increments = increments[material]
-    if increments.size == 0:
-        return False
-    forward_travel = np.sum(increments[increments > 0])
-    reverse_travel = -np.sum(increments[increments < 0])
-    minority_travel = min(forward_travel, reverse_travel)
-    return bool(minority_travel <= _MAX_REVERSE_SWEEP_FRACTION * voltage_span)
-
-
-def _effective_sample_count(values):
-    """Estimate independent samples using the initial positive autocorrelation."""
+def shot_mean_and_std(values, valid_mask=None):
+    """Return nan-aware mean, sample standard deviation, and count over shots."""
     values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-    n_values = values.size
-    if n_values < 2:
-        return float(n_values)
+    valid = np.isfinite(values)
+    if valid_mask is not None:
+        valid &= np.asarray(valid_mask, dtype=bool)
 
-    centered = values - np.mean(values)
-    variance_sum = float(np.dot(centered, centered))
-    if not np.isfinite(variance_sum) or variance_sum <= 0:
-        return float(n_values)
+    count = np.sum(valid, axis=-1)
+    total = np.sum(np.where(valid, values, 0.0), axis=-1)
+    mean = np.full(count.shape, np.nan, dtype=float)
+    np.divide(total, count, out=mean, where=count > 0)
 
-    autocorrelation = np.correlate(centered, centered, mode="full")[
-        n_values - 1 :
-    ] / variance_sum
-    positive_lags = autocorrelation[1:]
-    nonpositive = np.flatnonzero(positive_lags <= 0)
-    if nonpositive.size:
-        positive_lags = positive_lags[: nonpositive[0]]
-    correlation_time = 1.0 + 2.0 * float(np.sum(positive_lags))
-    if not np.isfinite(correlation_time) or correlation_time <= 0:
-        return 1.0
-    return float(np.clip(n_values / correlation_time, 1.0, n_values))
-
-
-def _estimate_ion_current(voltage, current, vf, enforce_flatness=False):
-    cutoff = voltage[0] + _ION_WINDOW_FRACTION * (vf - voltage[0])
-    mask = np.isfinite(voltage) & np.isfinite(current) & (voltage <= cutoff)
-    if np.count_nonzero(mask) < _ION_MIN_POINTS:
-        return None, "too few independent points in the ion-saturation region"
-
-    V_ion = voltage[mask]
-    I_ion_samples = current[mask]
-    ion_current = float(np.median(I_ion_samples))
-    slope, intercept = np.polyfit(V_ion, I_ion_samples, 1)
-    fitted = slope * V_ion + intercept
-    residual = I_ion_samples - fitted
-    ion_noise = float(1.4826 * np.median(np.abs(residual - np.median(residual))))
-    effective_sample_count = _effective_sample_count(residual)
-    median_standard_error = (
-        np.sqrt(np.pi / 2.0) * ion_noise / np.sqrt(effective_sample_count)
+    squared_deviation = np.where(valid, (values - mean[..., np.newaxis]) ** 2, 0.0)
+    std = np.full(count.shape, np.nan, dtype=float)
+    np.divide(
+        np.sum(squared_deviation, axis=-1),
+        count - 1,
+        out=std,
+        where=count > 1,
     )
-    trend_span = float(abs(slope) * np.ptp(V_ion))
-    ion_magnitude = -ion_current
+    np.sqrt(std, out=std)
+    return mean, std, count
 
-    if not np.isfinite(ion_current) or ion_current >= 0:
-        return (
-            None,
-            "ion-saturation current is not negative under the configured polarity",
+
+def sanitize_filename_component(text):
+    """Make a short filesystem-safe filename component."""
+    text = str(text)
+    safe_chars = []
+    for char in text:
+        if char.isalnum() or char in ("-", "_", "."):
+            safe_chars.append(char)
+        elif char.isspace():
+            safe_chars.append("_")
+    return "".join(safe_chars).strip("._") or "plot"
+
+
+def save_diagnostic_figure(fig, output_dir, filename_stem, dpi=600):
+    """Save a diagnostic figure to the configured output directory."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{sanitize_filename_component(filename_stem)}.png"
+    fig.savefig(path, format="png", dpi=dpi)
+    print(f"Saved diagnostic plot: {path}")
+    return path
+
+
+def electron_density_profile_shape_factor(x_cm, electron_density_profile):
+    """Integrate peak-normalized electron density over x and return meters."""
+    x_values_cm = np.asarray(x_cm, dtype=float)
+    profile_values = np.asarray(
+        getattr(electron_density_profile, "value", electron_density_profile),
+        dtype=float,
+    )
+
+    if x_values_cm.shape != profile_values.shape:
+        raise ValueError(
+            "x coordinates and electron-density profile must have the same shape; "
+            f"got {x_values_cm.shape} and {profile_values.shape}."
         )
-    trend_fraction = trend_span / ion_magnitude
-    trend_exceeds_limit = trend_fraction > _SATURATION_MAX_TREND_FRACTION
-    if enforce_flatness and trend_exceeds_limit:
-        return None, "low-bias current does not form a constant ion-saturation plateau"
 
-    return {
-        "current_A": ion_current,
-        "noise_A": ion_noise,
-        "uncertainty_A": float(median_standard_error),
-        "snr": (
-            float(ion_magnitude / median_standard_error)
-            if median_standard_error > 0
-            else np.inf
-        ),
-        "effective_sample_count": effective_sample_count,
-        "slope_A_per_V": float(slope),
-        "intercept_A": float(intercept),
-        "trend_span_A": trend_span,
-        "trend_fraction": trend_fraction,
-        "trend_exceeds_limit": trend_exceeds_limit,
-        "mask": mask,
-    }, None
+    finite = np.isfinite(x_values_cm) & np.isfinite(profile_values)
+    if np.count_nonzero(finite) < 2:
+        return np.nan * u.m
+
+    x_values_m = (x_values_cm[finite] * u.cm).to_value(u.m)
+    finite_profile = profile_values[finite]
+    profile_maximum = np.max(finite_profile)
+    if not np.isfinite(profile_maximum) or profile_maximum == 0.0:
+        return np.nan * u.m
+
+    normalized_profile = finite_profile / profile_maximum
+    # Apply the trapezoidal rule after converting the position samples to
+    # meters, so the dimensionless normalized profile integrates to a length.
+    shape_factor_m = np.sum(
+        np.diff(x_values_m)
+        * 0.5
+        * (normalized_profile[:-1] + normalized_profile[1:])
+    )
+    return shape_factor_m * u.m
 
 
-def _estimate_electron_saturation_current(
-    V,
-    measured_current,
-    vp,
-    ion_noise,
-    enforce_flatness=False,
+def scale_density_profile_to_interferometer(
+    electron_density_profile,
+    line_integrated_density,
+    shape_factor,
 ):
-    """Estimate electron saturation from the high-bias collection region."""
-    cutoff = vp + 0.5 * (V[-1] - vp)
-    mask = np.isfinite(V) & np.isfinite(measured_current) & (V >= cutoff)
-    if np.count_nonzero(mask) < _ION_MIN_POINTS:
-        return None, "too few independent points in the electron-saturation region"
+    """Normalize density to unit peak and calibrate it to an interferometer."""
+    density = u.Quantity(electron_density_profile).to(u.m**-3)
+    density_values = np.asarray(density.value, dtype=float)
+    normalized_density = np.full(density_values.shape, np.nan, dtype=float)
+    finite = np.isfinite(density_values)
+    if not np.any(finite):
+        return normalized_density, normalized_density * u.m**-3, np.nan
 
-    V_sat = V[mask]
-    I_sat = measured_current[mask]
-    saturation_current = float(np.median(I_sat))
-    if not np.isfinite(saturation_current) or saturation_current <= 0:
-        return None, "electron saturation current is not finite and positive"
-    if saturation_current < _ELECTRON_SIGNAL_TO_NOISE * ion_noise:
-        return None, "electron saturation current is not resolved above ion noise"
+    density_maximum = np.max(density_values[finite])
+    shape_factor_m = u.Quantity(shape_factor).to(u.m)
+    line_integrated_density = u.Quantity(line_integrated_density).to(u.m**-2)
+    if (
+        not np.isfinite(density_maximum)
+        or density_maximum <= 0.0
+        or not np.isfinite(shape_factor_m.value)
+        or shape_factor_m <= 0.0 * u.m
+        or not np.isfinite(line_integrated_density.value)
+        or line_integrated_density <= 0.0 * u.m**-2
+    ):
+        return normalized_density, normalized_density * u.m**-3, np.nan
 
-    slope, intercept = np.polyfit(V_sat, I_sat, 1)
-    fitted = slope * V_sat + intercept
-    residual = I_sat - fitted
-    residual_noise = float(1.4826 * np.median(np.abs(residual - np.median(residual))))
-    trend_span = float(abs(slope) * np.ptp(V_sat))
-    trend_fraction = trend_span / saturation_current
-    trend_exceeds_limit = trend_fraction > _SATURATION_MAX_TREND_FRACTION
-    if enforce_flatness and trend_exceeds_limit:
-        return None, "high-bias current does not form an electron-saturation plateau"
-
-    return {
-        "current_A": saturation_current,
-        "noise_A": residual_noise,
-        "slope_A_per_V": float(slope),
-        "trend_span_A": trend_span,
-        "trend_fraction": trend_fraction,
-        "trend_exceeds_limit": trend_exceeds_limit,
-        "mask": mask,
-    }, None
-
-
-def _fit_electron_temperature(V, electron_current, I_es, vf, vp, ion_noise, cfg):
-    signal_floor = max(
-        cfg["te_current_floor_frac"] * I_es,
-        _ELECTRON_SIGNAL_TO_NOISE * ion_noise,
-        np.finfo(float).tiny,
+    normalized_density[finite] = density_values[finite] / density_maximum
+    peak_density = (line_integrated_density / shape_factor_m).to(u.m**-3)
+    scaled_density = normalized_density * peak_density
+    density_scale = (peak_density / (density_maximum * u.m**-3)).to_value(
+        u.dimensionless_unscaled
     )
-    signal_ceiling = _TE_CURRENT_CEILING_FRACTION * I_es
-    eligible = (
-        np.isfinite(V)
-        & np.isfinite(electron_current)
-        & (V >= vf)
-        & (V <= vp - cfg["te_margin_from_vp"])
-        & (electron_current > 0)
-    )
-    within_thresholds = (
-        eligible
-        & (electron_current >= signal_floor)
-        & (electron_current <= signal_ceiling)
-    )
-    threshold_indices = np.flatnonzero(within_thresholds)
-    mask = np.zeros(V.shape, dtype=bool)
-    if threshold_indices.size:
-        mask[threshold_indices[0] : threshold_indices[-1] + 1] = True
-        mask &= eligible
-
-    output = {
-        "fit_mask": mask,
-        "npts": int(np.count_nonzero(mask)),
-        "slope": np.nan,
-        "intercept": np.nan,
-        "r2": np.nan,
-        "rmse_logI": np.nan,
-        "relative_slope_uncertainty": np.nan,
-        "log_span": np.nan,
-        "curvature_log": np.nan,
-        "curvature_detected": False,
-        "te_eV_candidate": np.nan,
-        "passed_r2": False,
-        "valid": False,
-        "reason": None,
-    }
-    if output["npts"] < cfg["te_min_points"]:
-        output["reason"] = (
-            "too few independent binned samples in the electron-retarding fit region"
-        )
-        return output
-
-    V_fit = V[mask]
-    log_current = np.log(electron_current[mask])
-    try:
-        slope, intercept = np.polyfit(V_fit, log_current, 1)
-    except np.linalg.LinAlgError:
-        output["reason"] = "electron-temperature regression failed"
-        return output
-
-    fitted = slope * V_fit + intercept
-    residual = log_current - fitted
-    ss_res = float(np.sum(residual**2))
-    ss_tot = float(np.sum((log_current - np.mean(log_current)) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else -np.inf
-    rmse = float(np.sqrt(np.mean(residual**2)))
-    x_variance_sum = float(np.sum((V_fit - np.mean(V_fit)) ** 2))
-    if len(V_fit) > 2 and x_variance_sum > 0:
-        slope_se = np.sqrt((ss_res / (len(V_fit) - 2)) / x_variance_sum)
-        relative_uncertainty = slope_se / slope if slope > 0 else np.inf
-    else:
-        relative_uncertainty = np.inf
-    te_candidate = 1.0 / slope if slope > 0 else np.nan
-    log_span = float(slope * np.ptp(V_fit)) if slope > 0 else np.nan
-    curvature_log = np.nan
-    curvature_detected = False
-    if len(V_fit) >= 5:
-        try:
-            quadratic, covariance = np.polyfit(V_fit, log_current, 2, cov=True)
-            quadratic_se = float(np.sqrt(max(covariance[0, 0], 0.0)))
-            curvature_log = float(abs(quadratic[0]) * np.ptp(V_fit) ** 2)
-            curvature_detected = bool(
-                curvature_log > _TE_MAX_CURVATURE_LOG
-                and abs(quadratic[0]) > _TE_CURVATURE_SIGNIFICANCE * quadratic_se
-            )
-        except np.linalg.LinAlgError:
-            curvature_detected = True
-
-    output.update(
-        {
-            "slope": float(slope),
-            "intercept": float(intercept),
-            "r2": r2,
-            "rmse_logI": rmse,
-            "relative_slope_uncertainty": float(relative_uncertainty),
-            "log_span": log_span,
-            "curvature_log": curvature_log,
-            "curvature_detected": curvature_detected,
-            "te_eV_candidate": float(te_candidate),
-            "passed_r2": bool(np.isfinite(r2) and r2 >= cfg["te_min_r2"]),
-            "vstart": float(V_fit[0]),
-            "vstop": float(V_fit[-1]),
-        }
-    )
-
-    checks = (
-        (
-            np.isfinite(slope) and slope > 0,
-            "electron-temperature slope is not finite and positive",
-        ),
-        (
-            np.isfinite(te_candidate)
-            and cfg["te_min_eV"] <= te_candidate <= cfg["te_max_eV"],
-            "electron temperature lies outside the configured physical range",
-        ),
-        (output["passed_r2"], "electron-temperature fit failed the R^2 threshold"),
-        (
-            np.isfinite(log_span) and log_span >= _TE_MIN_LOG_SPAN,
-            "electron-temperature fit spans less than one e-fold in current",
-        ),
-        (
-            np.isfinite(relative_uncertainty)
-            and relative_uncertainty <= _TE_MAX_RELATIVE_SLOPE_UNCERTAINTY,
-            "electron-temperature slope uncertainty is too large",
-        ),
-        (
-            not cfg["enforce_ideal_model_checks"] or not curvature_detected,
-            "electron-retarding semilog branch has significant curvature",
-        ),
-    )
-    for passed, reason in checks:
-        if not passed:
-            output["reason"] = reason
-            return output
-
-    output["valid"] = True
-    return output
+    return normalized_density, scaled_density, density_scale
 
 
-def _empty_result(trace_label):
-    return {
-        "trace_label": trace_label,
-        "ok": False,
-        "warnings": [],
-        "model_notes": [],
-        "te_eV": np.nan,
-        "vp_V": np.nan,
-        "vp_fit_V": np.nan,
-        "vp_derivative_V": np.nan,
-        "vf_V": np.nan,
-        "ies_A": np.nan,
-        "iis_A": np.nan,
-        "n_e_m3": np.nan,
-        "ion_current_A": np.nan,
-        "ion_noise_A": np.nan,
-        "ion_current_uncertainty_A": np.nan,
-        "ion_current_snr": np.nan,
-        "ion_effective_sample_count": np.nan,
-        "ion_fit_slope_A_per_V": np.nan,
-        "electron_saturation_slope_A_per_V": np.nan,
-        "ion_saturation_trend_fraction": np.nan,
-        "electron_saturation_trend_fraction": np.nan,
-        "electron_leakage_fraction": np.nan,
-        "te_fit_r2": np.nan,
-        "te_fit_rmse": np.nan,
-        "te_fit_npts": 0,
-        "te_fit_vstart": np.nan,
-        "te_fit_vstop": np.nan,
-        "te_fit_slope": np.nan,
-        "te_fit_intercept": np.nan,
-        "te_fit_relative_uncertainty": np.nan,
-        "te_fit_log_span": np.nan,
-        "te_fit_curvature_log": np.nan,
-        "te_fit_curvature_flagged": False,
-        "te_fit_valid": False,
-        # Compatibility aliases. I0 is now the measured median ion-region
-        # current, not the old artificial positivity shift; one fit is attempted.
-        "te_fit_i0": np.nan,
-        "te_fit_subtract_i0": True,
-        "te_fit_passed_r2": False,
-        "te_fit_candidate_count": 0,
-        "iv_voltage_grid": None,
-        "iv_current_grid": None,
-        "iv_didv_grid": None,
-        "iv_fit_mask": None,
-        "diagnostic_data": None,
-    }
+def select_xline_from_xy_map(y_cm, density_map, requested_y_cm=0.0):
+    """Return the xy-map row nearest a requested y position.
 
-
-def analyze_iv_trace(
-    bias_values,
-    current_values,
-    config=None,
-    include_diagnostic_data=False,
-    trace_label=None,
-):
-    """Analyze one trace and return every estimate that could be calculated.
-
-    ``ok`` means that the measured sweep and numerical fit passed the enabled
-    quality checks. Experimental deviations from the ideal planar-Maxwellian
-    model are recorded in ``model_notes`` unless
-    ``enforce_ideal_model_checks`` is true. A quality-rejected trace can still
-    contain finite scalar estimates so callers can plot and inspect the fit;
-    ``warnings`` explains why it was not accepted. Density may be NaN when
-    ``probe_area`` is absent.
+    Parameters
+    ----------
+    y_cm : array-like or `~astropy.units.Quantity`
+        One-dimensional y coordinates for the first map axis.
+    density_map : array-like or `~astropy.units.Quantity`
+        Two-dimensional electron-density map ordered as ``(y, x)``.
+    requested_y_cm : float or `~astropy.units.Quantity`
+        Desired x-line location. Unitless values are interpreted as cm.
     """
-    cfg = _validated_config(config)
-    result = _empty_result(trace_label)
-    bias, current = _validate_trace_arrays(bias_values, current_values)
-
-    if not _sweep_direction_is_valid(bias, cfg["voltage_bin_width"]):
-        result["warnings"].append(
-            "voltage samples do not contain one dominant sweep direction"
-        )
-        return result
-
-    iv = make_monotonic_iv_curve(
-        bias,
-        current,
-        npts=cfg["iv_npts"],
-        bin_width=cfg["voltage_bin_width"],
+    y_values = (
+        u.Quantity(y_cm).to_value(u.cm)
+        if isinstance(y_cm, u.Quantity)
+        else np.asarray(y_cm, dtype=float)
     )
-    if iv is None:
-        result["warnings"].append(
-            "could not construct a sufficiently sampled I-V curve"
+    if y_values.ndim != 1 or y_values.size == 0:
+        raise ValueError("y_cm must be a non-empty one-dimensional array.")
+
+    density_shape = np.shape(density_map)
+    if len(density_shape) != 2 or density_shape[0] != y_values.size:
+        raise ValueError(
+            "density_map must have shape (len(y_cm), nx); "
+            f"got {density_shape} for {y_values.size} y coordinates."
         )
-        return result
 
-    Vb = iv["V_binned"]
-    Ib = iv["I_binned"]
-    Va = iv["V_analysis"]
-    Ia = iv["I_analysis"]
-    Vg = iv["V_grid"]
-    Ig = iv["I_grid"]
-    result["iv_voltage_grid"] = Vg
-    result["iv_current_grid"] = Ig
-    result["iv_fit_mask"] = np.zeros(Vg.shape, dtype=np.uint8)
-
-    if include_diagnostic_data:
-        result["diagnostic_data"] = {
-            "V_raw": iv["V_raw"],
-            "I_raw": iv["I_raw"],
-            "V_binned": Vb,
-            "I_binned": Ib,
-        }
-
-    if not cfg["current_zero_calibrated"]:
-        result["warnings"].append(
-            "absolute current zero is not independently calibrated"
-        )
-        return result
-
-    preliminary_vf = find_floating_potential_from_iv(Vb, Ib)
-    if not np.isfinite(preliminary_vf.to_value(u.V)):
-        result["warnings"].append("no bracketed negative-to-positive current crossing")
-        return result
-
-    Vp, dIdV_analysis = find_plasma_potential_from_iv(
-        Va,
-        Ia,
-        vf=preliminary_vf,
-        smoothing=cfg["vp_smoothing"],
-        smoothing_width_V=cfg["vp_smoothing_width_V"],
-        savgol_order=cfg["vp_savgol_order"],
+    requested_value = (
+        u.Quantity(requested_y_cm).to_value(u.cm)
+        if isinstance(requested_y_cm, u.Quantity)
+        else float(requested_y_cm)
     )
-    result["iv_didv_grid"] = np.interp(Vg, Va, dIdV_analysis)
-    if not np.isfinite(Vp.to_value(u.V)):
-        result["warnings"].append("no interior plasma-potential derivative peak")
-        return result
+    if not np.isfinite(requested_value):
+        raise ValueError("requested_y_cm must be finite.")
 
-    Vf = find_floating_potential_from_iv(Vb, Ib, upper_bound=Vp)
-    vf_value = Vf.to_value(u.V)
-    vp_value = Vp.to_value(u.V)
-    if not np.isfinite(vf_value) or not vf_value < vp_value:
-        result["warnings"].append(
-            "floating and plasma potentials are not physically ordered"
-        )
-        return result
-    result["vf_V"] = vf_value
-    result["vp_derivative_V"] = vp_value
-    # The derivative estimate is a reportable plasma-potential measurement even
-    # if a later Maxwellian consistency check rejects the overall trace.
-    result["vp_V"] = vp_value
+    finite_y = np.isfinite(y_values)
+    if not np.any(finite_y):
+        raise ValueError("y_cm must contain at least one finite coordinate.")
+    finite_indices = np.flatnonzero(finite_y)
+    local_index = np.argmin(np.abs(y_values[finite_y] - requested_value))
+    y_index = int(finite_indices[local_index])
+    return y_index, float(y_values[y_index]), density_map[y_index, :]
 
-    ion, ion_error = _estimate_ion_current(
-        Vb,
-        Ib,
-        vf_value,
-        enforce_flatness=cfg["enforce_ideal_model_checks"],
+
+def scale_xy_density_map_to_interferometer(
+    x_cm,
+    y_cm,
+    density_map,
+    line_integrated_density,
+    requested_y_cm=0.0,
+):
+    """Calibrate an xy density map from one measured x-line profile.
+
+    The selected x-line is normalized and integrated in exactly the same way
+    as the native x-line pipeline. Its scalar calibration factor is then
+    applied uniformly to the complete xy map.
+    """
+    density = u.Quantity(density_map).to(u.m**-3)
+    y_index, selected_y_cm, xline_density = select_xline_from_xy_map(
+        y_cm,
+        density,
+        requested_y_cm=requested_y_cm,
     )
-    if ion is None:
-        result["warnings"].append(ion_error)
-        return result
-    result["ion_current_A"] = ion["current_A"]
-    result["ion_noise_A"] = ion["noise_A"]
-    result["ion_current_uncertainty_A"] = ion["uncertainty_A"]
-    result["ion_current_snr"] = ion["snr"]
-    result["ion_effective_sample_count"] = ion["effective_sample_count"]
-    result["ion_fit_slope_A_per_V"] = ion["slope_A_per_V"]
-    result["ion_saturation_trend_fraction"] = ion["trend_fraction"]
-    result["iis_A"] = -ion["current_A"]
-    result["te_fit_i0"] = ion["current_A"]
-    if ion["snr"] < cfg["ion_min_snr"]:
-        result["warnings"].append(
-            "ion-saturation current estimate is not resolved above its uncertainty"
-        )
-        return result
-    if ion["trend_exceeds_limit"]:
-        result["model_notes"].append(
-            "ion-saturation branch is sloped; median region current was used"
-        )
-
-    ion_voltage_max = Vb[ion["mask"]][-1]
-    derivative_ion_mask = Va <= ion_voltage_max
-    derivative_baseline = np.median(dIdV_analysis[derivative_ion_mask])
-    derivative_noise = 1.4826 * np.median(
-        np.abs(
-            dIdV_analysis[derivative_ion_mask]
-            - np.median(dIdV_analysis[derivative_ion_mask])
+    shape_factor = electron_density_profile_shape_factor(x_cm, xline_density)
+    normalized_xline, scaled_xline, density_scale = (
+        scale_density_profile_to_interferometer(
+            xline_density,
+            line_integrated_density,
+            shape_factor,
         )
     )
-    derivative_peak = float(np.interp(vp_value, Va, dIdV_analysis))
-    if (
-        not np.isfinite(derivative_peak)
-        or derivative_peak
-        <= derivative_baseline + _ELECTRON_SIGNAL_TO_NOISE * derivative_noise
-    ):
-        result["warnings"].append(
-            "plasma-potential derivative peak is not resolved above ion-region noise"
-        )
-        return result
 
-    supported = Vb >= vf_value
-    supported_spacing = np.diff(Vb[supported])
-    typical_spacing = np.median(np.diff(Vb))
-    maximum_gap = max(
-        5 * typical_spacing,
-        0.5 * cfg["vp_smoothing_width_V"],
+    if np.isfinite(density_scale):
+        scaled_density_map = density * density_scale
+    else:
+        scaled_density_map = np.full(density.shape, np.nan) * u.m**-3
+
+    return {
+        "selected_y_index": y_index,
+        "selected_y_cm": selected_y_cm,
+        "shape_factor": shape_factor,
+        "density_scale": density_scale,
+        "normalized_xline": normalized_xline,
+        "scaled_xline": scaled_xline,
+        "scaled_density_map": scaled_density_map,
+    }
+
+
+def read_channel_xline(
+    file_obj,
+    board,
+    channel,
+    shotnum_start,
+    shotnum_end,
+    nx,
+    nshots,
+    nt_full,
+    digitizer,
+    adc,
+    config_name,
+    scale_factor=1.0,
+    negate=False,
+):
+    """Read one digitizer channel and reshape it as (nx, nshots, nt_full)."""
+    raw = file_obj.read_data(
+        board,
+        channel,
+        digitizer=digitizer,
+        adc=adc,
+        config_name=config_name,
+        shotnum=slice(shotnum_start, shotnum_end, 1),
     )
-    if supported_spacing.size == 0 or np.max(supported_spacing) > maximum_gap:
-        result["warnings"].append(
-            "measured voltage bins do not continuously support the electron branch"
-        )
-        return result
 
-    electron_current = Ib - ion["current_A"]
-    electron_saturation, saturation_error = _estimate_electron_saturation_current(
-        Vb,
-        Ib,
-        vp_value,
-        ion["noise_A"],
-        enforce_flatness=cfg["enforce_ideal_model_checks"],
+    signal = raw["signal"]
+    dt = raw.dt.value
+
+    if signal.ndim != 2:
+        raise ValueError(
+            f"Channel {channel}: expected raw signal with shape (shots, time), got {signal.shape}."
+        )
+
+    n_actual_shots, n_actual_time = signal.shape
+    print(f"Channel {channel}: raw shape = {signal.shape}")
+    print(f"Channel {channel}: expected shots = {shotnum_end - shotnum_start}, actual shots = {n_actual_shots}")
+    print(f"Channel {channel}: expected nt_full = {nt_full}, actual time samples = {n_actual_time}")
+
+    if n_actual_shots != (shotnum_end - shotnum_start):
+        raise ValueError(
+            f"Channel {channel}: shot count mismatch. "
+            f"Expected {shotnum_end - shotnum_start}, found {n_actual_shots}. "
+            f"Likely wrong data_offset, nx, or nshots."
+        )
+
+    if n_actual_time != nt_full:
+        raise ValueError(
+            f"Channel {channel}: time-length mismatch. Expected {nt_full}, found {n_actual_time}."
+        )
+
+    if negate:
+        signal = -signal
+
+    expected_shape = (nx, nshots, nt_full)
+    if signal.size != np.prod(expected_shape):
+        raise ValueError(
+            f"Channel {channel}: cannot reshape size {signal.size} into {expected_shape}."
+        )
+
+    signal = signal.reshape(expected_shape)
+    signal = signal * scale_factor
+    return signal, dt
+
+
+def open_h5_for_update(path):
+    try:
+        return h5py.File(path, "r+")
+    except BlockingIOError as exc:
+        if getattr(exc, "errno", None) == 35:
+            print("HDF5 file lock unavailable (errno 35); retrying with locking disabled.")
+            return h5py.File(path, "r+", locking=False)
+        raise
+
+
+def analyze_trace_worker(task):
+    """Analyze one trace and preserve caller-owned geometry indexing metadata."""
+    flat_index, idx, bias_values, current_values, include_diagnostic_data, config = task
+    result = analyze_iv_trace(
+        bias_values,
+        current_values,
+        config,
+        include_diagnostic_data=include_diagnostic_data,
+        trace_label=idx,
     )
-    if electron_saturation is None:
-        result["warnings"].append(saturation_error)
-        return result
-    I_es = electron_saturation["current_A"]
-    result["ies_A"] = I_es
-    result["electron_saturation_slope_A_per_V"] = electron_saturation["slope_A_per_V"]
-    result["electron_saturation_trend_fraction"] = electron_saturation[
-        "trend_fraction"
-    ]
-    if electron_saturation["trend_exceeds_limit"]:
-        result["model_notes"].append(
-            "electron-saturation branch is sloped; median region current was used"
-        )
-
-    te_fit = _fit_electron_temperature(
-        Vb,
-        electron_current,
-        I_es,
-        vf_value,
-        vp_value,
-        ion["noise_A"],
-        cfg,
-    )
-    result["te_fit_npts"] = te_fit["npts"]
-    result["te_fit_r2"] = te_fit["r2"]
-    result["te_fit_rmse"] = te_fit["rmse_logI"]
-    result["te_fit_slope"] = te_fit["slope"]
-    result["te_fit_intercept"] = te_fit["intercept"]
-    result["te_fit_vstart"] = te_fit.get("vstart", np.nan)
-    result["te_fit_vstop"] = te_fit.get("vstop", np.nan)
-    result["te_fit_relative_uncertainty"] = te_fit["relative_slope_uncertainty"]
-    result["te_fit_log_span"] = te_fit["log_span"]
-    result["te_fit_curvature_log"] = te_fit["curvature_log"]
-    result["te_fit_curvature_flagged"] = te_fit["curvature_detected"]
-    result["te_fit_passed_r2"] = te_fit["passed_r2"]
-    result["te_fit_candidate_count"] = 1 if te_fit["npts"] else 0
-    result["te_fit_valid"] = te_fit["valid"]
-    if te_fit["curvature_detected"]:
-        result["model_notes"].append(
-            "electron-retarding semilog branch has significant curvature"
-        )
-    # Retain the numerical fit result independently of the quality decision.
-    # This prevents a failed diagnostic gate from erasing an otherwise finite
-    # fit and leaving diagnostic/profile plots entirely blank.
-    result["te_eV"] = te_fit["te_eV_candidate"]
-
-    if np.isfinite(te_fit["slope"]) and te_fit["slope"] > 0:
-        fitted_vp = (np.log(I_es) - te_fit["intercept"]) / te_fit["slope"]
-        if np.isfinite(fitted_vp):
-            result["vp_fit_V"] = float(fitted_vp)
-
-    probe_area = cfg["probe_area"]
-    if (
-        probe_area is not None
-        and np.isfinite(result["te_eV"])
-        and result["te_eV"] > 0
-    ):
-        density = density_from_electron_saturation_current(
-            I_es,
-            result["te_eV"],
-            probe_area,
-        )
-        result["n_e_m3"] = density.to_value(u.m**-3)
-
-    if te_fit["npts"]:
-        selected_voltage = Vb[te_fit["fit_mask"]]
-        if selected_voltage.size:
-            result["iv_fit_mask"] = (
-                (Vg >= selected_voltage[0]) & (Vg <= selected_voltage[-1])
-            ).astype(np.uint8)
-
-    if np.isfinite(te_fit["slope"]) and np.isfinite(te_fit["intercept"]):
-        electron_leakage = np.exp(
-            te_fit["slope"] * ion_voltage_max + te_fit["intercept"]
-        )
-        result["electron_leakage_fraction"] = electron_leakage / result["iis_A"]
-        if result["electron_leakage_fraction"] > 0.02:
-            message = "negative-bias coverage may include electron current in the ion estimate"
-            if cfg["enforce_ideal_model_checks"]:
-                result["warnings"].append(
-                    "negative-bias coverage is insufficient to isolate ion saturation"
-                )
-                return result
-            result["model_notes"].append(message)
-
-    if not te_fit["valid"]:
-        result["warnings"].append(te_fit["reason"])
-        return result
-
-    fitted_vp = result["vp_fit_V"]
-    vp_tolerance = max(
-        2 * cfg["voltage_bin_width"],
-        min(0.5 * cfg["vp_smoothing_width_V"], 0.5 * te_fit["te_eV_candidate"]),
-    )
-    vp_estimators_disagree = (
-        not np.isfinite(fitted_vp)
-        or not vf_value < fitted_vp < Vb[-1]
-        or abs(fitted_vp - vp_value) > vp_tolerance
-    )
-    if vp_estimators_disagree:
-        message = "derivative and retarding/saturation plasma-potential estimates disagree"
-        if cfg["enforce_ideal_model_checks"]:
-            result["warnings"].append(message)
-            return result
-        result["model_notes"].append(message)
-
-    # Use the fit extrapolation only when it is consistent with the measured
-    # derivative knee; otherwise retain the derivative-based Vp estimate.
-    if not vp_estimators_disagree:
-        result["vp_V"] = float(fitted_vp)
-    if probe_area is None:
-        result["warnings"].append(
-            "missing probe_area; electron density was not calculated"
-        )
-
-    result["ok"] = True
+    result["flat_index"] = flat_index
+    result["idx"] = idx
     return result
+
+
+def choose_analysis_process_count(n_traces, requested_processes=None):
+    """Choose a conservative worker count for independent trace fits."""
+    n_traces = int(n_traces)
+    if n_traces < 1:
+        return 0
+    if requested_processes is not None:
+        return max(1, min(int(requested_processes), n_traces))
+    return max(1, min((mp.cpu_count() or 1) - 1, n_traces))
+
+
+def reject_spikes_by_local_median(y, half_window=2, threshold=5.0):
+    """Return a mask of spike-like points using local median comparison."""
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    is_spike = np.zeros(n, dtype=bool)
+
+    for i in range(n):
+        if not np.isfinite(y[i]):
+            continue
+
+        i0 = max(0, i - half_window)
+        i1 = min(n, i + half_window + 1)
+
+        neighborhood = y[i0:i1].copy()
+        local_idx = i - i0
+        neighborhood = np.delete(neighborhood, local_idx)
+        neighborhood = neighborhood[np.isfinite(neighborhood)]
+
+        if neighborhood.size < 2:
+            continue
+
+        med = np.median(neighborhood)
+        if np.abs(y[i] - med) > threshold:
+            is_spike[i] = True
+
+    return is_spike
+
+
+def replace_flagged_by_local_interp(x_coord, y, flagged):
+    """Replace flagged points in y by linear interpolation from unflagged finite neighbors."""
+    x_coord = np.asarray(x_coord, dtype=float)
+    y = np.asarray(y, dtype=float).copy()
+    flagged = np.asarray(flagged, dtype=bool)
+
+    good = np.isfinite(y) & (~flagged)
+    if np.count_nonzero(good) < 2:
+        return y
+
+    y_out = y.copy()
+    bad = flagged & np.isfinite(y)
+    y_out[bad] = np.interp(x_coord[bad], x_coord[good], y[good])
+    return y_out
+
+
+def gaussian_neighbor_smooth_nanaware(x_coord, y, half_window=1, sigma=1.0):
+    """Smooth 1D data using a local gaussian-like weighted average, ignoring NaNs."""
+    x_coord = np.asarray(x_coord, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    y_smooth = np.full(n, np.nan)
+
+    offsets = np.arange(-half_window, half_window + 1, dtype=float)
+    weights_template = np.exp(-0.5 * (offsets / sigma) ** 2)
+
+    for i in range(n):
+        if not np.isfinite(y[i]):
+            continue
+        idx = np.arange(i - half_window, i + half_window + 1)
+        keep = (idx >= 0) & (idx < n)
+        idx = idx[keep]
+        weights = weights_template[keep]
+
+        vals = y[idx]
+        finite = np.isfinite(vals)
+        if np.count_nonzero(finite) == 0:
+            continue
+
+        vals = vals[finite]
+        w = weights[finite]
+        y_smooth[i] = np.sum(w * vals) / np.sum(w)
+
+    return y_smooth
+
+
+def apply_optional_x_postprocessing(
+    x_coord,
+    te,
+    vp,
+    vf,
+    ies=None,
+    iis=None,
+    n_e=None,
+    enable_vp_spike_rejection=True,
+    vp_spike_half_window=2,
+    vp_spike_threshold_V=5.0,
+    vp_replace_flagged_with_local_interp=True,
+    enable_neighbor_smoothing=True,
+    neighbor_smooth_half_window=1,
+    neighbor_smooth_sigma=1.0,
+):
+    """
+    Optional x-line post-processing of Te(x), Vp(x), Vf(x), I_es(x), I_is(x), n_e(x):
+      1) detect/reject Vp spikes
+      2) neighbor-aware smoothing
+    """
+    x_coord = np.asarray(x_coord, dtype=float)
+
+    te_in = np.asarray(te, dtype=float)
+    vp_in = np.asarray(vp, dtype=float)
+    vf_in = np.asarray(vf, dtype=float)
+    ies_in = np.asarray(ies, dtype=float) if ies is not None else None
+    iis_in = np.asarray(iis, dtype=float) if iis is not None else None
+    n_e_in = np.asarray(n_e, dtype=float) if n_e is not None else None
+
+    te_proc = te_in.copy()
+    vp_proc = vp_in.copy()
+    vf_proc = vf_in.copy()
+    ies_proc = ies_in.copy() if ies_in is not None else None
+    iis_proc = iis_in.copy() if iis_in is not None else None
+    n_e_proc = n_e_in.copy() if n_e_in is not None else None
+
+    vp_spike_mask = np.zeros_like(vp_proc, dtype=bool)
+
+    if enable_vp_spike_rejection:
+        vp_spike_mask = reject_spikes_by_local_median(
+            vp_proc,
+            half_window=vp_spike_half_window,
+            threshold=vp_spike_threshold_V,
+        )
+        if vp_replace_flagged_with_local_interp:
+            vp_proc = replace_flagged_by_local_interp(x_coord, vp_proc, vp_spike_mask)
+
+    te_smooth = te_proc.copy()
+    vp_smooth = vp_proc.copy()
+    vf_smooth = vf_proc.copy()
+    ies_smooth = ies_proc.copy() if ies_proc is not None else None
+    iis_smooth = iis_proc.copy() if iis_proc is not None else None
+    n_e_smooth = n_e_proc.copy() if n_e_proc is not None else None
+
+    if enable_neighbor_smoothing:
+        te_smooth = gaussian_neighbor_smooth_nanaware(
+            x_coord, te_proc,
+            half_window=neighbor_smooth_half_window,
+            sigma=neighbor_smooth_sigma
+        )
+        vp_smooth = gaussian_neighbor_smooth_nanaware(
+            x_coord, vp_proc,
+            half_window=neighbor_smooth_half_window,
+            sigma=neighbor_smooth_sigma
+        )
+        vf_smooth = gaussian_neighbor_smooth_nanaware(
+            x_coord, vf_proc,
+            half_window=neighbor_smooth_half_window,
+            sigma=neighbor_smooth_sigma
+        )
+        if ies_proc is not None:
+            ies_smooth = gaussian_neighbor_smooth_nanaware(
+                x_coord, ies_proc,
+                half_window=neighbor_smooth_half_window,
+                sigma=neighbor_smooth_sigma
+            )
+        if iis_proc is not None:
+            iis_smooth = gaussian_neighbor_smooth_nanaware(
+                x_coord, iis_proc,
+                half_window=neighbor_smooth_half_window,
+                sigma=neighbor_smooth_sigma
+            )
+        if n_e_proc is not None:
+            n_e_smooth = gaussian_neighbor_smooth_nanaware(
+                x_coord, n_e_proc,
+                half_window=neighbor_smooth_half_window,
+                sigma=neighbor_smooth_sigma
+            )
+
+    result = {
+        "te_raw": te_in,
+        "vp_raw": vp_in,
+        "vf_raw": vf_in,
+        "te_processed": te_smooth,
+        "vp_processed": vp_smooth,
+        "vf_processed": vf_smooth,
+        "vp_spike_mask": vp_spike_mask,
+    }
+    if ies_proc is not None:
+        result["ies_raw"] = ies_proc
+        result["ies_processed"] = ies_smooth
+    if iis_proc is not None:
+        result["iis_raw"] = iis_proc
+        result["iis_processed"] = iis_smooth
+    if n_e_proc is not None:
+        result["n_e_raw"] = n_e_proc
+        result["n_e_processed"] = n_e_smooth
+    return result
+
+
+def render_xline_summary_plot(
+    x,
+    te,
+    vp,
+    vf,
+    ies,
+    iis,
+    n_e=None,
+    te_std=None,
+    vp_std=None,
+    vf_std=None,
+    ies_std=None,
+    iis_std=None,
+    n_e_std=None,
+    plot_stds=False,
+    vp_spike_mask=None,
+    vp_raw=None,
+    te_fit_r2=None,
+    te_poor_fit_r2=None,
+    analysis_ok=None,
+    analysis_status=None,
+    shape_factor=None,
+    title="Langmuir X-Line Summary",
+):
+    fig, axs = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
+
+    finite_x = np.asarray(x)[np.isfinite(x)]
+    fit_accepted = (
+        None if analysis_ok is None else np.asarray(analysis_ok, dtype=bool)
+    )
+
+    def _finish_profile_axis(ax, plot_title, y_label):
+        ax.set_title(plot_title)
+        ax.set_xlabel("X (cm)")
+        ax.set_ylabel(y_label)
+        if finite_x.size:
+            ax.set_xlim(np.min(finite_x), np.max(finite_x))
+        ax.grid(True)
+
+    def _mark_empty(ax):
+        ax.text(
+            0.5,
+            0.5,
+            "No accepted values",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color="0.35",
+        )
+
+    def _plot_standard_deviations(ax, values, std, color):
+        if not plot_stds or std is None:
+            return
+
+        plot_values = np.asarray(values.value, dtype=float)
+        std_values = np.asarray(std.value, dtype=float)
+        finite = np.isfinite(x) & np.isfinite(plot_values) & np.isfinite(std_values)
+        if np.any(finite):
+            ax.errorbar(
+                np.asarray(x)[finite],
+                plot_values[finite],
+                yerr=std_values[finite],
+                fmt="none",
+                ecolor=color,
+                elinewidth=1.0,
+                capsize=3,
+                alpha=0.7,
+                label="shot-to-shot $\u00b11\u03c3$",
+            )
+
+    def _plot_profile(ax, values, std, plot_title, y_label):
+        plot_values = np.asarray(values.value, dtype=float)
+        finite = np.isfinite(x) & np.isfinite(plot_values)
+        if np.any(finite):
+            line = ax.plot(np.asarray(x)[finite], plot_values[finite])[0]
+            _plot_standard_deviations(ax, values, std, line.get_color())
+            if fit_accepted is not None:
+                rejected = finite & ~fit_accepted
+                if np.any(rejected):
+                    ax.plot(
+                        np.asarray(x)[rejected],
+                        plot_values[rejected],
+                        "x",
+                        color="tab:orange",
+                        label="no accepted fits",
+                    )
+        else:
+            _mark_empty(ax)
+        _finish_profile_axis(ax, plot_title, y_label)
+        handles, _ = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend()
+
+    _plot_profile(axs[0, 0], te, te_std, "Electron Temperature", "T_e (eV)")
+    if te_fit_r2 is not None and te_poor_fit_r2 is not None:
+        poor_te_fit = np.isfinite(te_fit_r2) & np.isfinite(te.value) & (te_fit_r2 < te_poor_fit_r2)
+        if np.any(poor_te_fit):
+            axs[0, 0].plot(
+                x[poor_te_fit],
+                te.value[poor_te_fit],
+                "rx",
+                ms=6,
+                mew=1.5,
+                label=f"Te fit R^2 < {te_poor_fit_r2:.2f}",
+            )
+            axs[0, 0].legend()
+
+    vp_values = np.asarray(vp.value, dtype=float)
+    vp_finite = np.isfinite(x) & np.isfinite(vp_values)
+    if np.any(vp_finite):
+        vp_line = axs[0, 1].plot(
+            np.asarray(x)[vp_finite],
+            vp_values[vp_finite],
+            label="Vp",
+        )[0]
+        _plot_standard_deviations(axs[0, 1], vp, vp_std, vp_line.get_color())
+        if fit_accepted is not None:
+            rejected = vp_finite & ~fit_accepted
+            if np.any(rejected):
+                axs[0, 1].plot(
+                    np.asarray(x)[rejected],
+                    vp_values[rejected],
+                    "x",
+                    color="tab:orange",
+                    label="no accepted fits",
+                )
+    any_vp_values = bool(np.any(vp_finite))
+    if vp_raw is not None:
+        vp_raw_values = np.asarray(vp_raw.value, dtype=float)
+        vp_raw_finite = np.isfinite(x) & np.isfinite(vp_raw_values)
+        if np.any(vp_raw_finite):
+            axs[0, 1].plot(
+                np.asarray(x)[vp_raw_finite],
+                vp_raw_values[vp_raw_finite],
+                alpha=0.35,
+                label="Vp raw",
+            )
+            any_vp_values = True
+    if vp_spike_mask is not None and vp_raw is not None:
+        m = vp_spike_mask.astype(bool)
+        if np.any(m):
+            axs[0, 1].plot(x[m], vp_raw.value[m], "o", label="flagged spikes")
+    if not any_vp_values:
+        _mark_empty(axs[0, 1])
+    _finish_profile_axis(axs[0, 1], "Plasma Potential", "V_p (V)")
+    handles, _ = axs[0, 1].get_legend_handles_labels()
+    if handles:
+        axs[0, 1].legend()
+
+    _plot_profile(axs[1, 0], vf, vf_std, "Floating Potential", "V_f (V)")
+    _plot_profile(
+        axs[1, 1],
+        ies,
+        ies_std,
+        "Electron Saturation Current",
+        "I_es (A)",
+    )
+    _plot_profile(
+        axs[2, 0],
+        iis,
+        iis_std,
+        "Ion Saturation Current",
+        "I_is (A)",
+    )
+    if n_e is not None:
+        _plot_profile(
+            axs[2, 1],
+            n_e,
+            n_e_std,
+            "Electron Density",
+            "n_e (m^-3)",
+        )
+        if shape_factor is not None:
+            shape_factor_m = u.Quantity(shape_factor).to_value(u.m)
+            shape_factor_text = (
+                f"Shape factor = {shape_factor_m:.4g} m"
+                if np.isfinite(shape_factor_m)
+                else "Shape factor unavailable"
+            )
+            axs[2, 1].text(
+                0.03,
+                0.95,
+                shape_factor_text,
+                transform=axs[2, 1].transAxes,
+                ha="left",
+                va="top",
+                bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"},
+            )
+    else:
+        axs[2, 1].axis("off")
+
+    summary_title = title if analysis_status is None else f"{title}\n{analysis_status}"
+    fig.suptitle(summary_title, fontsize=16)
+    return fig
+
+
+def render_xline_all_iv_curves_plot(x, iv_voltage_grid, iv_current_grid):
+    """Plot all interpolated I-V curves colored by x position."""
+    fig, ax = plt.subplots(figsize=(9, 6), constrained_layout=True)
+
+    cmap = plt.get_cmap("viridis")
+    x_min = np.nanmin(x)
+    x_max = np.nanmax(x)
+
+    for i in range(len(x)):
+        voltage_curve = iv_voltage_grid[i]
+        current_curve = iv_current_grid[i]
+        good = np.isfinite(voltage_curve) & np.isfinite(current_curve)
+        if np.count_nonzero(good) < 2:
+            continue
+
+        frac = 0.5 if x_max == x_min else (x[i] - x_min) / (x_max - x_min)
+        ax.plot(
+            voltage_curve[good],
+            current_curve[good],
+            color=cmap(frac),
+            alpha=0.9,
+            lw=1.2,
+        )
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=x_min, vmax=x_max))
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label="X (cm)")
+
+    ax.set_title("Interpolated I–V Curves Along X-Line")
+    ax.set_xlabel("Bias (V)")
+    ax.set_ylabel("Current (A)")
+    ax.grid(True)
+
+    return fig
+
+
+def read_channel_xy(
+    file_obj,
+    board,
+    channel,
+    shotnum_start,
+    shotnum_end,
+    ny,
+    nx,
+    nshots,
+    nt_full,
+    digitizer,
+    adc,
+    config_name,
+    scale_factor=1.0,
+    negate=False,
+    flipup=False,
+):
+    """
+    Read one digitizer channel and reshape it as (ny, nx, nshots, nt_full).
+
+    This assumes shot order is y-major, then x, then repeated shots at each
+    location. If the acquisition order differs, change expected_shape and the
+    corresponding coordinate metadata before running the analysis.
+
+    If flipup is True, return the reshaped signal with the y dimension flipped
+    using numpy.flipud.
+    """
+    raw = file_obj.read_data(
+        board,
+        channel,
+        digitizer=digitizer,
+        adc=adc,
+        config_name=config_name,
+        shotnum=slice(shotnum_start, shotnum_end, 1),
+    )
+
+    signal = raw["signal"]
+    dt = raw.dt.value
+
+    if signal.ndim != 2:
+        raise ValueError(
+            f"Channel {channel}: expected raw signal with shape (shots, time), got {signal.shape}."
+        )
+
+    n_actual_shots, n_actual_time = signal.shape
+    print(f"Channel {channel}: raw shape = {signal.shape}")
+    print(f"Channel {channel}: expected shots = {shotnum_end - shotnum_start}, actual shots = {n_actual_shots}")
+    print(f"Channel {channel}: expected nt_full = {nt_full}, actual time samples = {n_actual_time}")
+
+    if n_actual_shots != (shotnum_end - shotnum_start):
+        raise ValueError(
+            f"Channel {channel}: shot count mismatch. "
+            f"Expected {shotnum_end - shotnum_start}, found {n_actual_shots}. "
+            f"Likely wrong data_offset, ny, nx, or nshots."
+        )
+
+    if n_actual_time != nt_full:
+        raise ValueError(
+            f"Channel {channel}: time-length mismatch. Expected {nt_full}, found {n_actual_time}."
+        )
+
+    if negate:
+        signal = -signal
+
+    expected_shape = (ny, nx, nshots, nt_full)
+    if signal.size != np.prod(expected_shape):
+        raise ValueError(
+            f"Channel {channel}: cannot reshape size {signal.size} into {expected_shape}."
+        )
+
+    signal = signal.reshape(expected_shape)
+    signal = signal * scale_factor
+    if flipup:
+        signal = np.flipud(signal)
+    return signal, dt
+
+
+def _as_yx_half_window(half_window):
+    if np.isscalar(half_window):
+        hw = int(half_window)
+        return hw, hw
+    if len(half_window) != 2:
+        raise ValueError("half_window must be a scalar or a two-item (y, x) tuple.")
+    return int(half_window[0]), int(half_window[1])
+
+
+def reject_spikes_by_local_median_2d(z, half_window=(1, 1), threshold=5.0):
+    """Return a mask of spike-like map points using 2D local median comparison."""
+    z = np.asarray(z, dtype=float)
+    hy, hx = _as_yx_half_window(half_window)
+    ny_map, nx_map = z.shape
+    is_spike = np.zeros(z.shape, dtype=bool)
+
+    for iy in range(ny_map):
+        for ix in range(nx_map):
+            if not np.isfinite(z[iy, ix]):
+                continue
+
+            y0 = max(0, iy - hy)
+            y1 = min(ny_map, iy + hy + 1)
+            x0 = max(0, ix - hx)
+            x1 = min(nx_map, ix + hx + 1)
+
+            neighborhood = z[y0:y1, x0:x1].copy()
+            neighborhood[iy - y0, ix - x0] = np.nan
+            neighborhood = neighborhood[np.isfinite(neighborhood)]
+
+            if neighborhood.size < 2:
+                continue
+
+            med = np.median(neighborhood)
+            if np.abs(z[iy, ix] - med) > threshold:
+                is_spike[iy, ix] = True
+
+    return is_spike
+
+
+def replace_flagged_by_local_median_2d(z, flagged, half_window=(1, 1)):
+    """Replace flagged map points with the finite median of nearby unflagged points."""
+    z = np.asarray(z, dtype=float).copy()
+    flagged = np.asarray(flagged, dtype=bool)
+    hy, hx = _as_yx_half_window(half_window)
+    ny_map, nx_map = z.shape
+    z_out = z.copy()
+
+    for iy, ix in zip(*np.where(flagged & np.isfinite(z))):
+        y0 = max(0, iy - hy)
+        y1 = min(ny_map, iy + hy + 1)
+        x0 = max(0, ix - hx)
+        x1 = min(nx_map, ix + hx + 1)
+
+        neighborhood = z[y0:y1, x0:x1]
+        neighborhood_flags = flagged[y0:y1, x0:x1]
+        vals = neighborhood[np.isfinite(neighborhood) & (~neighborhood_flags)]
+        if vals.size > 0:
+            z_out[iy, ix] = np.median(vals)
+
+    return z_out
+
+
+def gaussian_neighbor_smooth_nanaware_2d(z, half_window=(1, 1), sigma=1.0):
+    """Smooth a 2D map using local gaussian-like weights, ignoring NaNs."""
+    z = np.asarray(z, dtype=float)
+    hy, hx = _as_yx_half_window(half_window)
+    ny_map, nx_map = z.shape
+    z_smooth = np.full(z.shape, np.nan)
+
+    y_offsets = np.arange(-hy, hy + 1, dtype=float)
+    x_offsets = np.arange(-hx, hx + 1, dtype=float)
+    dy, dx = np.meshgrid(y_offsets, x_offsets, indexing="ij")
+    weights_template = np.exp(-0.5 * (dy**2 + dx**2) / float(sigma) ** 2)
+
+    for iy in range(ny_map):
+        for ix in range(nx_map):
+            if not np.isfinite(z[iy, ix]):
+                continue
+            y0 = max(0, iy - hy)
+            y1 = min(ny_map, iy + hy + 1)
+            x0 = max(0, ix - hx)
+            x1 = min(nx_map, ix + hx + 1)
+
+            wy0 = y0 - (iy - hy)
+            wy1 = wy0 + (y1 - y0)
+            wx0 = x0 - (ix - hx)
+            wx1 = wx0 + (x1 - x0)
+
+            vals = z[y0:y1, x0:x1]
+            weights = weights_template[wy0:wy1, wx0:wx1]
+            finite = np.isfinite(vals)
+            if np.count_nonzero(finite) == 0:
+                continue
+
+            z_smooth[iy, ix] = np.sum(weights[finite] * vals[finite]) / np.sum(weights[finite])
+
+    return z_smooth
+
+
+def apply_optional_xy_postprocessing(
+    te,
+    vp,
+    vf,
+    ies,
+    iis,
+    n_e=None,
+    enable_vp_spike_rejection=True,
+    vp_spike_half_window=(1, 1),
+    vp_spike_threshold_V=5.0,
+    vp_replace_flagged_with_local_median=True,
+    enable_neighbor_smoothing=True,
+    neighbor_smooth_half_window=(1, 1),
+    neighbor_smooth_sigma=1.0,
+):
+    """
+    Optional 2D post-processing of Te(y, x), Vp(y, x), Vf(y, x), I_es(y, x), I_is(y, x), n_e(y, x):
+      1) detect/reject Vp spikes using a local 2D median
+      2) neighbor-aware 2D smoothing for Te, Vp, Vf, I_es, I_is, and n_e
+    """
+    te_in = np.asarray(te, dtype=float)
+    vp_in = np.asarray(vp, dtype=float)
+    vf_in = np.asarray(vf, dtype=float)
+    ies_in = np.asarray(ies, dtype=float)
+    iis_in = np.asarray(iis, dtype=float)
+    n_e_in = np.asarray(n_e, dtype=float) if n_e is not None else None
+
+    te_proc = te_in.copy()
+    vp_proc = vp_in.copy()
+    vf_proc = vf_in.copy()
+    ies_proc = ies_in.copy()
+    iis_proc = iis_in.copy()
+    n_e_proc = n_e_in.copy() if n_e_in is not None else None
+
+    vp_spike_mask = np.zeros_like(vp_proc, dtype=bool)
+
+    if enable_vp_spike_rejection:
+        vp_spike_mask = reject_spikes_by_local_median_2d(
+            vp_proc,
+            half_window=vp_spike_half_window,
+            threshold=vp_spike_threshold_V,
+        )
+        if vp_replace_flagged_with_local_median:
+            vp_proc = replace_flagged_by_local_median_2d(
+                vp_proc,
+                vp_spike_mask,
+                half_window=vp_spike_half_window,
+            )
+
+    te_smooth = te_proc.copy()
+    vp_smooth = vp_proc.copy()
+    vf_smooth = vf_proc.copy()
+    ies_smooth = ies_proc.copy()
+    iis_smooth = iis_proc.copy()
+    n_e_smooth = n_e_proc.copy() if n_e_proc is not None else None
+
+    if enable_neighbor_smoothing:
+        te_smooth = gaussian_neighbor_smooth_nanaware_2d(
+            te_proc,
+            half_window=neighbor_smooth_half_window,
+            sigma=neighbor_smooth_sigma,
+        )
+        vp_smooth = gaussian_neighbor_smooth_nanaware_2d(
+            vp_proc,
+            half_window=neighbor_smooth_half_window,
+            sigma=neighbor_smooth_sigma,
+        )
+        vf_smooth = gaussian_neighbor_smooth_nanaware_2d(
+            vf_proc,
+            half_window=neighbor_smooth_half_window,
+            sigma=neighbor_smooth_sigma,
+        )
+        ies_smooth = gaussian_neighbor_smooth_nanaware_2d(
+            ies_proc,
+            half_window=neighbor_smooth_half_window,
+            sigma=neighbor_smooth_sigma,
+        )
+        iis_smooth = gaussian_neighbor_smooth_nanaware_2d(
+            iis_proc,
+            half_window=neighbor_smooth_half_window,
+            sigma=neighbor_smooth_sigma,
+        )
+        if n_e_proc is not None:
+            n_e_smooth = gaussian_neighbor_smooth_nanaware_2d(
+                n_e_proc,
+                half_window=neighbor_smooth_half_window,
+                sigma=neighbor_smooth_sigma,
+            )
+
+    result_dict = {
+        "te_raw": te_in,
+        "vp_raw": vp_in,
+        "vf_raw": vf_in,
+        "ies_raw": ies_in,
+        "iis_raw": iis_in,
+        "te_processed": te_smooth,
+        "vp_processed": vp_smooth,
+        "vf_processed": vf_smooth,
+        "ies_processed": ies_smooth,
+        "iis_processed": iis_smooth,
+        "vp_spike_mask": vp_spike_mask,
+    }
+    if n_e_in is not None:
+        result_dict["n_e_raw"] = n_e_in
+        result_dict["n_e_processed"] = n_e_smooth
+    return result_dict
+
+
+def _plot_map(ax, x_mesh, y_mesh, values, title, cbar_label):
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(values)
+    mesh = None
+    if np.any(finite):
+        mesh = ax.pcolormesh(x_mesh, y_mesh, values, shading="auto")
+        cbar = ax.figure.colorbar(mesh, ax=ax)
+        cbar.set_label(cbar_label)
+    else:
+        finite_x = np.asarray(x_mesh)[np.isfinite(x_mesh)]
+        finite_y = np.asarray(y_mesh)[np.isfinite(y_mesh)]
+        if finite_x.size:
+            ax.set_xlim(np.min(finite_x), np.max(finite_x))
+        if finite_y.size:
+            ax.set_ylim(np.min(finite_y), np.max(finite_y))
+        ax.text(
+            0.5,
+            0.5,
+            "No accepted values",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color="0.35",
+        )
+    ax.set_title(title)
+    ax.set_xlabel("X (cm)")
+    ax.set_ylabel("Y (cm)")
+    ax.set_aspect("equal", adjustable="box")
+    return mesh
+
+
+def render_xy_summary_plot(
+    x_mesh,
+    y_mesh,
+    te,
+    vp,
+    vf,
+    ies,
+    iis,
+    n_e=None,
+    vp_spike_mask=None,
+    vp_raw=None,
+    te_fit_r2=None,
+    te_poor_fit_r2=None,
+    analysis_ok=None,
+    analysis_status=None,
+    shape_factor=None,
+    interferometer_profile_y_cm=None,
+    title="Langmuir XY-Plane Summary",
+):
+    fig, axs = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
+
+    _plot_map(axs[0, 0], x_mesh, y_mesh, te.value, "Electron Temperature", "T_e (eV)")
+    _plot_map(axs[0, 1], x_mesh, y_mesh, vp.value, "Plasma Potential", "V_p (V)")
+    _plot_map(axs[1, 0], x_mesh, y_mesh, vf.value, "Floating Potential", "V_f (V)")
+    _plot_map(axs[1, 1], x_mesh, y_mesh, ies.value, "Electron Saturation Current", "I_es (A)")
+    _plot_map(axs[2, 0], x_mesh, y_mesh, iis.value, "Ion Saturation Current", "I_is (A)")
+    if n_e is not None:
+        _plot_map(axs[2, 1], x_mesh, y_mesh, n_e.value, "Electron Density", "n_e (m^-3)")
+        if interferometer_profile_y_cm is not None:
+            axs[2, 1].axhline(
+                interferometer_profile_y_cm,
+                color="white",
+                linestyle="--",
+                linewidth=1.2,
+                label=f"interferometer x-line: y={interferometer_profile_y_cm:g} cm",
+            )
+            axs[2, 1].legend()
+        if shape_factor is not None:
+            shape_factor_m = u.Quantity(shape_factor).to_value(u.m)
+            shape_factor_text = (
+                f"X-line shape factor = {shape_factor_m:.4g} m"
+                if np.isfinite(shape_factor_m)
+                else "X-line shape factor unavailable"
+            )
+            axs[2, 1].text(
+                0.03,
+                0.97,
+                shape_factor_text,
+                transform=axs[2, 1].transAxes,
+                ha="left",
+                va="top",
+                color="black",
+                bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"},
+            )
+    else:
+        axs[2, 1].axis("off")
+
+    # Keep finite estimates visible while marking locations where no shot fit
+    # passed the full acceptance policy.
+    if analysis_ok is not None:
+        fit_accepted = np.asarray(analysis_ok, dtype=bool)
+        maps = (
+            (axs[0, 0], te.value),
+            (axs[0, 1], vp.value),
+            (axs[1, 0], vf.value),
+            (axs[1, 1], ies.value),
+            (axs[2, 0], iis.value),
+        )
+        if n_e is not None:
+            maps += ((axs[2, 1], n_e.value),)
+        for ax, values in maps:
+            values = np.asarray(values, dtype=float)
+            if fit_accepted.shape != values.shape:
+                continue
+            rejected = np.isfinite(values) & ~fit_accepted
+            if np.any(rejected):
+                ax.plot(
+                    x_mesh[rejected],
+                    y_mesh[rejected],
+                    "x",
+                    color="tab:orange",
+                    label="no accepted fits",
+                )
+                ax.legend()
+
+    if te_fit_r2 is not None and te_poor_fit_r2 is not None:
+        poor_te_fit = np.isfinite(te_fit_r2) & (te_fit_r2 < te_poor_fit_r2)
+        if np.any(poor_te_fit):
+            axs[0, 0].plot(
+                x_mesh[poor_te_fit],
+                y_mesh[poor_te_fit],
+                "rx",
+                ms=5,
+                mew=1.4,
+                label=f"Te fit R^2 < {te_poor_fit_r2:.2f}",
+            )
+            axs[0, 0].legend()
+
+    if vp_spike_mask is not None and np.any(vp_spike_mask):
+        axs[0, 1].plot(
+            x_mesh[vp_spike_mask],
+            y_mesh[vp_spike_mask],
+            "ko",
+            ms=3,
+            label="flagged Vp spikes",
+        )
+        axs[0, 1].legend()
+
+    summary_title = title if analysis_status is None else f"{title}\n{analysis_status}"
+    fig.suptitle(summary_title, fontsize=16)
+    return fig
+
+
+def render_xy_all_iv_curves_plot(x_coord, y_coord, iv_voltage_grid, iv_current_grid, max_curves=400):
+    """Plot a representative subset of interpolated I-V curves colored by y position."""
+    fig, ax = plt.subplots(figsize=(9, 6), constrained_layout=True)
+
+    cmap = plt.get_cmap("viridis")
+    y_min = np.nanmin(y_coord)
+    y_max = np.nanmax(y_coord)
+
+    flat_indices = np.arange(iv_voltage_grid.shape[0] * iv_voltage_grid.shape[1])
+    if flat_indices.size > max_curves:
+        flat_indices = np.linspace(0, flat_indices.size - 1, max_curves, dtype=int)
+
+    for flat_index in flat_indices:
+        iy, ix = np.unravel_index(flat_index, iv_voltage_grid.shape[:2])
+        voltage_curve = iv_voltage_grid[iy, ix]
+        current_curve = iv_current_grid[iy, ix]
+        good = np.isfinite(voltage_curve) & np.isfinite(current_curve)
+        if np.count_nonzero(good) < 2:
+            continue
+
+        frac = 0.5 if y_max == y_min else (y_coord[iy] - y_min) / (y_max - y_min)
+        ax.plot(
+            voltage_curve[good],
+            current_curve[good],
+            color=cmap(frac),
+            alpha=0.9,
+            lw=1.2,
+        )
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=y_min, vmax=y_max))
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label="Y (cm)")
+
+    ax.set_title("Representative Interpolated I-V Curves Across XY Plane")
+    ax.set_xlabel("Bias (V)")
+    ax.set_ylabel("Current (A)")
+    ax.grid(True)
+
+    return fig
+
+
+# %% Geometry-specific pipeline runners
+def run_xline_analysis():
+    """Run the configured x-line acquisition and analysis pipeline."""
+    # %%
+    # Read data
+
+    print(f"Expected Langmuir x-line shots: {n_expected_shots}")
+    print(f"shotnum_start = {shotnum_start}, shotnum_end = {shotnum_end}")
+
+    file = lapd.File(filename, silent=True)
+
+    print("Reading voltage data..")
+    vsweep_full, dt = read_channel_xline(
+        file_obj=file,
+        board=board,
+        channel=vsweep_channel,
+        shotnum_start=shotnum_start,
+        shotnum_end=shotnum_end,
+        nx=nx,
+        nshots=nshots,
+        nt_full=nt_full,
+        digitizer=digitizer,
+        adc=adc,
+        config_name=sis_config_name,
+        scale_factor=vsweep_attenuation,
+        negate=False,
+    )
+    print(f"Voltage data reshaped to (x, shots, time): {vsweep_full.shape}")
+
+    print("Reading current data..")
+    isweep_full, _ = read_channel_xline(
+        file_obj=file,
+        board=board,
+        channel=isweep_channel,
+        shotnum_start=shotnum_start,
+        shotnum_end=shotnum_end,
+        nx=nx,
+        nshots=nshots,
+        nt_full=nt_full,
+        digitizer=digitizer,
+        adc=adc,
+        config_name=sis_config_name,
+        scale_factor=isweep_attenuation / isweep_resistance,
+        negate=negate_Isweep_current,
+    )
+    print(f"Current data reshaped to (x, shots, time): {isweep_full.shape}")
+
+    print("Extracting sweep regions")
+    vsweep = vsweep_full[..., sweep_start_index:sweep_end_index + 1]
+    isweep = isweep_full[..., sweep_start_index:sweep_end_index + 1]
+
+    if subtract_dc:
+        if isweep_dc_offset_start_index is None or isweep_dc_offset_end_index is None:
+            raise ValueError(
+                "subtract_dc requires an independently measured plasma-off interval"
+            )
+        if not (
+            0
+            <= isweep_dc_offset_start_index
+            <= isweep_dc_offset_end_index
+            < nt_full
+        ):
+            raise ValueError("the electronics-offset interval is outside the trace")
+        if not (
+            isweep_dc_offset_end_index < sweep_start_index
+            or isweep_dc_offset_start_index > sweep_end_index
+        ):
+            raise ValueError("the electronics-offset interval must not overlap the I-V sweep")
+        print("Subtracting current DC offsets")
+        isweep_dc_offset_portion = isweep_full[..., isweep_dc_offset_start_index:isweep_dc_offset_end_index + 1]
+        isweep_dc_offsets = np.mean(isweep_dc_offset_portion, axis=-1)
+        isweep = isweep - isweep_dc_offsets[..., np.newaxis]
+
+    file.close()
+    print("Finished reading and reshaping data.")
+
+    # %%
+    # Optional time-domain products for visualization/export. The analysis itself
+    # uses unsmoothed samples and performs averaging in voltage bins.
+
+    time = np.arange(nt) * dt
+
+    vsweep_shot = vsweep * u.V
+    isweep_shot = isweep * u.A
+    vsweep_mean = np.mean(vsweep_shot, axis=1)
+    isweep_mean = np.mean(isweep_shot, axis=1)
+
+    isat = np.mean(isweep[..., isat_start_index:isat_end_index + 1], axis=-1)
+    isat_mean_values, isat_std_values, isat_count = shot_mean_and_std(isat)
+    isat_mean = isat_mean_values * u.A
+    isat_std = isat_std_values * u.A
+
+    print("Applying Savitzky-Golay filter along original sweep samples")
+    vsweep_shot_smoothed = savgol_filter(
+        vsweep_shot.value,
+        sg_smooth_bins,
+        sg_smooth_order,
+        axis=-1
+    ) * vsweep_shot.unit
+
+    isweep_shot_smoothed = savgol_filter(
+        isweep_shot.value,
+        sg_smooth_bins,
+        sg_smooth_order,
+        axis=-1
+    ) * isweep_shot.unit
+    vsweep_mean_smoothed = np.mean(vsweep_shot_smoothed, axis=1)
+    isweep_mean_smoothed = np.mean(isweep_shot_smoothed, axis=1)
+    print("Finished smoothing data.")
+
+    # %%
+    # Prepare output arrays
+
+    spatial_shape = (nx,)
+    trace_shape = spatial_shape + (nshots,)
+    n_traces = int(np.prod(trace_shape))
+
+    te_shot = np.full(trace_shape, np.nan)
+    vp_shot = np.full(trace_shape, np.nan)
+    vf_shot = np.full(trace_shape, np.nan)
+    ies_shot = np.full(trace_shape, np.nan)
+    iis_shot = np.full(trace_shape, np.nan)
+    n_e_shot = np.full(trace_shape, np.nan)
+    analysis_ok_shot = np.zeros(trace_shape, dtype=np.uint8)
+    analysis_rejection_counts = Counter()
+
+    te_fit_r2_shot = np.full(trace_shape, np.nan)
+    te_fit_rmse_shot = np.full(trace_shape, np.nan)
+    te_fit_npts_shot = np.full(trace_shape, np.nan)
+    te_fit_vstart_shot = np.full(trace_shape, np.nan)
+    te_fit_vstop_shot = np.full(trace_shape, np.nan)
+    te_fit_slope_shot = np.full(trace_shape, np.nan)
+    te_fit_intercept_shot = np.full(trace_shape, np.nan)
+    te_fit_i0_shot = np.full(trace_shape, np.nan)
+    te_fit_passed_r2_shot = np.zeros(trace_shape, dtype=np.uint8)
+    te_fit_candidate_count_shot = np.zeros(trace_shape, dtype=int)
+
+    iv_voltage_grid_shot = np.full(trace_shape + (iv_npts,), np.nan)
+    iv_current_grid_shot = np.full(trace_shape + (iv_npts,), np.nan)
+    iv_didv_grid_shot = np.full(trace_shape + (iv_npts,), np.nan)
+    iv_fit_mask_grid_shot = np.zeros(trace_shape + (iv_npts,), dtype=np.uint8)
+
+    # %%
+    # Robust Langmuir analysis on monotonic I(V) curves
+
+    analysis_tasks = []
+    for flat_index in range(n_traces):
+        idx = np.unravel_index(flat_index, trace_shape)
+        ix, ishot = idx
+        include_diagnostic_data = (
+            diagnostic_plot_every is not None
+            and diagnostic_plot_every > 0
+            and ishot == 0
+            and ix % diagnostic_plot_every == 0
+        )
+        analysis_tasks.append(
+            (
+                flat_index,
+                idx,
+                vsweep_shot.value[idx + (slice(None),)],
+                isweep_shot.value[idx + (slice(None),)],
+                include_diagnostic_data,
+                langmuir_analysis_config,
+            )
+        )
+
+    n_analysis_processes = choose_analysis_process_count(n_traces, analysis_processes)
+    use_parallel_analysis = parallel_analysis and n_analysis_processes > 1
+
+    if use_parallel_analysis and "fork" not in mp.get_all_start_methods():
+        print("Multiprocessing start method 'fork' is unavailable; falling back to serial analysis.")
+        use_parallel_analysis = False
+
+    analysis_processes_used = n_analysis_processes if use_parallel_analysis else 1
+
+    if use_parallel_analysis:
+        print(f"Processing {n_traces} Langmuir traces using {analysis_processes_used} worker processes...")
+        process_context = mp.get_context("fork")
+        with ProcessPoolExecutor(
+            max_workers=analysis_processes_used,
+            mp_context=process_context,
+        ) as executor:
+            futures = [executor.submit(analyze_trace_worker, task) for task in analysis_tasks]
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                result = future.result()
+                idx = result["idx"]
+                ix, ishot = idx
+                print(f"Finished trace {result['flat_index'] + 1}/{n_traces} at index {idx} ({completed}/{n_traces} complete)")
+
+                for warning in result["warnings"]:
+                    print(f"{warning} at index {idx}")
+
+                if not result["ok"]:
+                    reason = (
+                        result["warnings"][-1]
+                        if result["warnings"]
+                        else "unspecified analysis failure"
+                    )
+                    analysis_rejection_counts[reason] += 1
+
+                if result["iv_voltage_grid"] is None:
+                    continue
+
+                analysis_ok_shot[idx] = int(result["ok"])
+                # Keep every finite estimate for plotting and export.  The strict
+                # quality decision remains available separately in analysis_ok_shot.
+                te_shot[idx] = result["te_eV"]
+                vp_shot[idx] = result["vp_V"]
+                vf_shot[idx] = result["vf_V"]
+                ies_shot[idx] = result["ies_A"]
+                iis_shot[idx] = result["iis_A"]
+                n_e_shot[idx] = result.get("n_e_m3", np.nan)
+
+                te_fit_r2_shot[idx] = result["te_fit_r2"]
+                te_fit_rmse_shot[idx] = result["te_fit_rmse"]
+                if result["te_fit_candidate_count"]:
+                    te_fit_npts_shot[idx] = result["te_fit_npts"]
+                te_fit_vstart_shot[idx] = result["te_fit_vstart"]
+                te_fit_vstop_shot[idx] = result["te_fit_vstop"]
+                te_fit_slope_shot[idx] = result["te_fit_slope"]
+                te_fit_intercept_shot[idx] = result["te_fit_intercept"]
+                te_fit_i0_shot[idx] = result["te_fit_i0"]
+                te_fit_passed_r2_shot[idx] = int(result["te_fit_passed_r2"])
+                te_fit_candidate_count_shot[idx] = result["te_fit_candidate_count"]
+
+                iv_voltage_grid_shot[idx + (slice(None),)] = result["iv_voltage_grid"]
+                iv_current_grid_shot[idx + (slice(None),)] = result["iv_current_grid"]
+                if result["iv_didv_grid"] is not None:
+                    iv_didv_grid_shot[idx + (slice(None),)] = result["iv_didv_grid"]
+                iv_fit_mask_grid_shot[idx + (slice(None),)] = result["iv_fit_mask"]
+
+                diagnostic_data = result["diagnostic_data"]
+                if diagnostic_data is not None:
+                    fig = render_analysis_iv_diagnostic_plot(
+                        result,
+                        f"Diagnostic IV analysis at x index {ix}, shot {ishot} (x = {x[ix]:.2f} cm)",
+                    )
+                    save_diagnostic_figure(
+                        fig,
+                        diagnostic_plot_output_dir,
+                        f"{Path(filename).stem}_iv_diagnostic_ix{ix:03d}_shot{ishot:03d}_x_{x[ix]:+.2f}cm",
+                    )
+                    plt.show(block=False)
+                    plt.pause(example_pause_seconds)
+                    plt.close(fig)
+    else:
+        print("Processing Langmuir traces serially...")
+        for task in analysis_tasks:
+            flat_index = task[0]
+            idx = task[1]
+            ix, ishot = idx
+            print(f"Processing trace {flat_index + 1}/{n_traces} at index {idx}...")
+            result = analyze_trace_worker(task)
+
+            for warning in result["warnings"]:
+                print(f"{warning} at index {idx}")
+
+            if not result["ok"]:
+                reason = (
+                    result["warnings"][-1]
+                    if result["warnings"]
+                    else "unspecified analysis failure"
+                )
+                analysis_rejection_counts[reason] += 1
+
+            if result["iv_voltage_grid"] is None:
+                continue
+
+            analysis_ok_shot[idx] = int(result["ok"])
+            # Keep every finite estimate for plotting and export.  The strict
+            # quality decision remains available separately in analysis_ok_shot.
+            te_shot[idx] = result["te_eV"]
+            vp_shot[idx] = result["vp_V"]
+            vf_shot[idx] = result["vf_V"]
+            ies_shot[idx] = result["ies_A"]
+            iis_shot[idx] = result["iis_A"]
+            n_e_shot[idx] = result.get("n_e_m3", np.nan)
+
+            te_fit_r2_shot[idx] = result["te_fit_r2"]
+            te_fit_rmse_shot[idx] = result["te_fit_rmse"]
+            if result["te_fit_candidate_count"]:
+                te_fit_npts_shot[idx] = result["te_fit_npts"]
+            te_fit_vstart_shot[idx] = result["te_fit_vstart"]
+            te_fit_vstop_shot[idx] = result["te_fit_vstop"]
+            te_fit_slope_shot[idx] = result["te_fit_slope"]
+            te_fit_intercept_shot[idx] = result["te_fit_intercept"]
+            te_fit_i0_shot[idx] = result["te_fit_i0"]
+            te_fit_passed_r2_shot[idx] = int(result["te_fit_passed_r2"])
+            te_fit_candidate_count_shot[idx] = result["te_fit_candidate_count"]
+
+            iv_voltage_grid_shot[idx + (slice(None),)] = result["iv_voltage_grid"]
+            iv_current_grid_shot[idx + (slice(None),)] = result["iv_current_grid"]
+            if result["iv_didv_grid"] is not None:
+                iv_didv_grid_shot[idx + (slice(None),)] = result["iv_didv_grid"]
+            iv_fit_mask_grid_shot[idx + (slice(None),)] = result["iv_fit_mask"]
+
+            diagnostic_data = result["diagnostic_data"]
+            if diagnostic_data is not None:
+                fig = render_analysis_iv_diagnostic_plot(
+                    result,
+                    f"Diagnostic IV analysis at x index {ix}, shot {ishot} (x = {x[ix]:.2f} cm)",
+                )
+                save_diagnostic_figure(
+                    fig,
+                    diagnostic_plot_output_dir,
+                    f"{Path(filename).stem}_iv_diagnostic_ix{ix:03d}_shot{ishot:03d}_x_{x[ix]:+.2f}cm",
+                )
+                plt.show(block=False)
+                plt.pause(example_pause_seconds)
+                plt.close(fig)
+
+    # Compatibility export: this mask identifies locations with a reported Te fit.
+    # Consult analysis_ok_shot to distinguish quality-accepted and rejected fits.
+    statistics_fit_mask = np.isfinite(te_shot)
+    te_values, te_std_values, fit_count = shot_mean_and_std(te_shot)
+    vp_values, vp_std_values, _ = shot_mean_and_std(vp_shot)
+    vf_values, vf_std_values, _ = shot_mean_and_std(vf_shot)
+    ies_values, ies_std_values, _ = shot_mean_and_std(ies_shot)
+    iis_values, iis_std_values, _ = shot_mean_and_std(iis_shot)
+    n_e_values, n_e_std_values, _ = shot_mean_and_std(n_e_shot)
+
+    te = te_values * u.eV
+    vp = vp_values * u.V
+    vf = vf_values * u.V
+    ies = ies_values * u.A
+    iis = iis_values * u.A
+    n_e = n_e_values * u.m**-3
+    te_std = te_std_values * u.eV
+    vp_std = vp_std_values * u.V
+    vf_std = vf_std_values * u.V
+    ies_std = ies_std_values * u.A
+    iis_std = iis_std_values * u.A
+    n_e_std = n_e_std_values * u.m**-3
+
+    te_fit_r2, te_fit_r2_std, te_fit_count = shot_mean_and_std(te_fit_r2_shot)
+    te_fit_rmse, te_fit_rmse_std, _ = shot_mean_and_std(te_fit_rmse_shot)
+    te_fit_npts, te_fit_npts_std, _ = shot_mean_and_std(te_fit_npts_shot)
+    te_fit_vstart, te_fit_vstart_std, _ = shot_mean_and_std(te_fit_vstart_shot)
+    te_fit_vstop, te_fit_vstop_std, _ = shot_mean_and_std(te_fit_vstop_shot)
+    te_fit_slope, te_fit_slope_std, _ = shot_mean_and_std(te_fit_slope_shot)
+    te_fit_intercept, te_fit_intercept_std, _ = shot_mean_and_std(te_fit_intercept_shot)
+    te_fit_i0, te_fit_i0_std, _ = shot_mean_and_std(te_fit_i0_shot)
+    te_fit_passed_r2 = np.any(te_fit_passed_r2_shot.astype(bool), axis=-1).astype(np.uint8)
+    te_fit_candidate_count = np.sum(te_fit_candidate_count_shot, axis=-1)
+    analysis_valid_count = np.sum(analysis_ok_shot, axis=-1)
+    analysis_ok = (analysis_valid_count > 0).astype(np.uint8)
+    accepted_trace_count = int(np.sum(analysis_ok_shot))
+    reported_trace_count = int(np.count_nonzero(np.isfinite(te_shot)))
+    analysis_status = (
+        f"Reported {reported_trace_count}/{n_traces} finite fits; "
+        f"accepted {accepted_trace_count}/{n_traces} fits"
+    )
+    if analysis_rejection_counts:
+        common_reason, common_count = analysis_rejection_counts.most_common(1)[0]
+        analysis_status += f"; top rejection ({common_count}): {common_reason}"
+    print(f"Analysis summary: {analysis_status}")
+
+    # Backward-compatible representative I-V products are visualization-only shot
+    # means.  They are not used for physics, because individual sweep endpoints
+    # need not coincide.  Full per-shot grids are exported separately below.
+    iv_voltage_grid = np.nanmean(iv_voltage_grid_shot, axis=-2)
+    iv_current_grid = np.nanmean(iv_current_grid_shot, axis=-2)
+    iv_didv_grid = np.nanmean(iv_didv_grid_shot, axis=-2)
+    iv_fit_mask_grid = np.any(iv_fit_mask_grid_shot.astype(bool), axis=-2).astype(np.uint8)
+
+    print("Finished per-shot Langmuir probe analysis and spatial statistics")
+
+    # %%
+    # Optional post-processing along x
+
+    post = apply_optional_x_postprocessing(
+        x_coord=x,
+        te=te.value,
+        vp=vp.value,
+        vf=vf.value,
+        ies=ies.value,
+        iis=iis.value,
+        n_e=n_e.value,
+        enable_vp_spike_rejection=enable_vp_spike_rejection,
+        vp_spike_half_window=vp_spike_half_window,
+        vp_spike_threshold_V=vp_spike_threshold_V,
+        vp_replace_flagged_with_local_interp=vp_replace_flagged_with_local_interp,
+        enable_neighbor_smoothing=enable_neighbor_smoothing,
+        neighbor_smooth_half_window=neighbor_smooth_half_window,
+        neighbor_smooth_sigma=neighbor_smooth_sigma,
+    )
+
+    te_raw = post["te_raw"] * u.eV
+    vp_raw = post["vp_raw"] * u.V
+    vf_raw = post["vf_raw"] * u.V
+    ies_raw = post["ies_raw"] * u.A if "ies_raw" in post else None
+    iis_raw = post["iis_raw"] * u.A if "iis_raw" in post else None
+    n_e_raw = post["n_e_raw"] * u.m**-3 if "n_e_raw" in post else None
+
+    te_processed = post["te_processed"] * u.eV
+    vp_processed = post["vp_processed"] * u.V
+    vf_processed = post["vf_processed"] * u.V
+    ies_processed = post["ies_processed"] * u.A if "ies_processed" in post else None
+    iis_processed = post["iis_processed"] * u.A if "iis_processed" in post else None
+    n_e_processed = post["n_e_processed"] * u.m**-3 if "n_e_processed" in post else None
+
+    vp_spike_mask = post["vp_spike_mask"]
+    # Plots choose processed or raw results
+    te_plot = te_processed if enable_neighbor_smoothing else te_raw
+    vp_plot = vp_processed if (enable_neighbor_smoothing or enable_vp_spike_rejection) else vp_raw
+    vf_plot = vf_processed if enable_neighbor_smoothing else vf_raw
+    ies_plot = ies_processed if (ies_processed is not None and enable_neighbor_smoothing) else ies_raw
+    iis_plot = iis_processed if (iis_processed is not None and enable_neighbor_smoothing) else iis_raw
+    n_e_plot = n_e_processed if (n_e_processed is not None and enable_neighbor_smoothing) else n_e_raw
+
+    # Use the same raw or post-processed density profile displayed in the summary.
+    shape_factor = None
+    electron_density_normalized = None
+    if calculate_shape_factor:
+        shape_factor = electron_density_profile_shape_factor(x, n_e_plot)
+        (
+            electron_density_normalized,
+            n_e_plot,
+            density_scale,
+        ) = scale_density_profile_to_interferometer(
+            n_e_plot,
+            interferometer_scaling,
+            shape_factor,
+        )
+        if np.isfinite(density_scale):
+            # Preserve consistency between the calibrated density and its
+            # shot-to-shot uncertainty in the summary plot.
+            n_e_std = n_e_std * density_scale
+            print(
+                "Scaled normalized electron density to the interferometer "
+                f"line-integrated density; peak n_e = {np.nanmax(n_e_plot):.4g}."
+            )
+        else:
+            print(
+                "Warning: electron density could not be normalized and scaled "
+                "because its maximum, shape factor, or interferometer scaling "
+                "is not finite and positive."
+            )
+            n_e_std = np.full(n_e_std.shape, np.nan) * u.m**-3
+    # %%
+    # Plot results
+
+    plot_png_bytes = None
+    all_iv_plot_png_bytes = None
+    summary_plot_path = None
+    all_iv_plot_path = None
+
+    if plot_results:
+        fig = render_xline_summary_plot(
+            x,
+            te_plot,
+            vp_plot,
+            vf_plot,
+            ies_plot,
+            iis_plot,
+            n_e_plot,
+            te_std=te_std,
+            vp_std=vp_std,
+            vf_std=vf_std,
+            ies_std=ies_std,
+            iis_std=iis_std,
+            n_e_std=n_e_std,
+            plot_stds=plot_summary_stds and nshots > 1,
+            vp_spike_mask=vp_spike_mask,
+            vp_raw=vp_raw,
+            te_fit_r2=te_fit_r2,
+            te_poor_fit_r2=te_min_r2,
+            analysis_ok=analysis_ok,
+            analysis_status=analysis_status,
+            shape_factor=shape_factor,
+        )
+
+        plot_buffer = io.BytesIO()
+        fig.savefig(plot_buffer, format="png", dpi=600)
+        plot_png_bytes = plot_buffer.getvalue()
+        plot_buffer.close()
+
+        summary_plot_path = save_diagnostic_figure(
+            fig,
+            diagnostic_plot_output_dir,
+            f"{Path(filename).stem}_langmuir_xline_summary",
+        )
+        plt.show()
+
+    if make_all_iv_diagnostic_plot:
+        fig_iv = render_xline_all_iv_curves_plot(x, iv_voltage_grid, iv_current_grid)
+
+        iv_plot_buffer = io.BytesIO()
+        fig_iv.savefig(iv_plot_buffer, format="png", dpi=600)
+        all_iv_plot_png_bytes = iv_plot_buffer.getvalue()
+        iv_plot_buffer.close()
+
+        all_iv_plot_path = save_diagnostic_figure(
+            fig_iv,
+            diagnostic_plot_output_dir,
+            f"{Path(filename).stem}_all_interpolated_iv_curves",
+        )
+        plt.show()
+
+    # %%
+    # Save processed Langmuir x-line results
+
+    output_h5_path = Path(filename)
+    output_npz_path = output_h5_path.with_name(f"{output_h5_path.stem}_langmuir_xline.npz")
+
+    if save_results:
+        with open_h5_for_update(output_h5_path) as h5f:
+            if "langmuir_xline" in h5f:
+                del h5f["langmuir_xline"]
+
+            grp = h5f.create_group("langmuir_xline")
+
+            grp.create_dataset("x_cm", data=x)
+            grp.create_dataset("time_s", data=time)
+
+            # Primary exported profiles reflect current optional processing choices
+            grp.create_dataset("te_eV", data=te_plot.value)
+            grp.create_dataset("vp_V", data=vp_plot.value)
+            grp.create_dataset("vf_V", data=vf_plot.value)
+            grp.create_dataset("ies_A", data=ies_plot.value)
+            grp.create_dataset("iis_A", data=iis_plot.value)
+            # Electron density map (m^-3) if available
+            try:
+                if n_e_plot is not None:
+                    grp.create_dataset("n_e_m3", data=getattr(n_e_plot, "value", n_e_plot))
+            except Exception:
+                pass
+            if calculate_shape_factor and electron_density_normalized is not None:
+                grp.create_dataset(
+                    "n_e_normalized",
+                    data=electron_density_normalized,
+                )
+            grp.create_dataset("isat_A", data=isat_mean.value)
+
+            # Per-shot fitted quantities and their per-location sample deviations
+            grp.create_dataset("te_shot_eV", data=te_shot)
+            grp.create_dataset("vp_shot_V", data=vp_shot)
+            grp.create_dataset("vf_shot_V", data=vf_shot)
+            grp.create_dataset("ies_shot_A", data=ies_shot)
+            grp.create_dataset("iis_shot_A", data=iis_shot)
+            grp.create_dataset("n_e_shot_m3", data=n_e_shot)
+            grp.create_dataset("isat_shot_A", data=isat)
+            grp.create_dataset("te_std_eV", data=te_std.value)
+            grp.create_dataset("vp_std_V", data=vp_std.value)
+            grp.create_dataset("vf_std_V", data=vf_std.value)
+            grp.create_dataset("ies_std_A", data=ies_std.value)
+            grp.create_dataset("iis_std_A", data=iis_std.value)
+            grp.create_dataset("n_e_std_m3", data=n_e_std.value)
+            grp.create_dataset("isat_std_A", data=isat_std.value)
+            grp.create_dataset("fit_count", data=fit_count)
+            grp.create_dataset("analysis_ok", data=analysis_ok)
+            grp.create_dataset("analysis_valid_count", data=analysis_valid_count)
+            grp.create_dataset("analysis_ok_shot", data=analysis_ok_shot)
+            grp.create_dataset("statistics_fit_mask", data=statistics_fit_mask.astype(np.uint8))
+
+            # Raw extracted profiles
+            grp.create_dataset("te_raw_eV", data=te_raw.value)
+            grp.create_dataset("vp_raw_V", data=vp_raw.value)
+            grp.create_dataset("vf_raw_V", data=vf_raw.value)
+            grp.create_dataset("ies_raw_A", data=ies_raw.value if ies_raw is not None else np.full(spatial_shape, np.nan))
+            grp.create_dataset("iis_raw_A", data=iis_raw.value if iis_raw is not None else np.full(spatial_shape, np.nan))
+            grp.create_dataset("n_e_raw_m3", data=n_e_raw.value if n_e_raw is not None else np.full(spatial_shape, np.nan))
+
+            # Post-processed profiles
+            grp.create_dataset("te_processed_eV", data=te_processed.value)
+            grp.create_dataset("vp_processed_V", data=vp_processed.value)
+            grp.create_dataset("vf_processed_V", data=vf_processed.value)
+            grp.create_dataset("ies_processed_A", data=ies_processed.value if ies_processed is not None else np.full(spatial_shape, np.nan))
+            grp.create_dataset("iis_processed_A", data=iis_processed.value if iis_processed is not None else np.full(spatial_shape, np.nan))
+            grp.create_dataset("n_e_processed_m3", data=n_e_processed.value if n_e_processed is not None else np.full(spatial_shape, np.nan))
+
+            # Spike diagnostics
+            grp.create_dataset("vp_spike_mask", data=vp_spike_mask.astype(np.uint8))
+
+            # Shot-averaged original sweep curves
+            grp.create_dataset("vsweep_mean_V", data=vsweep_mean.value)
+            grp.create_dataset("isweep_mean_A", data=isweep_mean.value)
+            grp.create_dataset("vsweep_mean_smoothed_V", data=vsweep_mean_smoothed.value)
+            grp.create_dataset("isweep_mean_smoothed_A", data=isweep_mean_smoothed.value)
+            grp.create_dataset("vsweep_shot_smoothed_V", data=vsweep_shot_smoothed.value)
+            grp.create_dataset("isweep_shot_smoothed_A", data=isweep_shot_smoothed.value)
+
+            # Interpolated monotonic IV analysis products
+            grp.create_dataset("iv_voltage_grid_V", data=iv_voltage_grid)
+            grp.create_dataset("iv_current_grid_A", data=iv_current_grid)
+            grp.create_dataset("iv_didv_grid_A_per_V", data=iv_didv_grid)
+            grp.create_dataset("iv_te_fit_mask", data=iv_fit_mask_grid)
+            grp.create_dataset("iv_voltage_grid_shot_V", data=iv_voltage_grid_shot)
+            grp.create_dataset("iv_current_grid_shot_A", data=iv_current_grid_shot)
+            grp.create_dataset("iv_didv_grid_shot_A_per_V", data=iv_didv_grid_shot)
+            grp.create_dataset("iv_te_fit_mask_shot", data=iv_fit_mask_grid_shot)
+
+            # Fit diagnostics
+            grp.create_dataset("te_fit_r2", data=te_fit_r2)
+            grp.create_dataset("te_fit_rmse_logI", data=te_fit_rmse)
+            grp.create_dataset("te_fit_npts", data=te_fit_npts)
+            grp.create_dataset("te_fit_vstart_V", data=te_fit_vstart)
+            grp.create_dataset("te_fit_vstop_V", data=te_fit_vstop)
+            grp.create_dataset("te_fit_slope_logI_per_V", data=te_fit_slope)
+            grp.create_dataset("te_fit_intercept_logI", data=te_fit_intercept)
+            grp.create_dataset("te_fit_i0_A", data=te_fit_i0)
+            grp.create_dataset("te_fit_passed_r2", data=te_fit_passed_r2)
+            grp.create_dataset("te_fit_candidate_count", data=te_fit_candidate_count)
+            grp.create_dataset("te_fit_r2_std", data=te_fit_r2_std)
+            grp.create_dataset("te_fit_rmse_logI_std", data=te_fit_rmse_std)
+            grp.create_dataset("te_fit_npts_std", data=te_fit_npts_std)
+            grp.create_dataset("te_fit_vstart_std_V", data=te_fit_vstart_std)
+            grp.create_dataset("te_fit_vstop_std_V", data=te_fit_vstop_std)
+            grp.create_dataset("te_fit_slope_std_logI_per_V", data=te_fit_slope_std)
+            grp.create_dataset("te_fit_intercept_std_logI", data=te_fit_intercept_std)
+            grp.create_dataset("te_fit_i0_std_A", data=te_fit_i0_std)
+            grp.create_dataset("te_fit_count", data=te_fit_count)
+            grp.create_dataset("te_fit_r2_shot", data=te_fit_r2_shot)
+            grp.create_dataset("te_fit_rmse_logI_shot", data=te_fit_rmse_shot)
+            grp.create_dataset("te_fit_npts_shot", data=te_fit_npts_shot)
+            grp.create_dataset("te_fit_vstart_shot_V", data=te_fit_vstart_shot)
+            grp.create_dataset("te_fit_vstop_shot_V", data=te_fit_vstop_shot)
+            grp.create_dataset("te_fit_slope_shot_logI_per_V", data=te_fit_slope_shot)
+            grp.create_dataset("te_fit_intercept_shot_logI", data=te_fit_intercept_shot)
+            grp.create_dataset("te_fit_i0_shot_A", data=te_fit_i0_shot)
+            grp.create_dataset("te_fit_passed_r2_shot", data=te_fit_passed_r2_shot)
+            grp.create_dataset("te_fit_candidate_count_shot", data=te_fit_candidate_count_shot)
+
+            if subtract_dc:
+                grp.create_dataset("isweep_dc_offsets_A", data=isweep_dc_offsets)
+            grp.create_dataset("xline_shape_info", data=np.array([nx, nshots, nt_full, nt, iv_npts], dtype=np.int64))
+            grp.create_dataset("trace_spatial_shape", data=np.array(spatial_shape, dtype=np.int64))
+
+            if plot_results and plot_png_bytes is None:
+                fig = render_xline_summary_plot(
+                    x,
+                    te_plot,
+                    vp_plot,
+                    vf_plot,
+                    ies_plot,
+                    iis_plot,
+                    n_e_plot,
+                    te_std=te_std,
+                    vp_std=vp_std,
+                    vf_std=vf_std,
+                    ies_std=ies_std,
+                    iis_std=iis_std,
+                    n_e_std=n_e_std,
+                    plot_stds=plot_summary_stds and nshots > 1,
+                    vp_spike_mask=vp_spike_mask,
+                    vp_raw=vp_raw,
+                    te_fit_r2=te_fit_r2,
+                    te_poor_fit_r2=te_min_r2,
+                    analysis_ok=analysis_ok,
+                    analysis_status=analysis_status,
+                    shape_factor=shape_factor,
+                )
+                plot_buffer = io.BytesIO()
+                fig.savefig(plot_buffer, format="png", dpi=600)
+                plot_png_bytes = plot_buffer.getvalue()
+                plot_buffer.close()
+                plt.close(fig)
+
+            if plot_png_bytes is not None:
+                grp.create_dataset(
+                    "summary_plot_png",
+                    data=np.frombuffer(plot_png_bytes, dtype=np.uint8)
+                )
+                grp["summary_plot_png"].attrs["mime_type"] = "image/png"
+                grp["summary_plot_png"].attrs["description"] = "Rendered Langmuir x-line summary plot."
+
+            if all_iv_plot_png_bytes is not None:
+                grp.create_dataset(
+                    "all_iv_curves_plot_png",
+                    data=np.frombuffer(all_iv_plot_png_bytes, dtype=np.uint8)
+                )
+                grp["all_iv_curves_plot_png"].attrs["mime_type"] = "image/png"
+                grp["all_iv_curves_plot_png"].attrs["description"] = (
+                    "Diagnostic plot of all interpolated I-V curves colored by x position."
+                )
+
+            grp.attrs["source_file"] = str(filename)
+            grp.attrs["geometry"] = "x_line"
+            grp.attrs["fixed_y_cm"] = 0.0
+
+            grp.attrs["nx"] = nx
+            grp.attrs["n_traces"] = n_traces
+            grp.attrs["trace_spatial_ndim"] = len(spatial_shape)
+            grp.attrs["nshots"] = nshots
+            grp.attrs["nt_full"] = nt_full
+            grp.attrs["nt_sweep"] = nt
+            grp.attrs["dt_s"] = dt
+
+            grp.attrs["digitizer"] = digitizer
+            grp.attrs["adc"] = adc
+            grp.attrs["config_name"] = sis_config_name
+            grp.attrs["board"] = board
+            grp.attrs["vsweep_channel"] = vsweep_channel
+            grp.attrs["isweep_channel"] = isweep_channel
+            grp.attrs["vsweep_attenuation"] = vsweep_attenuation
+            grp.attrs["isweep_attenuation"] = isweep_attenuation
+            grp.attrs["isweep_resistance_ohm"] = isweep_resistance
+
+            # Record probe geometry used for density calculation if available
+            try:
+                grp.attrs["probe_area_m2"] = float(probe_area.to(u.m**2).value)
+            except Exception:
+                pass
+
+            grp.attrs["sweep_start_index"] = sweep_start_index
+            grp.attrs["sweep_end_index"] = sweep_end_index
+            grp.attrs["isat_start_index"] = isat_start_index
+            grp.attrs["isat_end_index"] = isat_end_index
+
+            if subtract_dc:
+                grp.attrs["dc_offset_start_index"] = isweep_dc_offset_start_index
+                grp.attrs["dc_offset_end_index"] = isweep_dc_offset_end_index
+
+            grp.attrs["sg_smooth_bins"] = sg_smooth_bins
+            grp.attrs["sg_smooth_order"] = sg_smooth_order
+            grp.attrs["iv_npts"] = iv_npts
+            grp.attrs["voltage_bin_width_V"] = voltage_bin_width
+            grp.attrs["vp_smoothing"] = "none" if vp_smoothing is None else str(vp_smoothing)
+            grp.attrs["vp_smoothing_width_V"] = vp_smoothing_width_V
+            grp.attrs["vp_savgol_order"] = vp_savgol_order
+            grp.attrs["parallel_analysis"] = int(parallel_analysis)
+            grp.attrs["analysis_processes_requested"] = (
+                -1 if analysis_processes is None else int(analysis_processes)
+            )
+            grp.attrs["analysis_processes_used"] = analysis_processes_used
+            grp.attrs["analysis_start_method"] = "fork" if use_parallel_analysis else "serial"
+
+            grp.attrs["te_min_points"] = te_min_points
+            grp.attrs["te_margin_from_vp_V"] = te_margin_from_vp
+            grp.attrs["te_current_floor_frac"] = te_current_floor_frac
+            grp.attrs["te_subtract_i0"] = int(te_subtract_i0)
+            grp.attrs["te_min_eV"] = te_min_eV
+            grp.attrs["te_max_eV"] = te_max_eV
+            grp.attrs["te_min_r2"] = te_min_r2
+            grp.attrs["ion_min_snr"] = ion_min_snr
+            grp.attrs["analysis_model"] = (
+                "single-temperature semilog fit; median low-bias ion and high-bias "
+                "electron-saturation region estimates"
+            )
+            grp.attrs["te_fit_i0_definition"] = "median low-bias ion-region current"
+            grp.attrs["iv_npts_role"] = "fixed-size diagnostics only"
+            grp.attrs["current_zero_calibrated"] = int(current_zero_calibrated)
+            grp.attrs["negate_Isweep_current"] = int(negate_Isweep_current)
+            grp.attrs["calculate_shape_factor"] = int(calculate_shape_factor)
+            grp.attrs["shape_factor_m"] = (
+                np.nan if shape_factor is None else shape_factor.to_value(u.m)
+            )
+            grp.attrs["interferometer_line_integrated_density_m2"] = (
+                interferometer_scaling.to_value(u.m**-2)
+            )
+            grp.attrs["enforce_ideal_model_checks"] = int(enforce_ideal_model_checks)
+            grp.attrs["subtract_dc"] = int(subtract_dc)
+            grp.attrs["shot_standard_deviation_ddof"] = 1
+            grp.attrs["per_shot_axis_order"] = "x,shot"
+            grp.attrs["shot_statistics_stage"] = "individual fits before spatial post-processing"
+            grp.attrs["profile_value_policy"] = (
+                "finite estimates retained; analysis_ok records fit acceptance"
+            )
+
+            grp.attrs["enable_vp_spike_rejection"] = int(enable_vp_spike_rejection)
+            grp.attrs["vp_spike_half_window"] = vp_spike_half_window
+            grp.attrs["vp_spike_threshold_V"] = vp_spike_threshold_V
+            grp.attrs["vp_replace_flagged_with_local_interp"] = int(vp_replace_flagged_with_local_interp)
+
+            grp.attrs["enable_neighbor_smoothing"] = int(enable_neighbor_smoothing)
+            grp.attrs["neighbor_smooth_half_window"] = neighbor_smooth_half_window
+            grp.attrs["neighbor_smooth_sigma"] = neighbor_smooth_sigma
+
+            grp.attrs["diagnostic_plot_every"] = diagnostic_plot_every
+            grp.attrs["diagnostic_plot_output_dir"] = str(diagnostic_plot_output_dir)
+            if summary_plot_path is not None:
+                grp.attrs["summary_plot_path"] = str(summary_plot_path)
+            if all_iv_plot_path is not None:
+                grp.attrs["all_iv_plot_path"] = str(all_iv_plot_path)
+
+            grp.attrs["make_all_iv_diagnostic_plot"] = int(make_all_iv_diagnostic_plot)
+            grp.attrs["data_offset_shots"] = data_offset
+
+        xline_y = np.zeros_like(x)
+        xline_npz_data = {
+            "source_file": np.array(str(filename)),
+            "geometry": np.array("x_line"),
+            "fixed_y_cm": np.array(0.0),
+            "x_cm": x,
+            "y_cm": xline_y,
+            "X_cm": x,
+            "Y_cm": xline_y,
+            "time_s": time,
+            "te_eV": te_plot.value,
+            "vp_V": vp_plot.value,
+            "vf_V": vf_plot.value,
+            "ies_A": ies_plot.value,
+            "iis_A": iis_plot.value,
+            "isat_A": isat_mean.value,
+            "te_shot_eV": te_shot,
+            "vp_shot_V": vp_shot,
+            "vf_shot_V": vf_shot,
+            "ies_shot_A": ies_shot,
+            "iis_shot_A": iis_shot,
+            "n_e_shot_m3": n_e_shot,
+            "isat_shot_A": isat,
+            "te_std_eV": te_std.value,
+            "vp_std_V": vp_std.value,
+            "vf_std_V": vf_std.value,
+            "ies_std_A": ies_std.value,
+            "iis_std_A": iis_std.value,
+            "n_e_std_m3": n_e_std.value,
+            "isat_std_A": isat_std.value,
+            "fit_count": fit_count,
+            "analysis_ok": analysis_ok,
+            "analysis_valid_count": analysis_valid_count,
+            "analysis_ok_shot": analysis_ok_shot,
+            "statistics_fit_mask": statistics_fit_mask.astype(np.uint8),
+            "n_e_m3": (n_e_plot.value if hasattr(n_e_plot, "value") else n_e_plot) if n_e_plot is not None else np.full_like(x, np.nan),
+            "n_e_normalized": (
+                electron_density_normalized
+                if electron_density_normalized is not None
+                else np.full_like(x, np.nan, dtype=float)
+            ),
+            "te_raw_eV": te_raw.value,
+            "vp_raw_V": vp_raw.value,
+            "vf_raw_V": vf_raw.value,
+            "ies_raw_A": ies_raw.value if ies_raw is not None else np.full(spatial_shape, np.nan),
+            "iis_raw_A": iis_raw.value if iis_raw is not None else np.full(spatial_shape, np.nan),
+            "n_e_raw_m3": n_e_raw.value if n_e_raw is not None else np.full(spatial_shape, np.nan),
+            "te_processed_eV": te_processed.value,
+            "vp_processed_V": vp_processed.value,
+            "vf_processed_V": vf_processed.value,
+            "ies_processed_A": ies_processed.value if ies_processed is not None else np.full(spatial_shape, np.nan),
+            "iis_processed_A": iis_processed.value if iis_processed is not None else np.full(spatial_shape, np.nan),
+            "n_e_processed_m3": n_e_processed.value if n_e_processed is not None else np.full(spatial_shape, np.nan),
+            "vp_spike_mask": vp_spike_mask.astype(np.uint8),
+            "vsweep_mean_V": vsweep_mean.value,
+            "isweep_mean_A": isweep_mean.value,
+            "vsweep_mean_smoothed_V": vsweep_mean_smoothed.value,
+            "isweep_mean_smoothed_A": isweep_mean_smoothed.value,
+            "vsweep_shot_smoothed_V": vsweep_shot_smoothed.value,
+            "isweep_shot_smoothed_A": isweep_shot_smoothed.value,
+            "iv_voltage_grid_V": iv_voltage_grid,
+            "iv_current_grid_A": iv_current_grid,
+            "iv_didv_grid_A_per_V": iv_didv_grid,
+            "iv_te_fit_mask": iv_fit_mask_grid,
+            "iv_voltage_grid_shot_V": iv_voltage_grid_shot,
+            "iv_current_grid_shot_A": iv_current_grid_shot,
+            "iv_didv_grid_shot_A_per_V": iv_didv_grid_shot,
+            "iv_te_fit_mask_shot": iv_fit_mask_grid_shot,
+            "te_fit_r2": te_fit_r2,
+            "te_fit_rmse_logI": te_fit_rmse,
+            "te_fit_npts": te_fit_npts,
+            "te_fit_vstart_V": te_fit_vstart,
+            "te_fit_vstop_V": te_fit_vstop,
+            "te_fit_slope_logI_per_V": te_fit_slope,
+            "te_fit_intercept_logI": te_fit_intercept,
+            "te_fit_i0_A": te_fit_i0,
+            "te_subtract_i0": np.array(int(te_subtract_i0)),
+            "te_fit_passed_r2": te_fit_passed_r2,
+            "te_fit_candidate_count": te_fit_candidate_count,
+            "te_fit_r2_std": te_fit_r2_std,
+            "te_fit_rmse_logI_std": te_fit_rmse_std,
+            "te_fit_npts_std": te_fit_npts_std,
+            "te_fit_vstart_std_V": te_fit_vstart_std,
+            "te_fit_vstop_std_V": te_fit_vstop_std,
+            "te_fit_slope_std_logI_per_V": te_fit_slope_std,
+            "te_fit_intercept_std_logI": te_fit_intercept_std,
+            "te_fit_i0_std_A": te_fit_i0_std,
+            "te_fit_count": te_fit_count,
+            "te_fit_r2_shot": te_fit_r2_shot,
+            "te_fit_rmse_logI_shot": te_fit_rmse_shot,
+            "te_fit_npts_shot": te_fit_npts_shot,
+            "te_fit_vstart_shot_V": te_fit_vstart_shot,
+            "te_fit_vstop_shot_V": te_fit_vstop_shot,
+            "te_fit_slope_shot_logI_per_V": te_fit_slope_shot,
+            "te_fit_intercept_shot_logI": te_fit_intercept_shot,
+            "te_fit_i0_shot_A": te_fit_i0_shot,
+            "te_fit_passed_r2_shot": te_fit_passed_r2_shot,
+            "te_fit_candidate_count_shot": te_fit_candidate_count_shot,
+            "shot_standard_deviation_ddof": np.array(1),
+            "per_shot_axis_order": np.array("x,shot"),
+            "shot_statistics_stage": np.array("individual fits before spatial post-processing"),
+            "profile_value_policy": np.array(
+                "finite estimates retained; analysis_ok records fit acceptance"
+            ),
+            "xline_shape_info": np.array([nx, nshots, nt_full, nt, iv_npts], dtype=np.int64),
+            "trace_spatial_shape": np.array(spatial_shape, dtype=np.int64),
+            "dt_s": np.array(dt),
+            "te_min_r2": np.array(te_min_r2),
+            "ion_min_snr": np.array(ion_min_snr),
+            "analysis_model": np.array(
+                "single-temperature semilog fit; median low-bias ion and high-bias "
+                "electron-saturation region estimates"
+            ),
+            "te_fit_i0_definition": np.array("median low-bias ion-region current"),
+            "iv_npts_role": np.array("fixed-size diagnostics only"),
+            "current_zero_calibrated": np.array(int(current_zero_calibrated)),
+            "negate_Isweep_current": np.array(int(negate_Isweep_current)),
+            "calculate_shape_factor": np.array(int(calculate_shape_factor)),
+            "shape_factor_m": np.array(
+                np.nan if shape_factor is None else shape_factor.to_value(u.m)
+            ),
+            "interferometer_line_integrated_density_m2": np.array(
+                interferometer_scaling.to_value(u.m**-2)
+            ),
+            "enforce_ideal_model_checks": np.array(int(enforce_ideal_model_checks)),
+            "subtract_dc": np.array(int(subtract_dc)),
+            "summary_plot_path": np.array("" if summary_plot_path is None else str(summary_plot_path)),
+            "all_iv_plot_path": np.array("" if all_iv_plot_path is None else str(all_iv_plot_path)),
+        }
+        if subtract_dc:
+            xline_npz_data["isweep_dc_offsets_A"] = isweep_dc_offsets
+        if plot_png_bytes is not None:
+            xline_npz_data["summary_plot_png"] = np.frombuffer(plot_png_bytes, dtype=np.uint8)
+        if all_iv_plot_png_bytes is not None:
+            xline_npz_data["all_iv_curves_plot_png"] = np.frombuffer(all_iv_plot_png_bytes, dtype=np.uint8)
+
+        np.savez_compressed(output_npz_path, **xline_npz_data)
+
+        print(f"Saved Langmuir x-line results to: {output_h5_path}")
+        print(f"Saved Langmuir x-line NPZ results to: {output_npz_path}")
+
+    # %%
+
+
+def run_xy_analysis():
+    """Run the configured xy-plane acquisition and analysis pipeline."""
+    # %%
+    # Read data
+
+    print(f"Expected Langmuir XY-plane shots: {n_expected_shots}")
+    print(f"shotnum_start = {shotnum_start}, shotnum_end = {shotnum_end}")
+
+    file = lapd.File(filename, silent=True)
+
+    print("Reading voltage data..")
+    vsweep_full, dt = read_channel_xy(
+        file_obj=file,
+        board=board,
+        channel=vsweep_channel,
+        shotnum_start=shotnum_start,
+        shotnum_end=shotnum_end,
+        ny=ny,
+        nx=nx,
+        nshots=nshots,
+        nt_full=nt_full,
+        digitizer=digitizer,
+        adc=adc,
+        config_name=sis_config_name,
+        scale_factor=vsweep_attenuation,
+        flipup=True,
+        negate=False,
+    )
+    print(f"Voltage data reshaped to (y, x, shots, time): {vsweep_full.shape}")
+
+    print("Reading current data..")
+    isweep_full, _ = read_channel_xy(
+        file_obj=file,
+        board=board,
+        channel=isweep_channel,
+        shotnum_start=shotnum_start,
+        shotnum_end=shotnum_end,
+        ny=ny,
+        nx=nx,
+        nshots=nshots,
+        nt_full=nt_full,
+        digitizer=digitizer,
+        adc=adc,
+        config_name=sis_config_name,
+        scale_factor=isweep_attenuation / isweep_resistance,
+        flipup=True,
+        negate=negate_Isweep_current,
+    )
+    print(f"Current data reshaped to (y, x, shots, time): {isweep_full.shape}")
+
+    print("Extracting sweep regions")
+    vsweep = vsweep_full[..., sweep_start_index:sweep_end_index + 1]
+    isweep = isweep_full[..., sweep_start_index:sweep_end_index + 1]
+
+    if subtract_dc:
+        if isweep_dc_offset_start_index is None or isweep_dc_offset_end_index is None:
+            raise ValueError(
+                "subtract_dc requires an independently measured plasma-off interval"
+            )
+        if not (
+            0
+            <= isweep_dc_offset_start_index
+            <= isweep_dc_offset_end_index
+            < nt_full
+        ):
+            raise ValueError("the electronics-offset interval is outside the trace")
+        if not (
+            isweep_dc_offset_end_index < sweep_start_index
+            or isweep_dc_offset_start_index > sweep_end_index
+        ):
+            raise ValueError("the electronics-offset interval must not overlap the I-V sweep")
+        print("Subtracting current DC offsets")
+        isweep_dc_offset_portion = isweep_full[..., isweep_dc_offset_start_index:isweep_dc_offset_end_index + 1]
+        isweep_dc_offsets = np.mean(isweep_dc_offset_portion, axis=-1)
+        isweep = isweep - isweep_dc_offsets[..., np.newaxis]
+
+    file.close()
+    print("Finished reading and reshaping data.")
+
+    # %%
+    # Optional time-domain products for visualization/export. The analysis itself
+    # uses unsmoothed samples and performs averaging in voltage bins.
+
+    time = np.arange(nt) * dt
+
+    vsweep_shot = vsweep * u.V
+    isweep_shot = isweep * u.A
+    vsweep_mean = np.mean(vsweep_shot, axis=2)
+    isweep_mean = np.mean(isweep_shot, axis=2)
+
+    isat = np.mean(isweep[..., isat_start_index:isat_end_index + 1], axis=-1)
+    isat_mean_values, isat_std_values, isat_count = shot_mean_and_std(isat)
+    isat_mean = isat_mean_values * u.A
+    isat_std = isat_std_values * u.A
+
+    print("Applying Savitzky-Golay filter along original sweep samples")
+    vsweep_shot_smoothed = savgol_filter(
+        vsweep_shot.value,
+        sg_smooth_bins,
+        sg_smooth_order,
+        axis=-1
+    ) * vsweep_shot.unit
+
+    isweep_shot_smoothed = savgol_filter(
+        isweep_shot.value,
+        sg_smooth_bins,
+        sg_smooth_order,
+        axis=-1
+    ) * isweep_shot.unit
+    vsweep_mean_smoothed = np.mean(vsweep_shot_smoothed, axis=2)
+    isweep_mean_smoothed = np.mean(isweep_shot_smoothed, axis=2)
+    print("Finished smoothing data.")
+
+    # %%
+    # Prepare output arrays
+
+    spatial_shape = (ny, nx)
+    trace_shape = spatial_shape + (nshots,)
+    n_traces = int(np.prod(trace_shape))
+
+    te_shot = np.full(trace_shape, np.nan)
+    vp_shot = np.full(trace_shape, np.nan)
+    vf_shot = np.full(trace_shape, np.nan)
+    ies_shot = np.full(trace_shape, np.nan)
+    iis_shot = np.full(trace_shape, np.nan)
+    n_e_shot = np.full(trace_shape, np.nan)
+    analysis_ok_shot = np.zeros(trace_shape, dtype=np.uint8)
+    analysis_rejection_counts = Counter()
+
+    te_fit_r2_shot = np.full(trace_shape, np.nan)
+    te_fit_rmse_shot = np.full(trace_shape, np.nan)
+    te_fit_npts_shot = np.full(trace_shape, np.nan)
+    te_fit_vstart_shot = np.full(trace_shape, np.nan)
+    te_fit_vstop_shot = np.full(trace_shape, np.nan)
+    te_fit_slope_shot = np.full(trace_shape, np.nan)
+    te_fit_intercept_shot = np.full(trace_shape, np.nan)
+    te_fit_i0_shot = np.full(trace_shape, np.nan)
+    te_fit_passed_r2_shot = np.zeros(trace_shape, dtype=np.uint8)
+    te_fit_candidate_count_shot = np.zeros(trace_shape, dtype=int)
+
+    iv_voltage_grid_shot = np.full(trace_shape + (iv_npts,), np.nan)
+    iv_current_grid_shot = np.full(trace_shape + (iv_npts,), np.nan)
+    iv_didv_grid_shot = np.full(trace_shape + (iv_npts,), np.nan)
+    iv_fit_mask_grid_shot = np.zeros(trace_shape + (iv_npts,), dtype=np.uint8)
+
+    # %%
+    # Robust Langmuir analysis on monotonic I(V) curves
+
+    analysis_tasks = []
+    for flat_index in range(n_traces):
+        idx = np.unravel_index(flat_index, trace_shape)
+        include_diagnostic_data = (
+            diagnostic_plot_every is not None
+            and diagnostic_plot_every > 0
+            and flat_index % diagnostic_plot_every == 0
+        )
+        analysis_tasks.append(
+            (
+                flat_index,
+                idx,
+                vsweep_shot.value[idx + (slice(None),)],
+                isweep_shot.value[idx + (slice(None),)],
+                include_diagnostic_data,
+                langmuir_analysis_config,
+            )
+        )
+
+    n_analysis_processes = choose_analysis_process_count(n_traces, analysis_processes)
+    use_parallel_analysis = parallel_analysis and n_analysis_processes > 1
+
+    if use_parallel_analysis and "fork" not in mp.get_all_start_methods():
+        print("Multiprocessing start method 'fork' is unavailable; falling back to serial analysis.")
+        use_parallel_analysis = False
+
+    analysis_processes_used = n_analysis_processes if use_parallel_analysis else 1
+
+    if use_parallel_analysis:
+        print(f"Processing {n_traces} Langmuir traces using {analysis_processes_used} worker processes...")
+        process_context = mp.get_context("fork")
+        with ProcessPoolExecutor(
+            max_workers=analysis_processes_used,
+            mp_context=process_context,
+        ) as executor:
+            futures = [executor.submit(analyze_trace_worker, task) for task in analysis_tasks]
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                result = future.result()
+                idx = result["idx"]
+                iy, ix, ishot = idx
+                print(f"Finished trace {result['flat_index'] + 1}/{n_traces} at index {idx} ({completed}/{n_traces} complete)")
+
+                for warning in result["warnings"]:
+                    print(f"{warning} at index {idx}")
+
+                if not result["ok"]:
+                    reason = (
+                        result["warnings"][-1]
+                        if result["warnings"]
+                        else "unspecified analysis failure"
+                    )
+                    analysis_rejection_counts[reason] += 1
+
+                if result["iv_voltage_grid"] is None:
+                    continue
+
+                analysis_ok_shot[idx] = int(result["ok"])
+                # Keep every finite estimate for plotting and export.  The strict
+                # quality decision remains available separately in analysis_ok_shot.
+                te_shot[idx] = result["te_eV"]
+                vp_shot[idx] = result["vp_V"]
+                vf_shot[idx] = result["vf_V"]
+                ies_shot[idx] = result["ies_A"]
+                iis_shot[idx] = result["iis_A"]
+                n_e_shot[idx] = result.get("n_e_m3", np.nan)
+
+                te_fit_r2_shot[idx] = result["te_fit_r2"]
+                te_fit_rmse_shot[idx] = result["te_fit_rmse"]
+                if result["te_fit_candidate_count"]:
+                    te_fit_npts_shot[idx] = result["te_fit_npts"]
+                te_fit_vstart_shot[idx] = result["te_fit_vstart"]
+                te_fit_vstop_shot[idx] = result["te_fit_vstop"]
+                te_fit_slope_shot[idx] = result["te_fit_slope"]
+                te_fit_intercept_shot[idx] = result["te_fit_intercept"]
+                te_fit_i0_shot[idx] = result["te_fit_i0"]
+                te_fit_passed_r2_shot[idx] = int(result["te_fit_passed_r2"])
+                te_fit_candidate_count_shot[idx] = result["te_fit_candidate_count"]
+
+                iv_voltage_grid_shot[idx + (slice(None),)] = result["iv_voltage_grid"]
+                iv_current_grid_shot[idx + (slice(None),)] = result["iv_current_grid"]
+                if result["iv_didv_grid"] is not None:
+                    iv_didv_grid_shot[idx + (slice(None),)] = result["iv_didv_grid"]
+                iv_fit_mask_grid_shot[idx + (slice(None),)] = result["iv_fit_mask"]
+
+                diagnostic_data = result["diagnostic_data"]
+                if diagnostic_data is not None:
+                    fig = render_analysis_iv_diagnostic_plot(
+                        result,
+                        f"Diagnostic IV analysis at index {idx} "
+                        f"shot {ishot} (x = {x[ix]:.2f} cm, y = {y[iy]:.2f} cm)",
+                    )
+                    save_diagnostic_figure(
+                        fig,
+                        diagnostic_plot_output_dir,
+                        f"{Path(filename).stem}_iv_diagnostic_iy{iy:03d}_ix{ix:03d}_"
+                        f"shot{ishot:03d}_y_{y[iy]:+.2f}cm_x_{x[ix]:+.2f}cm",
+                    )
+                    plt.show(block=False)
+                    plt.pause(example_pause_seconds)
+                    plt.close(fig)
+    else:
+        print("Processing Langmuir traces serially...")
+        for task in analysis_tasks:
+            flat_index = task[0]
+            idx = task[1]
+            iy, ix, ishot = idx
+            print(f"Processing trace {flat_index + 1}/{n_traces} at index {idx}...")
+            result = analyze_trace_worker(task)
+
+            for warning in result["warnings"]:
+                print(f"{warning} at index {idx}")
+
+            if not result["ok"]:
+                reason = (
+                    result["warnings"][-1]
+                    if result["warnings"]
+                    else "unspecified analysis failure"
+                )
+                analysis_rejection_counts[reason] += 1
+
+            if result["iv_voltage_grid"] is None:
+                continue
+
+            analysis_ok_shot[idx] = int(result["ok"])
+            # Keep every finite estimate for plotting and export.  The strict
+            # quality decision remains available separately in analysis_ok_shot.
+            te_shot[idx] = result["te_eV"]
+            vp_shot[idx] = result["vp_V"]
+            vf_shot[idx] = result["vf_V"]
+            ies_shot[idx] = result["ies_A"]
+            iis_shot[idx] = result["iis_A"]
+            n_e_shot[idx] = result.get("n_e_m3", np.nan)
+
+            te_fit_r2_shot[idx] = result["te_fit_r2"]
+            te_fit_rmse_shot[idx] = result["te_fit_rmse"]
+            if result["te_fit_candidate_count"]:
+                te_fit_npts_shot[idx] = result["te_fit_npts"]
+            te_fit_vstart_shot[idx] = result["te_fit_vstart"]
+            te_fit_vstop_shot[idx] = result["te_fit_vstop"]
+            te_fit_slope_shot[idx] = result["te_fit_slope"]
+            te_fit_intercept_shot[idx] = result["te_fit_intercept"]
+            te_fit_i0_shot[idx] = result["te_fit_i0"]
+            te_fit_passed_r2_shot[idx] = int(result["te_fit_passed_r2"])
+            te_fit_candidate_count_shot[idx] = result["te_fit_candidate_count"]
+
+            iv_voltage_grid_shot[idx + (slice(None),)] = result["iv_voltage_grid"]
+            iv_current_grid_shot[idx + (slice(None),)] = result["iv_current_grid"]
+            if result["iv_didv_grid"] is not None:
+                iv_didv_grid_shot[idx + (slice(None),)] = result["iv_didv_grid"]
+            iv_fit_mask_grid_shot[idx + (slice(None),)] = result["iv_fit_mask"]
+
+            diagnostic_data = result["diagnostic_data"]
+            if diagnostic_data is not None:
+                fig = render_analysis_iv_diagnostic_plot(
+                    result,
+                    f"Diagnostic IV analysis at index {idx} "
+                    f"shot {ishot} (x = {x[ix]:.2f} cm, y = {y[iy]:.2f} cm)",
+                )
+                save_diagnostic_figure(
+                    fig,
+                    diagnostic_plot_output_dir,
+                    f"{Path(filename).stem}_iv_diagnostic_iy{iy:03d}_ix{ix:03d}_"
+                    f"shot{ishot:03d}_y_{y[iy]:+.2f}cm_x_{x[ix]:+.2f}cm",
+                )
+                plt.show(block=False)
+                plt.pause(example_pause_seconds)
+                plt.close(fig)
+    # Compatibility export: this mask identifies locations with a reported Te fit.
+    # Consult analysis_ok_shot to distinguish quality-accepted and rejected fits.
+    statistics_fit_mask = np.isfinite(te_shot)
+    te_values, te_std_values, fit_count = shot_mean_and_std(te_shot)
+    vp_values, vp_std_values, _ = shot_mean_and_std(vp_shot)
+    vf_values, vf_std_values, _ = shot_mean_and_std(vf_shot)
+    ies_values, ies_std_values, _ = shot_mean_and_std(ies_shot)
+    iis_values, iis_std_values, _ = shot_mean_and_std(iis_shot)
+    n_e_values, n_e_std_values, _ = shot_mean_and_std(n_e_shot)
+
+    te = te_values * u.eV
+    vp = vp_values * u.V
+    vf = vf_values * u.V
+    ies = ies_values * u.A
+    iis = iis_values * u.A
+    n_e = n_e_values * u.m**-3
+    te_std = te_std_values * u.eV
+    vp_std = vp_std_values * u.V
+    vf_std = vf_std_values * u.V
+    ies_std = ies_std_values * u.A
+    iis_std = iis_std_values * u.A
+    n_e_std = n_e_std_values * u.m**-3
+
+    te_fit_r2, te_fit_r2_std, te_fit_count = shot_mean_and_std(te_fit_r2_shot)
+    te_fit_rmse, te_fit_rmse_std, _ = shot_mean_and_std(te_fit_rmse_shot)
+    te_fit_npts, te_fit_npts_std, _ = shot_mean_and_std(te_fit_npts_shot)
+    te_fit_vstart, te_fit_vstart_std, _ = shot_mean_and_std(te_fit_vstart_shot)
+    te_fit_vstop, te_fit_vstop_std, _ = shot_mean_and_std(te_fit_vstop_shot)
+    te_fit_slope, te_fit_slope_std, _ = shot_mean_and_std(te_fit_slope_shot)
+    te_fit_intercept, te_fit_intercept_std, _ = shot_mean_and_std(te_fit_intercept_shot)
+    te_fit_i0, te_fit_i0_std, _ = shot_mean_and_std(te_fit_i0_shot)
+    te_fit_passed_r2 = np.any(te_fit_passed_r2_shot.astype(bool), axis=-1).astype(np.uint8)
+    te_fit_candidate_count = np.sum(te_fit_candidate_count_shot, axis=-1)
+    analysis_valid_count = np.sum(analysis_ok_shot, axis=-1)
+    analysis_ok = (analysis_valid_count > 0).astype(np.uint8)
+    accepted_trace_count = int(np.sum(analysis_ok_shot))
+    reported_trace_count = int(np.count_nonzero(np.isfinite(te_shot)))
+    analysis_status = (
+        f"Reported {reported_trace_count}/{n_traces} finite fits; "
+        f"accepted {accepted_trace_count}/{n_traces} fits"
+    )
+    if analysis_rejection_counts:
+        common_reason, common_count = analysis_rejection_counts.most_common(1)[0]
+        analysis_status += f"; top rejection ({common_count}): {common_reason}"
+    print(f"Analysis summary: {analysis_status}")
+
+    # Representative I-V products are visualization-only shot means.  They are
+    # not used for physics, because individual sweep endpoints need not coincide.
+    # Full per-shot grids are exported separately below.
+    iv_voltage_grid = np.nanmean(iv_voltage_grid_shot, axis=-2)
+    iv_current_grid = np.nanmean(iv_current_grid_shot, axis=-2)
+    iv_didv_grid = np.nanmean(iv_didv_grid_shot, axis=-2)
+    iv_fit_mask_grid = np.any(iv_fit_mask_grid_shot.astype(bool), axis=-2).astype(np.uint8)
+
+    print("Finished per-shot Langmuir probe analysis and spatial statistics")
+
+    # %%
+    # Optional post-processing on XY maps
+
+    post = apply_optional_xy_postprocessing(
+        te=te.value,
+        vp=vp.value,
+        vf=vf.value,
+        ies=ies.value,
+        iis=iis.value,
+        n_e=n_e.value,
+        enable_vp_spike_rejection=enable_vp_spike_rejection,
+        vp_spike_half_window=vp_spike_half_window,
+        vp_spike_threshold_V=vp_spike_threshold_V,
+        vp_replace_flagged_with_local_median=vp_replace_flagged_with_local_median,
+        enable_neighbor_smoothing=enable_neighbor_smoothing,
+        neighbor_smooth_half_window=neighbor_smooth_half_window,
+        neighbor_smooth_sigma=neighbor_smooth_sigma,
+    )
+
+    te_raw = post["te_raw"] * u.eV
+    vp_raw = post["vp_raw"] * u.V
+    vf_raw = post["vf_raw"] * u.V
+    ies_raw = post["ies_raw"] * u.A
+    iis_raw = post["iis_raw"] * u.A
+    n_e_raw = post["n_e_raw"] * u.m**-3 if "n_e_raw" in post else None
+
+    te_processed = post["te_processed"] * u.eV
+    vp_processed = post["vp_processed"] * u.V
+    vf_processed = post["vf_processed"] * u.V
+    ies_processed = post["ies_processed"] * u.A
+    iis_processed = post["iis_processed"] * u.A
+    n_e_processed = post["n_e_processed"] * u.m**-3 if "n_e_processed" in post else None
+
+    vp_spike_mask = post["vp_spike_mask"]
+
+    te_plot = te_processed if enable_neighbor_smoothing else te_raw
+    vp_plot = vp_processed if (enable_neighbor_smoothing or enable_vp_spike_rejection) else vp_raw
+    vf_plot = vf_processed if enable_neighbor_smoothing else vf_raw
+    ies_plot = ies_processed if enable_neighbor_smoothing else ies_raw
+    iis_plot = iis_processed if enable_neighbor_smoothing else iis_raw
+    n_e_plot = n_e_processed if enable_neighbor_smoothing else n_e_raw
+
+    # Calibrate the xy density map using the same normalized-profile spatial
+    # integral as the x-line pipeline.  One measured x-line determines a
+    # single scale factor, which is applied uniformly to the full map.
+    shape_factor = None
+    density_scale = np.nan
+    electron_density_normalized_xline = None
+    electron_density_scaled_xline = None
+    (
+        interferometer_profile_y_index,
+        interferometer_profile_y_selected_cm,
+        electron_density_xline,
+    ) = select_xline_from_xy_map(
+        y,
+        n_e_plot,
+        requested_y_cm=interferometer_profile_y_cm,
+    )
+    if calculate_shape_factor:
+        interferometer_result = scale_xy_density_map_to_interferometer(
+            x,
+            y,
+            n_e_plot,
+            interferometer_scaling,
+            requested_y_cm=interferometer_profile_y_cm,
+        )
+        shape_factor = interferometer_result["shape_factor"]
+        density_scale = interferometer_result["density_scale"]
+        electron_density_normalized_xline = interferometer_result[
+            "normalized_xline"
+        ]
+        electron_density_scaled_xline = interferometer_result["scaled_xline"]
+        n_e_plot = interferometer_result["scaled_density_map"]
+
+        if np.isfinite(density_scale):
+            n_e_std = n_e_std * density_scale
+            print(
+                "Scaled the xy electron-density map using the x-line at "
+                f"y={interferometer_profile_y_selected_cm:g} cm; "
+                f"peak n_e = {np.nanmax(n_e_plot):.4g}."
+            )
+        else:
+            print(
+                "Warning: the xy electron-density map could not be normalized "
+                "and scaled because the selected x-line maximum, shape factor, "
+                "or interferometer scaling is not finite and positive."
+            )
+            n_e_std = np.full(n_e_std.shape, np.nan) * u.m**-3
+
+    # %%
+    # Plot results
+
+    plot_png_bytes = None
+    all_iv_plot_png_bytes = None
+    summary_plot_path = None
+    all_iv_plot_path = None
+
+    if plot_results:
+        fig = render_xy_summary_plot(
+            X,
+            Y,
+            te_plot,
+            vp_plot,
+            vf_plot,
+            ies_plot,
+            iis_plot,
+            n_e_plot,
+            vp_spike_mask=vp_spike_mask,
+            vp_raw=vp_raw,
+            te_fit_r2=te_fit_r2,
+            te_poor_fit_r2=te_min_r2,
+            analysis_ok=analysis_ok,
+            analysis_status=analysis_status,
+            shape_factor=shape_factor,
+            interferometer_profile_y_cm=interferometer_profile_y_selected_cm,
+            title=f"{Path(filename).stem} - Langmuir XY-plane Summary",
+        )
+
+        plot_buffer = io.BytesIO()
+        fig.savefig(plot_buffer, format="png", dpi=600)
+        plot_png_bytes = plot_buffer.getvalue()
+        plot_buffer.close()
+
+        summary_plot_path = save_diagnostic_figure(
+            fig,
+            diagnostic_plot_output_dir,
+            f"{Path(filename).stem}_langmuir_xy_summary",
+        )
+        plt.show()
+
+    if make_all_iv_diagnostic_plot:
+        fig_iv = render_xy_all_iv_curves_plot(x, y, iv_voltage_grid, iv_current_grid)
+
+        iv_plot_buffer = io.BytesIO()
+        fig_iv.savefig(iv_plot_buffer, format="png", dpi=600)
+        all_iv_plot_png_bytes = iv_plot_buffer.getvalue()
+        iv_plot_buffer.close()
+
+        all_iv_plot_path = save_diagnostic_figure(
+            fig_iv,
+            diagnostic_plot_output_dir,
+            f"{Path(filename).stem}_all_interpolated_iv_curves",
+        )
+        plt.show()
+
+    # %%
+    # Save processed Langmuir XY-plane results
+
+    output_h5_path = Path(filename)
+    output_npz_path = output_h5_path.with_name(f"{output_h5_path.stem}_langmuir_xy.npz")
+
+    if save_results:
+        with open_h5_for_update(output_h5_path) as h5f:
+            if "langmuir_xy" in h5f:
+                del h5f["langmuir_xy"]
+
+            grp = h5f.create_group("langmuir_xy")
+
+            grp.create_dataset("x_cm", data=x)
+            grp.create_dataset("y_cm", data=y)
+            grp.create_dataset("X_cm", data=X)
+            grp.create_dataset("Y_cm", data=Y)
+            grp.create_dataset("time_s", data=time)
+
+            # Primary exported profiles reflect current optional processing choices
+            grp.create_dataset("te_eV", data=te_plot.value)
+            grp.create_dataset("vp_V", data=vp_plot.value)
+            grp.create_dataset("vf_V", data=vf_plot.value)
+            grp.create_dataset("ies_A", data=ies_plot.value)
+            grp.create_dataset("iis_A", data=iis_plot.value)
+            grp.create_dataset("isat_A", data=isat_mean.value)
+            grp.create_dataset("n_e_m3", data=n_e_plot.value)
+            grp.create_dataset(
+                "interferometer_xline_n_e_raw_m3",
+                data=u.Quantity(electron_density_xline).to_value(u.m**-3),
+            )
+            if electron_density_normalized_xline is not None:
+                grp.create_dataset(
+                    "interferometer_xline_n_e_normalized",
+                    data=electron_density_normalized_xline,
+                )
+            if electron_density_scaled_xline is not None:
+                grp.create_dataset(
+                    "interferometer_xline_n_e_m3",
+                    data=electron_density_scaled_xline.to_value(u.m**-3),
+                )
+
+            # Per-shot fitted quantities and their per-location sample deviations
+            grp.create_dataset("te_shot_eV", data=te_shot)
+            grp.create_dataset("vp_shot_V", data=vp_shot)
+            grp.create_dataset("vf_shot_V", data=vf_shot)
+            grp.create_dataset("ies_shot_A", data=ies_shot)
+            grp.create_dataset("iis_shot_A", data=iis_shot)
+            grp.create_dataset("n_e_shot_m3", data=n_e_shot)
+            grp.create_dataset("isat_shot_A", data=isat)
+            grp.create_dataset("te_std_eV", data=te_std.value)
+            grp.create_dataset("vp_std_V", data=vp_std.value)
+            grp.create_dataset("vf_std_V", data=vf_std.value)
+            grp.create_dataset("ies_std_A", data=ies_std.value)
+            grp.create_dataset("iis_std_A", data=iis_std.value)
+            grp.create_dataset("n_e_std_m3", data=n_e_std.value)
+            grp.create_dataset("isat_std_A", data=isat_std.value)
+            grp.create_dataset("fit_count", data=fit_count)
+            grp.create_dataset("analysis_ok", data=analysis_ok)
+            grp.create_dataset("analysis_valid_count", data=analysis_valid_count)
+            grp.create_dataset("analysis_ok_shot", data=analysis_ok_shot)
+            grp.create_dataset("statistics_fit_mask", data=statistics_fit_mask.astype(np.uint8))
+
+            # Raw extracted profiles
+            grp.create_dataset("te_raw_eV", data=te_raw.value)
+            grp.create_dataset("vp_raw_V", data=vp_raw.value)
+            grp.create_dataset("vf_raw_V", data=vf_raw.value)
+            grp.create_dataset("ies_raw_A", data=ies_raw.value)
+            grp.create_dataset("iis_raw_A", data=iis_raw.value)
+            grp.create_dataset("n_e_raw_m3", data=n_e_raw.value if n_e_raw is not None else np.full(spatial_shape, np.nan))
+
+            # Post-processed profiles
+            grp.create_dataset("te_processed_eV", data=te_processed.value)
+            grp.create_dataset("vp_processed_V", data=vp_processed.value)
+            grp.create_dataset("vf_processed_V", data=vf_processed.value)
+            grp.create_dataset("ies_processed_A", data=ies_processed.value)
+            grp.create_dataset("iis_processed_A", data=iis_processed.value)
+            grp.create_dataset("n_e_processed_m3", data=n_e_processed.value if n_e_processed is not None else np.full(spatial_shape, np.nan))
+
+            # Spike diagnostics
+            grp.create_dataset("vp_spike_mask", data=vp_spike_mask.astype(np.uint8))
+
+            # Shot-averaged original sweep curves
+            grp.create_dataset("vsweep_mean_V", data=vsweep_mean.value)
+            grp.create_dataset("isweep_mean_A", data=isweep_mean.value)
+            grp.create_dataset("vsweep_mean_smoothed_V", data=vsweep_mean_smoothed.value)
+            grp.create_dataset("isweep_mean_smoothed_A", data=isweep_mean_smoothed.value)
+            grp.create_dataset("vsweep_shot_smoothed_V", data=vsweep_shot_smoothed.value)
+            grp.create_dataset("isweep_shot_smoothed_A", data=isweep_shot_smoothed.value)
+
+            # Interpolated monotonic IV analysis products
+            grp.create_dataset("iv_voltage_grid_V", data=iv_voltage_grid)
+            grp.create_dataset("iv_current_grid_A", data=iv_current_grid)
+            grp.create_dataset("iv_didv_grid_A_per_V", data=iv_didv_grid)
+            grp.create_dataset("iv_te_fit_mask", data=iv_fit_mask_grid)
+            grp.create_dataset("iv_voltage_grid_shot_V", data=iv_voltage_grid_shot)
+            grp.create_dataset("iv_current_grid_shot_A", data=iv_current_grid_shot)
+            grp.create_dataset("iv_didv_grid_shot_A_per_V", data=iv_didv_grid_shot)
+            grp.create_dataset("iv_te_fit_mask_shot", data=iv_fit_mask_grid_shot)
+
+            # Fit diagnostics
+            grp.create_dataset("te_fit_r2", data=te_fit_r2)
+            grp.create_dataset("te_fit_rmse_logI", data=te_fit_rmse)
+            grp.create_dataset("te_fit_npts", data=te_fit_npts)
+            grp.create_dataset("te_fit_vstart_V", data=te_fit_vstart)
+            grp.create_dataset("te_fit_vstop_V", data=te_fit_vstop)
+            grp.create_dataset("te_fit_slope_logI_per_V", data=te_fit_slope)
+            grp.create_dataset("te_fit_intercept_logI", data=te_fit_intercept)
+            grp.create_dataset("te_fit_i0_A", data=te_fit_i0)
+            grp.create_dataset("te_fit_passed_r2", data=te_fit_passed_r2)
+            grp.create_dataset("te_fit_candidate_count", data=te_fit_candidate_count)
+            grp.create_dataset("te_fit_r2_std", data=te_fit_r2_std)
+            grp.create_dataset("te_fit_rmse_logI_std", data=te_fit_rmse_std)
+            grp.create_dataset("te_fit_npts_std", data=te_fit_npts_std)
+            grp.create_dataset("te_fit_vstart_std_V", data=te_fit_vstart_std)
+            grp.create_dataset("te_fit_vstop_std_V", data=te_fit_vstop_std)
+            grp.create_dataset("te_fit_slope_std_logI_per_V", data=te_fit_slope_std)
+            grp.create_dataset("te_fit_intercept_std_logI", data=te_fit_intercept_std)
+            grp.create_dataset("te_fit_i0_std_A", data=te_fit_i0_std)
+            grp.create_dataset("te_fit_count", data=te_fit_count)
+            grp.create_dataset("te_fit_r2_shot", data=te_fit_r2_shot)
+            grp.create_dataset("te_fit_rmse_logI_shot", data=te_fit_rmse_shot)
+            grp.create_dataset("te_fit_npts_shot", data=te_fit_npts_shot)
+            grp.create_dataset("te_fit_vstart_shot_V", data=te_fit_vstart_shot)
+            grp.create_dataset("te_fit_vstop_shot_V", data=te_fit_vstop_shot)
+            grp.create_dataset("te_fit_slope_shot_logI_per_V", data=te_fit_slope_shot)
+            grp.create_dataset("te_fit_intercept_shot_logI", data=te_fit_intercept_shot)
+            grp.create_dataset("te_fit_i0_shot_A", data=te_fit_i0_shot)
+            grp.create_dataset("te_fit_passed_r2_shot", data=te_fit_passed_r2_shot)
+            grp.create_dataset("te_fit_candidate_count_shot", data=te_fit_candidate_count_shot)
+
+            if subtract_dc:
+                grp.create_dataset("isweep_dc_offsets_A", data=isweep_dc_offsets)
+            grp.create_dataset("xy_shape_info", data=np.array([ny, nx, nshots, nt_full, nt, iv_npts], dtype=np.int64))
+            grp.create_dataset("trace_spatial_shape", data=np.array(spatial_shape, dtype=np.int64))
+
+            if plot_results and plot_png_bytes is None:
+                fig = render_xy_summary_plot(
+                    X,
+                    Y,
+                    te_plot,
+                    vp_plot,
+                    vf_plot,
+                    ies_plot,
+                    iis_plot,
+                    n_e_plot,
+                    vp_spike_mask=vp_spike_mask,
+                    vp_raw=vp_raw,
+                    te_fit_r2=te_fit_r2,
+                    te_poor_fit_r2=te_min_r2,
+                    analysis_ok=analysis_ok,
+                    analysis_status=analysis_status,
+                    shape_factor=shape_factor,
+                    interferometer_profile_y_cm=(
+                        interferometer_profile_y_selected_cm
+                    ),
+                )
+                plot_buffer = io.BytesIO()
+                fig.savefig(plot_buffer, format="png", dpi=600)
+                plot_png_bytes = plot_buffer.getvalue()
+                plot_buffer.close()
+                plt.close(fig)
+
+            if plot_png_bytes is not None:
+                grp.create_dataset(
+                    "summary_plot_png",
+                    data=np.frombuffer(plot_png_bytes, dtype=np.uint8)
+                )
+                grp["summary_plot_png"].attrs["mime_type"] = "image/png"
+                grp["summary_plot_png"].attrs["description"] = "Rendered Langmuir XY-plane summary plot."
+
+            if all_iv_plot_png_bytes is not None:
+                grp.create_dataset(
+                    "all_iv_curves_plot_png",
+                    data=np.frombuffer(all_iv_plot_png_bytes, dtype=np.uint8)
+                )
+                grp["all_iv_curves_plot_png"].attrs["mime_type"] = "image/png"
+                grp["all_iv_curves_plot_png"].attrs["description"] = (
+                    "Diagnostic plot of representative interpolated I-V curves colored by y position."
+                )
+
+            grp.attrs["source_file"] = str(filename)
+            grp.attrs["geometry"] = "xy_plane"
+
+            grp.attrs["ny"] = ny
+            grp.attrs["nx"] = nx
+            grp.attrs["n_traces"] = n_traces
+            grp.attrs["trace_spatial_ndim"] = len(spatial_shape)
+            grp.attrs["nshots"] = nshots
+            grp.attrs["nt_full"] = nt_full
+            grp.attrs["nt_sweep"] = nt
+            grp.attrs["dt_s"] = dt
+
+            grp.attrs["digitizer"] = digitizer
+            grp.attrs["adc"] = adc
+            grp.attrs["config_name"] = sis_config_name
+            grp.attrs["board"] = board
+            grp.attrs["vsweep_channel"] = vsweep_channel
+            grp.attrs["isweep_channel"] = isweep_channel
+            grp.attrs["vsweep_attenuation"] = vsweep_attenuation
+            grp.attrs["isweep_attenuation"] = isweep_attenuation
+            grp.attrs["isweep_resistance_ohm"] = isweep_resistance
+            grp.attrs["calculate_shape_factor"] = int(calculate_shape_factor)
+            grp.attrs["shape_factor_m"] = (
+                np.nan if shape_factor is None else shape_factor.to_value(u.m)
+            )
+            grp.attrs["density_scale"] = density_scale
+            grp.attrs["interferometer_line_integrated_density_m2"] = (
+                interferometer_scaling.to_value(u.m**-2)
+            )
+            grp.attrs["interferometer_profile_y_requested_cm"] = (
+                interferometer_profile_y_cm
+            )
+            grp.attrs["interferometer_profile_y_index"] = (
+                interferometer_profile_y_index
+            )
+            grp.attrs["interferometer_profile_y_selected_cm"] = (
+                interferometer_profile_y_selected_cm
+            )
+
+            grp.attrs["sweep_start_index"] = sweep_start_index
+            grp.attrs["sweep_end_index"] = sweep_end_index
+            grp.attrs["isat_start_index"] = isat_start_index
+            grp.attrs["isat_end_index"] = isat_end_index
+
+            if subtract_dc:
+                grp.attrs["dc_offset_start_index"] = isweep_dc_offset_start_index
+                grp.attrs["dc_offset_end_index"] = isweep_dc_offset_end_index
+
+            grp.attrs["sg_smooth_bins"] = sg_smooth_bins
+            grp.attrs["sg_smooth_order"] = sg_smooth_order
+            grp.attrs["iv_npts"] = iv_npts
+            grp.attrs["voltage_bin_width_V"] = voltage_bin_width
+            grp.attrs["vp_smoothing"] = "none" if vp_smoothing is None else str(vp_smoothing)
+            grp.attrs["vp_smoothing_width_V"] = vp_smoothing_width_V
+            grp.attrs["vp_savgol_order"] = vp_savgol_order
+            grp.attrs["parallel_analysis"] = int(parallel_analysis)
+            grp.attrs["analysis_processes_requested"] = (
+                -1 if analysis_processes is None else int(analysis_processes)
+            )
+            grp.attrs["analysis_processes_used"] = analysis_processes_used
+            grp.attrs["analysis_start_method"] = "fork" if use_parallel_analysis else "serial"
+
+            grp.attrs["te_min_points"] = te_min_points
+            grp.attrs["te_margin_from_vp_V"] = te_margin_from_vp
+            grp.attrs["te_current_floor_frac"] = te_current_floor_frac
+            grp.attrs["te_subtract_i0"] = int(te_subtract_i0)
+            grp.attrs["te_min_eV"] = te_min_eV
+            grp.attrs["te_max_eV"] = te_max_eV
+            grp.attrs["te_min_r2"] = te_min_r2
+            grp.attrs["ion_min_snr"] = ion_min_snr
+            grp.attrs["analysis_model"] = (
+                "single-temperature semilog fit; median low-bias ion and high-bias "
+                "electron-saturation region estimates"
+            )
+            grp.attrs["te_fit_i0_definition"] = "median low-bias ion-region current"
+            grp.attrs["iv_npts_role"] = "fixed-size diagnostics only"
+            grp.attrs["current_zero_calibrated"] = int(current_zero_calibrated)
+            grp.attrs["negate_Isweep_current"] = int(negate_Isweep_current)
+            grp.attrs["enforce_ideal_model_checks"] = int(enforce_ideal_model_checks)
+            grp.attrs["subtract_dc"] = int(subtract_dc)
+            grp.attrs["shot_standard_deviation_ddof"] = 1
+            grp.attrs["per_shot_axis_order"] = "y,x,shot"
+            grp.attrs["shot_statistics_stage"] = "individual fits before spatial post-processing"
+            grp.attrs["profile_value_policy"] = (
+                "finite estimates retained; analysis_ok records fit acceptance"
+            )
+
+            grp.attrs["enable_vp_spike_rejection"] = int(enable_vp_spike_rejection)
+            grp.attrs["vp_spike_half_window_y"] = _as_yx_half_window(vp_spike_half_window)[0]
+            grp.attrs["vp_spike_half_window_x"] = _as_yx_half_window(vp_spike_half_window)[1]
+            grp.attrs["vp_spike_threshold_V"] = vp_spike_threshold_V
+            grp.attrs["vp_replace_flagged_with_local_median"] = int(vp_replace_flagged_with_local_median)
+
+            grp.attrs["enable_neighbor_smoothing"] = int(enable_neighbor_smoothing)
+            grp.attrs["neighbor_smooth_half_window_y"] = _as_yx_half_window(neighbor_smooth_half_window)[0]
+            grp.attrs["neighbor_smooth_half_window_x"] = _as_yx_half_window(neighbor_smooth_half_window)[1]
+            grp.attrs["neighbor_smooth_sigma"] = neighbor_smooth_sigma
+
+            grp.attrs["diagnostic_plot_every"] = diagnostic_plot_every
+            grp.attrs["diagnostic_plot_output_dir"] = str(diagnostic_plot_output_dir)
+            if summary_plot_path is not None:
+                grp.attrs["summary_plot_path"] = str(summary_plot_path)
+            if all_iv_plot_path is not None:
+                grp.attrs["all_iv_plot_path"] = str(all_iv_plot_path)
+
+            grp.attrs["make_all_iv_diagnostic_plot"] = int(make_all_iv_diagnostic_plot)
+            grp.attrs["data_offset_shots"] = data_offset
+
+        xy_npz_data = {
+            "source_file": np.array(str(filename)),
+            "geometry": np.array("xy_plane"),
+            "calculate_shape_factor": np.array(int(calculate_shape_factor)),
+            "shape_factor_m": np.array(
+                np.nan if shape_factor is None else shape_factor.to_value(u.m)
+            ),
+            "density_scale": np.array(density_scale),
+            "interferometer_line_integrated_density_m2": np.array(
+                interferometer_scaling.to_value(u.m**-2)
+            ),
+            "interferometer_profile_y_requested_cm": np.array(
+                interferometer_profile_y_cm
+            ),
+            "interferometer_profile_y_index": np.array(
+                interferometer_profile_y_index
+            ),
+            "interferometer_profile_y_selected_cm": np.array(
+                interferometer_profile_y_selected_cm
+            ),
+            "interferometer_xline_n_e_raw_m3": u.Quantity(
+                electron_density_xline
+            ).to_value(u.m**-3),
+            "interferometer_xline_n_e_normalized": (
+                np.full(nx, np.nan)
+                if electron_density_normalized_xline is None
+                else electron_density_normalized_xline
+            ),
+            "interferometer_xline_n_e_m3": (
+                np.full(nx, np.nan)
+                if electron_density_scaled_xline is None
+                else electron_density_scaled_xline.to_value(u.m**-3)
+            ),
+            "x_cm": x,
+            "y_cm": y,
+            "X_cm": X,
+            "Y_cm": Y,
+            "time_s": time,
+            "te_eV": te_plot.value,
+            "vp_V": vp_plot.value,
+            "vf_V": vf_plot.value,
+            "ies_A": ies_plot.value,
+            "iis_A": iis_plot.value,
+            "n_e_m3": n_e_plot.value,
+            "isat_A": isat_mean.value,
+            "te_shot_eV": te_shot,
+            "vp_shot_V": vp_shot,
+            "vf_shot_V": vf_shot,
+            "ies_shot_A": ies_shot,
+            "iis_shot_A": iis_shot,
+            "n_e_shot_m3": n_e_shot,
+            "isat_shot_A": isat,
+            "te_std_eV": te_std.value,
+            "vp_std_V": vp_std.value,
+            "vf_std_V": vf_std.value,
+            "ies_std_A": ies_std.value,
+            "iis_std_A": iis_std.value,
+            "n_e_std_m3": n_e_std.value,
+            "isat_std_A": isat_std.value,
+            "fit_count": fit_count,
+            "analysis_ok": analysis_ok,
+            "analysis_valid_count": analysis_valid_count,
+            "analysis_ok_shot": analysis_ok_shot,
+            "statistics_fit_mask": statistics_fit_mask.astype(np.uint8),
+            "te_raw_eV": te_raw.value,
+            "vp_raw_V": vp_raw.value,
+            "vf_raw_V": vf_raw.value,
+            "ies_raw_A": ies_raw.value,
+            "iis_raw_A": iis_raw.value,
+            "n_e_raw_m3": n_e_raw.value if n_e_raw is not None else np.full(spatial_shape, np.nan),
+            "te_processed_eV": te_processed.value,
+            "vp_processed_V": vp_processed.value,
+            "vf_processed_V": vf_processed.value,
+            "ies_processed_A": ies_processed.value,
+            "iis_processed_A": iis_processed.value,
+            "n_e_processed_m3": n_e_processed.value if n_e_processed is not None else np.full(spatial_shape, np.nan),
+            "vp_spike_mask": vp_spike_mask.astype(np.uint8),
+            "vsweep_mean_V": vsweep_mean.value,
+            "isweep_mean_A": isweep_mean.value,
+            "vsweep_mean_smoothed_V": vsweep_mean_smoothed.value,
+            "isweep_mean_smoothed_A": isweep_mean_smoothed.value,
+            "vsweep_shot_smoothed_V": vsweep_shot_smoothed.value,
+            "isweep_shot_smoothed_A": isweep_shot_smoothed.value,
+            "iv_voltage_grid_V": iv_voltage_grid,
+            "iv_current_grid_A": iv_current_grid,
+            "iv_didv_grid_A_per_V": iv_didv_grid,
+            "iv_te_fit_mask": iv_fit_mask_grid,
+            "iv_voltage_grid_shot_V": iv_voltage_grid_shot,
+            "iv_current_grid_shot_A": iv_current_grid_shot,
+            "iv_didv_grid_shot_A_per_V": iv_didv_grid_shot,
+            "iv_te_fit_mask_shot": iv_fit_mask_grid_shot,
+            "te_fit_r2": te_fit_r2,
+            "te_fit_rmse_logI": te_fit_rmse,
+            "te_fit_npts": te_fit_npts,
+            "te_fit_vstart_V": te_fit_vstart,
+            "te_fit_vstop_V": te_fit_vstop,
+            "te_fit_slope_logI_per_V": te_fit_slope,
+            "te_fit_intercept_logI": te_fit_intercept,
+            "te_fit_i0_A": te_fit_i0,
+            "te_subtract_i0": np.array(int(te_subtract_i0)),
+            "te_fit_passed_r2": te_fit_passed_r2,
+            "te_fit_candidate_count": te_fit_candidate_count,
+            "te_fit_r2_std": te_fit_r2_std,
+            "te_fit_rmse_logI_std": te_fit_rmse_std,
+            "te_fit_npts_std": te_fit_npts_std,
+            "te_fit_vstart_std_V": te_fit_vstart_std,
+            "te_fit_vstop_std_V": te_fit_vstop_std,
+            "te_fit_slope_std_logI_per_V": te_fit_slope_std,
+            "te_fit_intercept_std_logI": te_fit_intercept_std,
+            "te_fit_i0_std_A": te_fit_i0_std,
+            "te_fit_count": te_fit_count,
+            "te_fit_r2_shot": te_fit_r2_shot,
+            "te_fit_rmse_logI_shot": te_fit_rmse_shot,
+            "te_fit_npts_shot": te_fit_npts_shot,
+            "te_fit_vstart_shot_V": te_fit_vstart_shot,
+            "te_fit_vstop_shot_V": te_fit_vstop_shot,
+            "te_fit_slope_shot_logI_per_V": te_fit_slope_shot,
+            "te_fit_intercept_shot_logI": te_fit_intercept_shot,
+            "te_fit_i0_shot_A": te_fit_i0_shot,
+            "te_fit_passed_r2_shot": te_fit_passed_r2_shot,
+            "te_fit_candidate_count_shot": te_fit_candidate_count_shot,
+            "shot_standard_deviation_ddof": np.array(1),
+            "per_shot_axis_order": np.array("y,x,shot"),
+            "shot_statistics_stage": np.array("individual fits before spatial post-processing"),
+            "profile_value_policy": np.array(
+                "finite estimates retained; analysis_ok records fit acceptance"
+            ),
+            "xy_shape_info": np.array([ny, nx, nshots, nt_full, nt, iv_npts], dtype=np.int64),
+            "trace_spatial_shape": np.array(spatial_shape, dtype=np.int64),
+            "dt_s": np.array(dt),
+            "te_min_r2": np.array(te_min_r2),
+            "ion_min_snr": np.array(ion_min_snr),
+            "analysis_model": np.array(
+                "single-temperature semilog fit; median low-bias ion and high-bias "
+                "electron-saturation region estimates"
+            ),
+            "te_fit_i0_definition": np.array("median low-bias ion-region current"),
+            "iv_npts_role": np.array("fixed-size diagnostics only"),
+            "current_zero_calibrated": np.array(int(current_zero_calibrated)),
+            "negate_Isweep_current": np.array(int(negate_Isweep_current)),
+            "enforce_ideal_model_checks": np.array(int(enforce_ideal_model_checks)),
+            "subtract_dc": np.array(int(subtract_dc)),
+            "summary_plot_path": np.array("" if summary_plot_path is None else str(summary_plot_path)),
+            "all_iv_plot_path": np.array("" if all_iv_plot_path is None else str(all_iv_plot_path)),
+        }
+        if subtract_dc:
+            xy_npz_data["isweep_dc_offsets_A"] = isweep_dc_offsets
+        if plot_png_bytes is not None:
+            xy_npz_data["summary_plot_png"] = np.frombuffer(plot_png_bytes, dtype=np.uint8)
+        if all_iv_plot_png_bytes is not None:
+            xy_npz_data["all_iv_curves_plot_png"] = np.frombuffer(all_iv_plot_png_bytes, dtype=np.uint8)
+
+        np.savez_compressed(output_npz_path, **xy_npz_data)
+
+        print(f"Saved Langmuir XY-plane results to: {output_h5_path}")
+        print(f"Saved Langmuir XY-plane NPZ results to: {output_npz_path}")
+
+    # %%
+
+
+def main():
+    """Run the analysis pipeline selected by ``analysis_geometry``."""
+    if analysis_geometry == "x_line":
+        run_xline_analysis()
+    elif analysis_geometry == "xy_plane":
+        run_xy_analysis()
+    else:
+        choices = ", ".join(sorted(_SUPPORTED_ANALYSIS_GEOMETRIES))
+        raise ValueError(
+            f"analysis_geometry must be one of {{{choices}}}; "
+            f"got {analysis_geometry!r}."
+        )
+
+
+if __name__ == "__main__":
+    main()

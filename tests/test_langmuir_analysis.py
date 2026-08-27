@@ -3,7 +3,7 @@ from astropy.constants import e, k_B, m_e
 import numpy as np
 import pytest
 
-from langmuir_analysis import (
+from langmuir_analysis_core import (
     analyze_iv_trace,
     density_from_electron_saturation_current,
 )
