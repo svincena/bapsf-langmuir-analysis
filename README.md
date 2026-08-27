@@ -77,16 +77,88 @@ receives negative ion current and positive electron current.
 
 ### Result files
 
-The NPZ filename is derived from the input HDF5 filename:
+Results are saved in two places when `save_results = True`:
 
-- `*_langmuir_xline.npz` for x-line results
-- `*_langmuir_xy.npz` for xy-plane results
+- Inside the source experiment HDF5 file under `/langmuir_xline` or
+  `/langmuir_xy`.
+- In a separate compressed NPZ file derived from the HDF5 filename:
+  - `*_langmuir_xline.npz` for x-line results
+  - `*_langmuir_xy.npz` for xy-plane results
 
-Both formats store a scalar `geometry` field. Primary quantities include
+Both storage formats record the result geometry. Primary quantities include
 `te_eV`, `vp_V`, `vf_V`, `ies_A`, `iis_A`, and `n_e_m3`. The files also contain
 raw and processed spatial results, shot statistics, fit-quality fields,
 interpolated I–V products, calibration settings, and optional embedded plot
 images.
+
+## Reading HDF5 results
+
+[`read_langmuir_results_hdf5.py`](read_langmuir_results_hdf5.py) reads results
+directly from the experiment HDF5 file. It opens the file read-only and detects
+`/langmuir_xline` or `/langmuir_xy` automatically when exactly one is present.
+
+Print a compact result and fit-quality summary:
+
+```bash
+python read_langmuir_results_hdf5.py path/to/experiment.hdf5
+```
+
+Open the geometry-appropriate six-panel plot:
+
+```bash
+python read_langmuir_results_hdf5.py path/to/experiment.hdf5 --plot
+```
+
+List result groups, dataset names, shapes, and data types without loading the
+array contents:
+
+```bash
+python read_langmuir_results_hdf5.py path/to/experiment.hdf5 --list-fields
+```
+
+If a file contains both result groups, select one explicitly:
+
+```bash
+python read_langmuir_results_hdf5.py path/to/experiment.hdf5 \
+    --geometry xy_plane --plot
+```
+
+### Using the HDF5 reader from Python
+
+By default, the Python loader returns every result dataset plus the group
+attributes in one flat dictionary:
+
+```python
+from read_langmuir_results_hdf5 import load_langmuir_results_hdf5
+
+data = load_langmuir_results_hdf5("path/to/experiment.hdf5")
+electron_temperature_eV = data["te_eV"]
+electron_density_m3 = data["n_e_m3"]
+```
+
+Per-shot I–V grids can be large. Load only the plotting and summary fields when
+full numerical products are unnecessary:
+
+```python
+data = load_langmuir_results_hdf5(
+    "path/to/experiment.hdf5",
+    summary_only=True,
+)
+```
+
+Or request specific datasets:
+
+```python
+data = load_langmuir_results_hdf5(
+    "path/to/experiment.hdf5",
+    geometry="x_line",
+    dataset_names={"x_cm", "te_eV", "n_e_m3"},
+)
+```
+
+Group attributes such as `geometry`, `source_file`, fit settings, acquisition
+settings, and interferometer calibration metadata are included automatically.
+The returned `hdf5_group` field records which result group was read.
 
 ## Reading NPZ results
 
@@ -151,7 +223,7 @@ from read_langmuir_results_npz import (
 
 These loaders verify that the file contains the requested geometry.
 
-### Reader troubleshooting
+### NPZ reader troubleshooting
 
 - A missing or unsupported `geometry` field produces an explicit error.
 - Missing stable result fields are reported by name during schema validation.
@@ -161,6 +233,17 @@ These loaders verify that the file contains the requested geometry.
   inventory command also works in headless environments.
 - XY plots mark the x-line used for interferometer calibration when that
   metadata is present.
+
+### HDF5 reader troubleshooting
+
+- A file with neither `/langmuir_xline` nor `/langmuir_xy` is not an analyzed
+  Langmuir result file.
+- If both groups are present, use `--geometry x_line` or
+  `--geometry xy_plane`.
+- Missing stable datasets are reported by name during group validation.
+- Use `--list-fields` to inspect large files without loading result arrays.
+- The reader always uses HDF5 read-only mode and does not modify the experiment
+  file.
 
 ## Environment
 
