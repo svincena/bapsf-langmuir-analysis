@@ -2,3 +2,8 @@
 /legacy/
 /last_parameters.json
 /last_parameters.json.tmp
+
+# Python and operating-system generated files
+__pycache__/
+*.py[cod]
+.DS_Store
