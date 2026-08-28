@@ -6,20 +6,38 @@ geometry-aware reader for its compressed NPZ results.
 ## Analysis program
 
 [`langmuir_analysis.py`](langmuir_analysis.py) processes either a one-dimensional
-x-line scan or a two-dimensional xy-plane scan. Select the pipeline near the
-top of the file:
-
-```python
-analysis_geometry = "x_line"   # or "xy_plane"
-```
-
-The selected geometry block contains its acquisition settings, sweep indices,
-probe calibration, fitting controls, post-processing options, plotting flags,
-and output controls. Run it with:
+x-line scan or a two-dimensional xy-plane scan. Run it to open the graphical
+parameter editor:
 
 ```bash
 python langmuir_analysis.py
 ```
+
+### Graphical interface
+
+The interface has separate **X-line scan** and **XY-plane scan** tabs. The tab
+that is open when **Start Analysis** is pressed defines the geometry; there is
+no geometry flag to edit in the source code. Each tab groups its settings into
+titled cards for:
+
+- data source and scan geometry;
+- digitizer/probe conversion and sweep windows;
+- I–V physics and time/spatial processing;
+- interferometer calibration; and
+- execution, plots, diagnostics, and result output.
+
+The experiment path has a native file picker, numerical values use bounded
+editors with units, boolean controls are explicit, and invalid cross-field
+combinations are rejected before a run starts. Analysis runs in a separate
+process, leaving the interface responsive while its output appears in the live
+console. **Stop analysis** terminates that worker if necessary.
+
+Both tabs are saved automatically in `last_parameters.json`, along with the
+last active tab. The file is local run state and is intentionally ignored by
+Git. If it is absent, all controls use the documented defaults in
+[`langmuir_analysis_config.py`](langmuir_analysis_config.py); a malformed file
+also restores defaults and reports why. Use **Save parameters** to save without
+starting a run, or **Restore this tab's defaults** to reset one geometry.
 
 ### Coding perspective
 
@@ -42,10 +60,13 @@ The program performs the full dataset workflow:
 7. Produces diagnostic figures and optionally writes results into the source
    HDF5 file and a compressed NPZ file.
 
-The geometry-dependent acquisition and visualization code lives in
-`langmuir_analysis.py`; the reusable numerical I–V solver lives in
-`langmuir_analysis_core.py`. This separation keeps the physical trace model
-independent of scan geometry.
+The typed defaults, labels, ranges, validation, and persistence schema live in
+`langmuir_analysis_config.py`; the Qt interface lives in
+[`langmuir_analysis_gui.py`](langmuir_analysis_gui.py). Geometry-dependent data
+acquisition and visualization remain in `langmuir_analysis.py`, while the
+reusable numerical I–V solver lives in `langmuir_analysis_core.py`. The GUI
+starts `langmuir_analysis.py` in a saved-parameter worker mode, keeping the
+physical solver independent of both scan geometry and interface code.
 
 ### Plasma-physics perspective
 
@@ -68,16 +89,16 @@ rejection reasons. Finite estimates may be retained for diagnosis even when a
 trace fails the full acceptance policy; use `analysis_ok` and the related
 per-shot masks to distinguish accepted fits.
 
-Absolute current calibration matters physically. Set
-`current_zero_calibrated = True` only when the current zero has been established
-independently. Do not use low-bias sweep samples as an artificial zero: that
-removes the ion current and biases `Vf` and `Iis`. Likewise,
-`negate_Isweep_current` must match the acquisition electronics so the solver
-receives negative ion current and positive electron current.
+Absolute current calibration matters physically. Enable **Absolute current
+zero calibrated** only when the current zero has been established independently.
+Do not use low-bias sweep samples as an artificial zero: that removes the ion
+current and biases `Vf` and `Iis`. Likewise, **Reverse current polarity** must
+match the acquisition electronics so the solver receives negative ion current
+and positive electron current.
 
 ### Result files
 
-Results are saved in two places when `save_results = True`:
+Results are saved in two places when **Save HDF5 and NPZ results** is enabled:
 
 - Inside the source experiment HDF5 file under `/langmuir_xline` or
   `/langmuir_xy`.
@@ -250,4 +271,4 @@ These loaders verify that the file contains the requested geometry.
 The numerical package versions verified with the core tests are listed in
 [`requirements-analysis.txt`](requirements-analysis.txt). The full HDF5
 analysis program also requires `bapsflib` and `h5py` for LAPD data access and
-result storage.
+result storage. The graphical interface uses PySide6 (Qt 6).

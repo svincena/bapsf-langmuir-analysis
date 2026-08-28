@@ -3,9 +3,10 @@ import numpy as np
 import pytest
 
 import langmuir_analysis as analysis
+from langmuir_analysis_config import default_parameters
 
 
-def test_main_dispatches_selected_geometry(monkeypatch):
+def test_run_analysis_dispatches_selected_geometry(monkeypatch):
     called = []
     monkeypatch.setattr(
         analysis,
@@ -19,16 +20,27 @@ def test_main_dispatches_selected_geometry(monkeypatch):
     )
 
     for geometry in ("x_line", "xy_plane"):
-        monkeypatch.setattr(analysis, "analysis_geometry", geometry)
-        analysis.main()
+        analysis.run_analysis(geometry, default_parameters(geometry))
 
     assert called == ["x_line", "xy_plane"]
 
 
-def test_main_rejects_unknown_geometry(monkeypatch):
-    monkeypatch.setattr(analysis, "analysis_geometry", "radial")
+def test_run_analysis_rejects_unknown_geometry():
     with pytest.raises(ValueError, match="analysis_geometry"):
-        analysis.main()
+        analysis.run_analysis("radial", {})
+
+
+def test_configure_xy_analysis_derives_spatial_and_shot_shapes():
+    values = default_parameters("xy_plane")
+    configured = analysis.configure_analysis("xy_plane", values)
+
+    assert configured == values
+    assert analysis.x.shape == (values["nx"],)
+    assert analysis.y.shape == (values["ny"],)
+    assert analysis.X.shape == (values["ny"], values["nx"])
+    assert analysis.Y.shape == (values["ny"], values["nx"])
+    assert analysis.nt == (values["sweep_end_index"] - values["sweep_start_index"] + 1)
+    assert analysis.n_expected_shots == (values["ny"] * values["nx"] * values["nshots"])
 
 
 def test_select_xline_from_xy_map_uses_nearest_y_coordinate():

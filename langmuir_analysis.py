@@ -1,16 +1,20 @@
 """Analyze swept Langmuir-probe data along an x line or across an xy plane.
 
-Set ``analysis_geometry`` in the user-controls section to select the complete
-geometry-specific acquisition, post-processing, plotting, and export pipeline.
-The trace-level numerical analysis remains in :mod:`langmuir_analysis_core`.
+Running this module without arguments opens the graphical parameter editor.
+The GUI starts the selected geometry in a separate worker process so its event
+loop stays responsive while data are read, analyzed, plotted, and saved.  The
+trace-level numerical analysis remains in :mod:`langmuir_analysis_core`.
 """
 
 # %% Imports
+import argparse
 import io
 import multiprocessing as mp
+import os
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 import astropy.units as u
 from bapsflib import lapd
@@ -19,312 +23,218 @@ import matplotlib
 import numpy as np
 from scipy.signal import savgol_filter
 
-matplotlib.use("Qt5Agg")
-# matplotlib.use("TkAgg")
+# Keep Matplotlib and the parameter GUI on the same Qt binding.
+os.environ["QT_API"] = "pyside6"
+matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
 
+from langmuir_analysis_config import (
+    SUPPORTED_GEOMETRIES,
+    load_last_parameters,
+    validate_parameters,
+)
 from langmuir_analysis_core import analyze_iv_trace
 from langmuir_diagnostics import (
     render_iv_diagnostic_plot as render_analysis_iv_diagnostic_plot,
 )
 
 
-# %% User controls
-# Select exactly one complete analysis pipeline.
-analysis_geometry = "x_line"  # "x_line" or "xy_plane"
+# %% Runtime configuration
+# Experiment-specific values are supplied by the GUI or a saved parameter file.
+# Keeping them out of this numerical engine makes a run explicit and repeatable.
+analysis_geometry = None
+_SUPPORTED_ANALYSIS_GEOMETRIES = set(SUPPORTED_GEOMETRIES)
+_configured_parameter_values = None
 
-_SUPPORTED_ANALYSIS_GEOMETRIES = {"x_line", "xy_plane"}
-if analysis_geometry not in _SUPPORTED_ANALYSIS_GEOMETRIES:
-    choices = ", ".join(sorted(_SUPPORTED_ANALYSIS_GEOMETRIES))
-    raise ValueError(
-        f"analysis_geometry must be one of {{{choices}}}; "
-        f"got {analysis_geometry!r}."
+# The geometry pipelines predate the GUI and intentionally read module-level
+# runtime values. These placeholders document the names installed atomically by
+# ``configure_analysis`` without reintroducing experiment-specific defaults.
+_RUNTIME_UNCONFIGURED = object()
+filename: Any = _RUNTIME_UNCONFIGURED
+digitizer: Any = _RUNTIME_UNCONFIGURED
+adc: Any = _RUNTIME_UNCONFIGURED
+sis_config_name: Any = _RUNTIME_UNCONFIGURED
+nx: Any = _RUNTIME_UNCONFIGURED
+ny: Any = _RUNTIME_UNCONFIGURED
+nshots: Any = _RUNTIME_UNCONFIGURED
+nt_full: Any = _RUNTIME_UNCONFIGURED
+x_min: Any = _RUNTIME_UNCONFIGURED
+x_max: Any = _RUNTIME_UNCONFIGURED
+y_min: Any = _RUNTIME_UNCONFIGURED
+y_max: Any = _RUNTIME_UNCONFIGURED
+x: Any = _RUNTIME_UNCONFIGURED
+y: Any = _RUNTIME_UNCONFIGURED
+X: Any = _RUNTIME_UNCONFIGURED
+Y: Any = _RUNTIME_UNCONFIGURED
+board: Any = _RUNTIME_UNCONFIGURED
+vsweep_channel: Any = _RUNTIME_UNCONFIGURED
+isweep_channel: Any = _RUNTIME_UNCONFIGURED
+vsweep_attenuation: Any = _RUNTIME_UNCONFIGURED
+isweep_attenuation: Any = _RUNTIME_UNCONFIGURED
+isweep_resistance: Any = _RUNTIME_UNCONFIGURED
+probe_area: Any = _RUNTIME_UNCONFIGURED
+data_offset: Any = _RUNTIME_UNCONFIGURED
+shotnum_start: Any = _RUNTIME_UNCONFIGURED
+shotnum_end: Any = _RUNTIME_UNCONFIGURED
+n_expected_shots: Any = _RUNTIME_UNCONFIGURED
+first_sweep_index: Any = _RUNTIME_UNCONFIGURED
+sweep_start_index: Any = _RUNTIME_UNCONFIGURED
+sweep_end_index: Any = _RUNTIME_UNCONFIGURED
+nt: Any = _RUNTIME_UNCONFIGURED
+isweep_dc_offset_start_index: Any = _RUNTIME_UNCONFIGURED
+isweep_dc_offset_end_index: Any = _RUNTIME_UNCONFIGURED
+isat_start_index: Any = _RUNTIME_UNCONFIGURED
+isat_end_index: Any = _RUNTIME_UNCONFIGURED
+subtract_dc: Any = _RUNTIME_UNCONFIGURED
+sg_smooth_bins: Any = _RUNTIME_UNCONFIGURED
+sg_smooth_order: Any = _RUNTIME_UNCONFIGURED
+current_zero_calibrated: Any = _RUNTIME_UNCONFIGURED
+negate_Isweep_current: Any = _RUNTIME_UNCONFIGURED
+enforce_ideal_model_checks: Any = _RUNTIME_UNCONFIGURED
+iv_npts: Any = _RUNTIME_UNCONFIGURED
+voltage_bin_width: Any = _RUNTIME_UNCONFIGURED
+vp_smoothing: Any = _RUNTIME_UNCONFIGURED
+vp_smoothing_width_V: Any = _RUNTIME_UNCONFIGURED
+vp_savgol_order: Any = _RUNTIME_UNCONFIGURED
+te_min_points: Any = _RUNTIME_UNCONFIGURED
+te_margin_from_vp: Any = _RUNTIME_UNCONFIGURED
+te_current_floor_frac: Any = _RUNTIME_UNCONFIGURED
+te_min_eV: Any = _RUNTIME_UNCONFIGURED
+te_max_eV: Any = _RUNTIME_UNCONFIGURED
+te_min_r2: Any = _RUNTIME_UNCONFIGURED
+ion_min_snr: Any = _RUNTIME_UNCONFIGURED
+te_subtract_i0: Any = _RUNTIME_UNCONFIGURED
+langmuir_analysis_config: Any = _RUNTIME_UNCONFIGURED
+enable_vp_spike_rejection: Any = _RUNTIME_UNCONFIGURED
+vp_spike_half_window: Any = _RUNTIME_UNCONFIGURED
+vp_spike_threshold_V: Any = _RUNTIME_UNCONFIGURED
+vp_replace_flagged_with_local_interp: Any = _RUNTIME_UNCONFIGURED
+vp_replace_flagged_with_local_median: Any = _RUNTIME_UNCONFIGURED
+enable_neighbor_smoothing: Any = _RUNTIME_UNCONFIGURED
+neighbor_smooth_half_window: Any = _RUNTIME_UNCONFIGURED
+neighbor_smooth_sigma: Any = _RUNTIME_UNCONFIGURED
+calculate_shape_factor: Any = _RUNTIME_UNCONFIGURED
+f_microwave: Any = _RUNTIME_UNCONFIGURED
+N_passes: Any = _RUNTIME_UNCONFIGURED
+interferometer_phase: Any = _RUNTIME_UNCONFIGURED
+interferometer_physical_constant: Any = _RUNTIME_UNCONFIGURED
+interferometer_scaling: Any = _RUNTIME_UNCONFIGURED
+interferometer_profile_y_cm: Any = _RUNTIME_UNCONFIGURED
+save_results: Any = _RUNTIME_UNCONFIGURED
+plot_results: Any = _RUNTIME_UNCONFIGURED
+plot_summary_stds: Any = _RUNTIME_UNCONFIGURED
+parallel_analysis: Any = _RUNTIME_UNCONFIGURED
+analysis_processes: Any = _RUNTIME_UNCONFIGURED
+diagnostic_plot_every: Any = _RUNTIME_UNCONFIGURED
+example_pause_seconds: Any = _RUNTIME_UNCONFIGURED
+diagnostic_plot_output_dir: Any = _RUNTIME_UNCONFIGURED
+make_all_iv_diagnostic_plot: Any = _RUNTIME_UNCONFIGURED
+
+
+def configure_analysis(geometry, parameter_values):
+    """Validate GUI values and populate the globals consumed by one pipeline."""
+    if geometry not in _SUPPORTED_ANALYSIS_GEOMETRIES:
+        choices = ", ".join(sorted(_SUPPORTED_ANALYSIS_GEOMETRIES))
+        raise ValueError(
+            f"analysis_geometry must be one of {{{choices}}}; got {geometry!r}."
+        )
+
+    values = validate_parameters(geometry, parameter_values)
+    runtime = dict(values)
+    runtime.update(
+        analysis_geometry=geometry,
+        filename=values["filename"],
+        digitizer=values["digitizer"],
+        adc=values["adc"],
+        sis_config_name=values["sis_config_name"],
+        nx=values["nx"],
+        nshots=values["nshots"],
+        nt_full=values["nt_full"],
+        x_min=values["x_min_cm"],
+        x_max=values["x_max_cm"],
+        x=np.linspace(values["x_min_cm"], values["x_max_cm"], values["nx"]),
+        board=values["board"],
+        vsweep_channel=values["vsweep_channel"],
+        isweep_channel=values["isweep_channel"],
+        vsweep_attenuation=values["vsweep_attenuation"],
+        isweep_attenuation=values["isweep_attenuation"],
+        isweep_resistance=values["isweep_resistance_ohm"],
+        probe_area=values["probe_area_mm2"] * u.mm**2,
+        data_offset=values["data_offset"],
+        sweep_start_index=values["sweep_start_index"],
+        first_sweep_index=values["sweep_start_index"],
+        sweep_end_index=values["sweep_end_index"],
+        nt=values["sweep_end_index"] - values["sweep_start_index"] + 1,
+        isweep_dc_offset_start_index=values["isweep_dc_offset_start_index"],
+        isweep_dc_offset_end_index=values["isweep_dc_offset_end_index"],
+        isat_start_index=values["isat_start_index"],
+        isat_end_index=values["isat_end_index"],
+        diagnostic_plot_output_dir=Path(values["diagnostic_plot_output_dir"]),
+        te_subtract_i0=True,
+        f_microwave=values["f_microwave_GHz"] * u.GHz,
+        N_passes=values["N_passes"],
+        interferometer_phase=values["interferometer_phase_rad"] * u.rad,
+        interferometer_physical_constant=(
+            values["interferometer_physical_constant"] * u.s / u.m**2 / u.rad
+        ),
     )
 
-# Both geometries use the same current interferometer calibration.  The
-# resulting line-integrated electron density has units of m^-2.
-calculate_shape_factor = True
-f_microwave = 288e9 * u.Hz
-N_passes = 2.0
-interferometer_phase = 35 * u.rad
-# This coefficient is 1 / (c * r_e), where c is the speed of light and r_e
-# is the classical electron radius. The explicit /rad cancels the phase unit.
-interferometer_physical_constant = 1.18e6 * u.s / u.m**2 / u.rad
-interferometer_scaling = (
-    interferometer_physical_constant
-    * f_microwave
-    * interferometer_phase
-    / N_passes
-)
+    n_spatial_positions = values["nx"]
+    if geometry == "xy_plane":
+        runtime.update(
+            ny=values["ny"],
+            y_min=values["y_min_cm"],
+            y_max=values["y_max_cm"],
+            y=np.linspace(values["y_min_cm"], values["y_max_cm"], values["ny"]),
+        )
+        runtime["X"], runtime["Y"] = np.meshgrid(
+            runtime["x"], runtime["y"], indexing="xy"
+        )
+        n_spatial_positions *= values["ny"]
 
-if analysis_geometry == "x_line":
-    save_results = True
-    plot_results = True
-
-    # Draw shot-to-shot +/-1 sigma error bars when more than one shot is available.
-    plot_summary_stds = True
-
-    # The first 128 samples provide a plasma-off electronics baseline, independent
-    # of the later I-V sweep.  Do not replace this with low-bias sweep samples;
-    # doing so would erase the physical ion current and bias Vf.
-    subtract_dc = False
-    current_zero_calibrated = True
-    # Set this to match the current polarity from the acquisition electronics. The
-    # analysis expects negative ion current and positive electron current.
-    negate_Isweep_current = True
-
-    # Real probe saturation branches are normally sloped. Keep ideal planar-
-    # Maxwellian consistency checks as diagnostics instead of rejecting good data.
-    enforce_ideal_model_checks = False
-
-    # Use multiprocessing to analyze independent traces in parallel.
-    parallel_analysis = True
-    analysis_processes = None  # None uses one fewer than the detected CPU count
-
-    filename = '/Users/vincena/data/Mini_Magnetospheres/August2026/run_06_langmuir_xline_dipole_removed 2026-08-26 09.33.06.hdf5'
-    # digitizer = "SIS 3301" # for 3301, this is also the name of the adc
-    # adc = "SIS 3301" #8-channel 14-bit 100 MS/s digitizer
-    adc = "SIS 3302" #8-channel 16-bit 100 MS/s digitizer
-    digitizer = "SIS crate"
-    sis_config_name = "Isat_Isweep_Vsweep_282624S_50MHz"
-
-
-    nshots = 5
-    nt_full = 282_624
-
-    nx = 81
-    x_min = -37.5
-    x_max = 37.5
-    x = np.linspace(x_min, x_max, nx)
-
-    board = 2
-    vsweep_channel = 3
-    isweep_channel = 2
-
-    vsweep_attenuation = 100.0
-    isweep_attenuation = 1.0 #4.0
-    isweep_resistance = 3.1 #1.0
-    probe_area = 4.0 * u.mm**2
-
-
-
-    # data_offset used if, say, skipping half the data where 2 probes move but only
-    # one at a time and half the data is being taken on a probe when it's sitting at
-    # the start or end of its motion list
-    data_offset = 0
-
-    shotnum_start = data_offset + 1
-    shotnum_end = nx * nshots + shotnum_start   # exclusive upper bound in slice(...)
-    n_expected_shots = shotnum_end - shotnum_start
-
-
-    first_sweep_index = 5010
-    sweep_start_index = first_sweep_index
-    sweep_end_index = 15000
-    nt = sweep_end_index - sweep_start_index + 1
-
-    isweep_dc_offset_start_index = 0
-    isweep_dc_offset_end_index = 127
-
-    isat_start_index = 0
-    isat_end_index = 127
-
-    # Smoothing along original time-ordered sweep
-    # sg_smooth_bins = 8
-    # sg_smooth_order = 1
-    sg_smooth_bins = 32
-    sg_smooth_order = 2
-
-
-    # Example diagnostic plot controls
-    diagnostic_plot_every = 2       # make an IV diagnostic plot every N x indices; 0 disables these plots
-    example_pause_seconds = 1.0
-    diagnostic_plot_output_dir = Path("output_diagnostic_plots")
-
-    # Interpolated monotonic I-V grid parameters
-    iv_npts = 2048
-    voltage_bin_width = 0.05  # volts; merges near-duplicate voltages before interpolation
-
-    # Derivative smoothing is specified in volts and therefore does not change when
-    # the fixed-size diagnostic grid resolution changes.
-    vp_smoothing = "savgol"
-    vp_smoothing_width_V = 2.5
-    vp_savgol_order = 2
-
-    # One Maxwellian fit on independent voltage-bin means.
-    te_min_points = 12
-    te_margin_from_vp = 0.2  # volts
-    te_current_floor_frac = 0.03
-    te_min_eV = 0.05
-    te_max_eV = 20.0
-    te_min_r2 = 0.98
-    # Uses autocorrelation-adjusted uncertainty of the regional median, not the
-    # point-to-point residual scatter.
-    ion_min_snr = 3.0
-    te_subtract_i0 = True  # legacy export name; I0 is now the median ion-region current
-
-    langmuir_analysis_config = {
-        "iv_npts": iv_npts,
-        "voltage_bin_width": voltage_bin_width,
-        "vp_smoothing": vp_smoothing,
-        "vp_smoothing_width_V": vp_smoothing_width_V,
-        "vp_savgol_order": vp_savgol_order,
-        "te_min_points": te_min_points,
-        "te_margin_from_vp": te_margin_from_vp,
-        "te_current_floor_frac": te_current_floor_frac,
-        "te_min_eV": te_min_eV,
-        "te_max_eV": te_max_eV,
-        "te_min_r2": te_min_r2,
-        "ion_min_snr": ion_min_snr,
-        "probe_area": probe_area,
-        "current_zero_calibrated": current_zero_calibrated,
-        "enforce_ideal_model_checks": enforce_ideal_model_checks,
+    runtime["shotnum_start"] = values["data_offset"] + 1
+    runtime["shotnum_end"] = (
+        runtime["shotnum_start"] + n_spatial_positions * values["nshots"]
+    )
+    runtime["n_expected_shots"] = (
+        runtime["shotnum_end"] - runtime["shotnum_start"]
+    )
+    runtime["interferometer_scaling"] = (
+        runtime["interferometer_physical_constant"]
+        * runtime["f_microwave"]
+        * runtime["interferometer_phase"]
+        / runtime["N_passes"]
+    )
+    runtime["langmuir_analysis_config"] = {
+        "iv_npts": values["iv_npts"],
+        "voltage_bin_width": values["voltage_bin_width"],
+        "vp_smoothing": values["vp_smoothing"],
+        "vp_smoothing_width_V": values["vp_smoothing_width_V"],
+        "vp_savgol_order": values["vp_savgol_order"],
+        "te_min_points": values["te_min_points"],
+        "te_margin_from_vp": values["te_margin_from_vp"],
+        "te_current_floor_frac": values["te_current_floor_frac"],
+        "te_min_eV": values["te_min_eV"],
+        "te_max_eV": values["te_max_eV"],
+        "te_min_r2": values["te_min_r2"],
+        "ion_min_snr": values["ion_min_snr"],
+        "probe_area": runtime["probe_area"],
+        "current_zero_calibrated": values["current_zero_calibrated"],
+        "enforce_ideal_model_checks": values["enforce_ideal_model_checks"],
     }
+    runtime["_configured_parameter_values"] = values
+    globals().update(runtime)
+    return values
 
-    # Optional post-processing controls along x
-    enable_vp_spike_rejection = True
-    vp_spike_half_window = 2          # neighbors on each side for local median
-    vp_spike_threshold_V = 5.0        # flag if |Vp - local median| exceeds this
-    vp_replace_flagged_with_local_interp = True
 
-    enable_neighbor_smoothing = True
-    neighbor_smooth_half_window = 1   # 1 means 3-point neighborhood, 2 means 5-point
-    neighbor_smooth_sigma = 1.0       # gaussian-like weighting in index space
-
-    make_all_iv_diagnostic_plot = True
-
-else:  # analysis_geometry == "xy_plane"
-    save_results = True
-    plot_results = True
-    # Only enable with an independently measured plasma-off electronics baseline.
-    # Using sweep samples would erase physical current and bias Vf and Iis.
-    subtract_dc = False
-    # Set True only when the sweep current has an independently established zero.
-    current_zero_calibrated = False
-    # Set this to match the current polarity from the acquisition electronics. The
-    # analysis expects negative ion current and positive electron current.
-    negate_Isweep_current = True
-    # Real probe saturation branches are normally sloped. Keep ideal planar-
-    # Maxwellian consistency checks as diagnostics instead of rejecting good data.
-    enforce_ideal_model_checks = False
-    parallel_analysis = True
-    analysis_processes = None  # None uses one fewer than the detected CPU count
-
-    # Use the measured x-line nearest this y location to calculate the profile
-    # shape factor that calibrates the complete xy density map.
-    interferometer_profile_y_cm = 0.0
-
-    filename ="/Users/vincena/data/Gekelman/Sparse_Alfven/Vp_p25_then_Lang_p35 2026-02-11 16.59.11.hdf5"
-    #filename = "/Users/vincena/data/Gekelman/Sparse_Alfven/Vp_p30_then_Lang_p15 2026-02-14 14.13.18.hdf5"
-    # filename = "/Users/vincena/data/Gekelman/Sparse_Alfven/Vp_p35_then_Lang_p25_take2 2026-02-13 10.30.51.hdf5"
-    digitizer = "SIS crate"
-    adc = "SIS 3302"
-
-    i = filename.find("Vp_p")
-    value = int(filename[i + len("Vp_p")]) if i != -1 else None
-    if value == 2:
-        sis_config_name = "64kS_100MHz_div_32__Lang_longtime"
-    else:
-        sis_config_name = "65kS_Langmuir_and_16kS_antenna_currents"
-
-    nx=31
-    ny=31
-    nshots = 8
-    nt_full = 65536
-
-    board = 4
-    vsweep_channel = 4
-    isweep_channel = 5
-
-    vsweep_attenuation = 100.0
-    isweep_attenuation = 4.0
-    isweep_resistance = 1.0
-    probe_area = 4.0 * u.mm**2  # effective probe area for current density calculations; adjust as needed
-
-    x = np.linspace(-15.0, 15.0, nx)
-    y = np.linspace(-15.0, 15.0, ny)
-    X, Y = np.meshgrid(x, y, indexing="xy")
-
-    # data_offset used if, say, skipping half the data where 2 probes move but only
-    # one at a time and half the data is being taken on a probe when it's sitting at
-    # the start or end of its motion list
-    data_offset = nx*ny*nshots # offset beyond the VP plane data to get to the Langmuir plane data
-
-    shotnum_start = data_offset + 1
-    shotnum_end = ny * nx * nshots + shotnum_start   # exclusive upper bound in slice(...)
-    n_expected_shots = shotnum_end - shotnum_start
-
-    first_sweep_index = 950  # index of the first sample in the sweep portion of the trace; adjust if needed based on oscilloscope timing and sweep shape
-    sweep_start_index = first_sweep_index
-    sweep_end_index = first_sweep_index + 1450
-    nt = sweep_end_index - sweep_start_index + 1
-
-    isweep_dc_offset_start_index = 64000#first_sweep_index
-    isweep_dc_offset_end_index = isweep_dc_offset_start_index + 1024 - 1
-
-    isat_start_index = 0
-    isat_end_index = 127
-
-    # Smoothing along original time-ordered sweep
-    sg_smooth_bins = 17
-    sg_smooth_order = 1
-
-    # Example diagnostic plot controls
-    diagnostic_plot_every = nx*nshots     # make an IV diagnostic plot every N trace indices; 0 disables these plots
-    example_pause_seconds = 1.0
-    diagnostic_plot_output_dir = Path("output_diagnostic_plots")
-
-    # Interpolated monotonic I-V grid parameters
-    iv_npts = 512
-    voltage_bin_width = 0.01  # volts; merges near-duplicate voltages before interpolation
-
-    # Derivative smoothing is specified in volts and is independent of the fixed
-    # diagnostic-grid resolution.
-    vp_smoothing = "savgol"
-    vp_smoothing_width_V = 2.5
-    vp_savgol_order = 2
-
-    # One Maxwellian fit on independent voltage-bin means.
-    te_min_points = 12
-    te_margin_from_vp = 1.0  # volts; require this much margin between the plasma potential and the nearest fit point
-    te_current_floor_frac = 0.075  # exclude points where the current is less than this fraction of the electron saturation current
-    te_min_eV = 0.1
-    te_max_eV = 30.0
-    te_min_r2 = 0.975
-    # Uses autocorrelation-adjusted uncertainty of the regional median, not the
-    # point-to-point residual scatter.
-    ion_min_snr = 3.0
-    te_subtract_i0 = True  # legacy export name; I0 is now the median ion-region current
-
-    langmuir_analysis_config = {
-        "iv_npts": iv_npts,
-        "voltage_bin_width": voltage_bin_width,
-        "vp_smoothing": vp_smoothing,
-        "vp_smoothing_width_V": vp_smoothing_width_V,
-        "vp_savgol_order": vp_savgol_order,
-        "te_min_points": te_min_points,
-        "te_margin_from_vp": te_margin_from_vp,
-        "te_current_floor_frac": te_current_floor_frac,
-        "te_min_eV": te_min_eV,
-        "te_max_eV": te_max_eV,
-        "te_min_r2": te_min_r2,
-        "ion_min_snr": ion_min_snr,
-        "probe_area": probe_area,
-        "current_zero_calibrated": current_zero_calibrated,
-        "enforce_ideal_model_checks": enforce_ideal_model_checks,
-    }
-
-    # Optional post-processing controls on 2D maps
-    enable_vp_spike_rejection = True
-    vp_spike_half_window = (1, 1)     # neighbors on each side in (y, x) for local median
-    vp_spike_threshold_V = 5.0        # flag if |Vp - local median| exceeds this
-    vp_replace_flagged_with_local_median = True
-
-    enable_neighbor_smoothing = True
-    neighbor_smooth_half_window = (1, 1)  # 1 means 3-point neighborhood in that dimension
-    neighbor_smooth_sigma = 2.0       # gaussian-like weighting in index space
-
-    make_all_iv_diagnostic_plot = True
+def run_analysis(geometry, parameter_values):
+    """Configure and run exactly one geometry-specific analysis pipeline."""
+    configure_analysis(geometry, parameter_values)
+    if geometry == "x_line":
+        return run_xline_analysis()
+    if geometry == "xy_plane":
+        return run_xy_analysis()
+    raise AssertionError("Geometry validation did not reject an invalid value.")
 
 
 def shot_mean_and_std(values, valid_mask=None):
@@ -3408,18 +3318,39 @@ def run_xy_analysis():
     # %%
 
 
-def main():
-    """Run the analysis pipeline selected by ``analysis_geometry``."""
-    if analysis_geometry == "x_line":
-        run_xline_analysis()
-    elif analysis_geometry == "xy_plane":
-        run_xy_analysis()
-    else:
-        choices = ", ".join(sorted(_SUPPORTED_ANALYSIS_GEOMETRIES))
-        raise ValueError(
-            f"analysis_geometry must be one of {{{choices}}}; "
-            f"got {analysis_geometry!r}."
+def _build_argument_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--run-parameters",
+        metavar="FILE",
+        help="Run one saved GUI configuration instead of opening the GUI.",
+    )
+    parser.add_argument(
+        "--geometry",
+        choices=SUPPORTED_GEOMETRIES,
+        help="Geometry to run with --run-parameters.",
+    )
+    return parser
+
+
+def main(argv=None):
+    """Open the GUI, or execute the private saved-parameter worker mode."""
+    arguments = _build_argument_parser().parse_args(argv)
+    if arguments.run_parameters:
+        if arguments.geometry is None:
+            raise SystemExit("--geometry is required with --run-parameters")
+        parameters, _active_geometry, warning = load_last_parameters(
+            arguments.run_parameters
         )
+        if warning:
+            raise SystemExit(warning)
+        return run_analysis(arguments.geometry, parameters[arguments.geometry])
+
+    if arguments.geometry is not None:
+        raise SystemExit("--geometry can only be used with --run-parameters")
+    from langmuir_analysis_gui import launch_gui
+
+    return launch_gui()
 
 
 if __name__ == "__main__":
