@@ -431,6 +431,14 @@ def _sections_for_geometry(geometry):
                     "Reject sloped saturation branches and other deviations instead of recording model notes.",
                 ),
                 _p(
+                    "ies_method",
+                    "Ies estimation method",
+                    "choice",
+                    "high_bias_median",
+                    "Use the legacy high-bias regional median or the ion-subtracted electron current at derivative Vp.",
+                    choices=("high_bias_median", "at_vp"),
+                ),
+                _p(
                     "iv_npts",
                     "Diagnostic I–V points",
                     "int",

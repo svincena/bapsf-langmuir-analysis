@@ -77,6 +77,57 @@ def test_ideal_trace_recovers_physical_parameters():
     assert result["n_e_m3"] == pytest.approx(truth["n_e_m3"], rel=0.05)
 
 
+def test_ies_method_selects_high_bias_median_or_electron_current_at_vp():
+    voltage, current, truth = _ideal_trace()
+    ideal_electron_current = truth["ies_A"] * np.where(
+        voltage <= truth["vp_V"],
+        np.exp((voltage - truth["vp_V"]) / truth["te_eV"]),
+        1.0,
+    )
+    ion_current = current - ideal_electron_current
+    expanding_sheath_current = np.where(
+        voltage <= truth["vp_V"],
+        ideal_electron_current,
+        truth["ies_A"] * (1.0 + 0.06 * (voltage - truth["vp_V"])),
+    )
+    measured_current = ion_current + expanding_sheath_current
+
+    high_bias = analyze_iv_trace(
+        voltage,
+        measured_current,
+        _config(ies_method="high_bias_median"),
+        include_diagnostic_data=True,
+    )
+    at_vp = analyze_iv_trace(
+        voltage,
+        measured_current,
+        _config(ies_method="at_vp"),
+        include_diagnostic_data=True,
+    )
+
+    assert high_bias["ok"] and at_vp["ok"]
+    assert high_bias["ies_method"] == "high_bias_median"
+    assert at_vp["ies_method"] == "at_vp"
+
+    high_bias_data = high_bias["diagnostic_data"]
+    cutoff = high_bias["vp_derivative_V"] + 0.5 * (
+        high_bias_data["V_binned"][-1] - high_bias["vp_derivative_V"]
+    )
+    expected_high_bias = np.median(
+        high_bias_data["I_binned"][high_bias_data["V_binned"] >= cutoff]
+    )
+    assert high_bias["ies_A"] == pytest.approx(expected_high_bias)
+
+    at_vp_data = at_vp["diagnostic_data"]
+    expected_at_vp = np.interp(
+        at_vp["vp_derivative_V"],
+        at_vp_data["V_binned"],
+        at_vp_data["I_binned"] - at_vp["ion_current_A"],
+    )
+    assert at_vp["ies_A"] == pytest.approx(expected_at_vp)
+    assert high_bias["ies_A"] > 1.3 * at_vp["ies_A"]
+
+
 def test_ion_background_does_not_change_electron_solution():
     voltage_a, current_a, _ = _ideal_trace(ion_current_A=-1e-4)
     voltage_b, current_b, _ = _ideal_trace(ion_current_A=-5e-4)
@@ -184,6 +235,7 @@ def test_density_value_and_equivalent_units():
         (np.ones((2, 5)), np.ones((2, 5)), _config()),
         (np.arange(10.0), np.arange(10.0), _config(voltage_bin_width=0)),
         (np.arange(10.0), np.arange(10.0), _config(unknown_option=True)),
+        (np.arange(10.0), np.arange(10.0), _config(ies_method="unknown")),
         (np.arange(10.0), np.arange(10.0), _config(probe_area=-1.0)),
         (np.arange(10.0), np.arange(10.0), _config(probe_area=4 * u.mm)),
     ],

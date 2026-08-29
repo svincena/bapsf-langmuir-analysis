@@ -20,6 +20,10 @@ def build_iv_diagnostic_summary(result):
         else:
             summary.append(f"{label} = NaN")
 
+    ies_method = result.get("ies_method")
+    if ies_method:
+        summary.append(f"I_es method = {ies_method}")
+
     r2 = result.get("te_fit_r2", np.nan)
     rel_uncertainty = result.get("te_fit_relative_uncertainty", np.nan)
     summary.extend(

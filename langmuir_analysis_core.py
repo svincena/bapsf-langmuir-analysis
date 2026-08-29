@@ -31,6 +31,7 @@ _TE_MAX_CURVATURE_LOG = 0.05
 _TE_CURVATURE_SIGNIFICANCE = 3.0
 _ELECTRON_SIGNAL_TO_NOISE = 5.0
 _MAX_REVERSE_SWEEP_FRACTION = 0.05
+_IES_METHODS = {"high_bias_median", "at_vp"}
 
 
 _DEFAULT_CONFIG = {
@@ -39,6 +40,7 @@ _DEFAULT_CONFIG = {
     "vp_smoothing": "savgol",
     "vp_smoothing_width_V": 2.5,
     "vp_savgol_order": 2,
+    "ies_method": "high_bias_median",
     "te_min_points": 8,
     "te_margin_from_vp": 0.2,
     "te_current_floor_frac": 0.03,
@@ -197,6 +199,12 @@ def _validated_config(config):
     if smoothing not in {"none", "moving", "savgol"}:
         raise ValueError("vp_smoothing must be None, 'moving', or 'savgol'.")
     cfg["vp_smoothing"] = smoothing
+
+    ies_method = str(cfg["ies_method"]).lower()
+    if ies_method not in _IES_METHODS:
+        choices = ", ".join(sorted(_IES_METHODS))
+        raise ValueError(f"ies_method must be one of: {choices}.")
+    cfg["ies_method"] = ies_method
     return cfg
 
 
@@ -493,11 +501,38 @@ def _estimate_ion_current(voltage, current, vf, enforce_flatness=False):
 def _estimate_electron_saturation_current(
     V,
     measured_current,
+    electron_current,
     vp,
     ion_noise,
+    method="high_bias_median",
     enforce_flatness=False,
 ):
-    """Estimate electron saturation from the high-bias collection region."""
+    """Estimate electron saturation at Vp or from the high-bias region."""
+    if method == "at_vp":
+        saturation_current = float(np.interp(vp, V, electron_current))
+        if not np.isfinite(saturation_current) or saturation_current <= 0:
+            return (
+                None,
+                "electron current at the plasma potential is not finite and positive",
+            )
+        if saturation_current < _ELECTRON_SIGNAL_TO_NOISE * ion_noise:
+            return (
+                None,
+                "electron current at the plasma potential is not resolved above ion noise",
+            )
+        return {
+            "current_A": saturation_current,
+            "noise_A": np.nan,
+            "slope_A_per_V": np.nan,
+            "trend_span_A": np.nan,
+            "trend_fraction": np.nan,
+            "trend_exceeds_limit": False,
+            "mask": np.zeros(V.shape, dtype=bool),
+        }, None
+
+    if method != "high_bias_median":
+        raise ValueError(f"Unknown electron-saturation method {method!r}.")
+
     cutoff = vp + 0.5 * (V[-1] - vp)
     mask = np.isfinite(V) & np.isfinite(measured_current) & (V >= cutoff)
     if np.count_nonzero(mask) < _ION_MIN_POINTS:
@@ -678,6 +713,7 @@ def _empty_result(trace_label):
         "vp_derivative_V": np.nan,
         "vf_V": np.nan,
         "ies_A": np.nan,
+        "ies_method": None,
         "iis_A": np.nan,
         "n_e_m3": np.nan,
         "ion_current_A": np.nan,
@@ -735,6 +771,7 @@ def analyze_iv_trace(
     """
     cfg = _validated_config(config)
     result = _empty_result(trace_label)
+    result["ies_method"] = cfg["ies_method"]
     bias, current = _validate_trace_arrays(bias_values, current_values)
 
     if not _sweep_direction_is_valid(bias, cfg["voltage_bin_width"]):
@@ -876,8 +913,10 @@ def analyze_iv_trace(
     electron_saturation, saturation_error = _estimate_electron_saturation_current(
         Vb,
         Ib,
+        electron_current,
         vp_value,
         ion["noise_A"],
+        method=cfg["ies_method"],
         enforce_flatness=cfg["enforce_ideal_model_checks"],
     )
     if electron_saturation is None:

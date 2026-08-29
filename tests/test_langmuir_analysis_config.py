@@ -71,3 +71,15 @@ def test_cross_field_validation_rejects_invalid_sweep():
 
     with pytest.raises(ValueError, match="smaller than samples per trace"):
         validate_parameters("x_line", values)
+
+
+def test_ies_method_is_selectable_and_validated():
+    values = default_parameters("x_line")
+    assert values["ies_method"] == "high_bias_median"
+
+    values["ies_method"] = "at_vp"
+    assert validate_parameters("x_line", values)["ies_method"] == "at_vp"
+
+    values["ies_method"] = "unsupported"
+    with pytest.raises(ValueError, match="Ies estimation method"):
+        validate_parameters("x_line", values)

@@ -96,6 +96,7 @@ voltage_bin_width: Any = _RUNTIME_UNCONFIGURED
 vp_smoothing: Any = _RUNTIME_UNCONFIGURED
 vp_smoothing_width_V: Any = _RUNTIME_UNCONFIGURED
 vp_savgol_order: Any = _RUNTIME_UNCONFIGURED
+ies_method: Any = _RUNTIME_UNCONFIGURED
 te_min_points: Any = _RUNTIME_UNCONFIGURED
 te_margin_from_vp: Any = _RUNTIME_UNCONFIGURED
 te_current_floor_frac: Any = _RUNTIME_UNCONFIGURED
@@ -211,6 +212,7 @@ def configure_analysis(geometry, parameter_values):
         "vp_smoothing": values["vp_smoothing"],
         "vp_smoothing_width_V": values["vp_smoothing_width_V"],
         "vp_savgol_order": values["vp_savgol_order"],
+        "ies_method": values["ies_method"],
         "te_min_points": values["te_min_points"],
         "te_margin_from_vp": values["te_margin_from_vp"],
         "te_current_floor_frac": values["te_current_floor_frac"],
@@ -235,6 +237,18 @@ def run_analysis(geometry, parameter_values):
     if geometry == "xy_plane":
         return run_xy_analysis()
     raise AssertionError("Geometry validation did not reject an invalid value.")
+
+
+def describe_ies_method(method):
+    """Return the persisted human-readable definition of an Ies method."""
+    if method == "at_vp":
+        return "ion-subtracted electron current interpolated at derivative Vp"
+    if method == "high_bias_median":
+        return (
+            "median measured current in the upper half of the "
+            "Vp-to-maximum-bias interval"
+        )
+    raise ValueError(f"Unknown Ies method {method!r}.")
 
 
 def shot_mean_and_std(values, valid_mask=None):
@@ -2149,6 +2163,8 @@ def run_xline_analysis():
             grp.attrs["vp_smoothing"] = "none" if vp_smoothing is None else str(vp_smoothing)
             grp.attrs["vp_smoothing_width_V"] = vp_smoothing_width_V
             grp.attrs["vp_savgol_order"] = vp_savgol_order
+            grp.attrs["ies_method"] = ies_method
+            grp.attrs["ies_definition"] = describe_ies_method(ies_method)
             grp.attrs["parallel_analysis"] = int(parallel_analysis)
             grp.attrs["analysis_processes_requested"] = (
                 -1 if analysis_processes is None else int(analysis_processes)
@@ -2165,8 +2181,8 @@ def run_xline_analysis():
             grp.attrs["te_min_r2"] = te_min_r2
             grp.attrs["ion_min_snr"] = ion_min_snr
             grp.attrs["analysis_model"] = (
-                "single-temperature semilog fit; median low-bias ion and high-bias "
-                "electron-saturation region estimates"
+                "single-temperature semilog fit; median low-bias ion estimate; "
+                + describe_ies_method(ies_method)
             )
             grp.attrs["te_fit_i0_definition"] = "median low-bias ion-region current"
             grp.attrs["iv_npts_role"] = "fixed-size diagnostics only"
@@ -2316,9 +2332,11 @@ def run_xline_analysis():
             "dt_s": np.array(dt),
             "te_min_r2": np.array(te_min_r2),
             "ion_min_snr": np.array(ion_min_snr),
+            "ies_method": np.array(ies_method),
+            "ies_definition": np.array(describe_ies_method(ies_method)),
             "analysis_model": np.array(
-                "single-temperature semilog fit; median low-bias ion and high-bias "
-                "electron-saturation region estimates"
+                "single-temperature semilog fit; median low-bias ion estimate; "
+                + describe_ies_method(ies_method)
             ),
             "te_fit_i0_definition": np.array("median low-bias ion-region current"),
             "iv_npts_role": np.array("fixed-size diagnostics only"),
@@ -3105,6 +3123,8 @@ def run_xy_analysis():
             grp.attrs["vp_smoothing"] = "none" if vp_smoothing is None else str(vp_smoothing)
             grp.attrs["vp_smoothing_width_V"] = vp_smoothing_width_V
             grp.attrs["vp_savgol_order"] = vp_savgol_order
+            grp.attrs["ies_method"] = ies_method
+            grp.attrs["ies_definition"] = describe_ies_method(ies_method)
             grp.attrs["parallel_analysis"] = int(parallel_analysis)
             grp.attrs["analysis_processes_requested"] = (
                 -1 if analysis_processes is None else int(analysis_processes)
@@ -3121,8 +3141,8 @@ def run_xy_analysis():
             grp.attrs["te_min_r2"] = te_min_r2
             grp.attrs["ion_min_snr"] = ion_min_snr
             grp.attrs["analysis_model"] = (
-                "single-temperature semilog fit; median low-bias ion and high-bias "
-                "electron-saturation region estimates"
+                "single-temperature semilog fit; median low-bias ion estimate; "
+                + describe_ies_method(ies_method)
             )
             grp.attrs["te_fit_i0_definition"] = "median low-bias ion-region current"
             grp.attrs["iv_npts_role"] = "fixed-size diagnostics only"
@@ -3290,9 +3310,11 @@ def run_xy_analysis():
             "dt_s": np.array(dt),
             "te_min_r2": np.array(te_min_r2),
             "ion_min_snr": np.array(ion_min_snr),
+            "ies_method": np.array(ies_method),
+            "ies_definition": np.array(describe_ies_method(ies_method)),
             "analysis_model": np.array(
-                "single-temperature semilog fit; median low-bias ion and high-bias "
-                "electron-saturation region estimates"
+                "single-temperature semilog fit; median low-bias ion estimate; "
+                + describe_ies_method(ies_method)
             ),
             "te_fit_i0_definition": np.array("median low-bias ion-region current"),
             "iv_npts_role": np.array("fixed-size diagnostics only"),

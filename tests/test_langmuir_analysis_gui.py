@@ -29,6 +29,10 @@ def test_gui_has_one_fully_populated_tab_per_geometry(
     assert "interferometer_profile_y_cm" in window.parameter_tabs["xy_plane"].values()
 
     xline_tab = window.parameter_tabs["x_line"]
+    assert xline_tab.values()["ies_method"] == "high_bias_median"
+    xline_tab.set_values({"ies_method": "at_vp"})
+    assert xline_tab.values()["ies_method"] == "at_vp"
+    assert "plasma potential" in xline_tab.editors["ies_method"].currentText()
     assert not xline_tab.editors["isweep_dc_offset_start_index"].isEnabled()
     xline_tab.editors["subtract_dc"].setChecked(True)
     assert xline_tab.editors["isweep_dc_offset_start_index"].isEnabled()

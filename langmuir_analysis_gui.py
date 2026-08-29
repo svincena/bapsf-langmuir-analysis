@@ -23,6 +23,11 @@ GEOMETRY_TITLES = {
     "xy_plane": "XY-plane scan",
 }
 
+CHOICE_LABELS = {
+    "high_bias_median": "High-bias regional median",
+    "at_vp": "At plasma potential (ion-subtracted)",
+}
+
 
 STYLE_SHEET = """
 QWidget {
@@ -230,8 +235,9 @@ def _make_editor(spec):
         editor.setGroupSeparatorShown(True)
     elif spec.kind == "choice":
         editor = QtWidgets.QComboBox()
-        editor.addItems(spec.choices)
-        editor.setCurrentText(str(spec.default))
+        for choice in spec.choices:
+            editor.addItem(CHOICE_LABELS.get(choice, choice), choice)
+        editor.setCurrentIndex(editor.findData(str(spec.default)))
     elif spec.kind in {"file", "directory"}:
         editor = PathEditor(spec.default, directory=spec.kind == "directory")
     elif spec.kind == "int_pair":
@@ -253,7 +259,7 @@ def _editor_value(editor, spec):
     if spec.kind in {"int", "float"}:
         return editor.value()
     if spec.kind == "choice":
-        return editor.currentText()
+        return editor.currentData()
     return editor.text().strip()
 
 
@@ -269,7 +275,7 @@ def _set_editor_value(editor, spec, value):
     elif spec.kind == "float":
         editor.setValue(float(value))
     elif spec.kind == "choice":
-        editor.setCurrentText(str(value))
+        editor.setCurrentIndex(editor.findData(str(value)))
     else:
         editor.setText(str(value))
 

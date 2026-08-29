@@ -78,11 +78,40 @@ curve and estimates:
 - Plasma potential, `Vp`, primarily from the peak in `dI/dV`, with a fitted
   retarding-branch estimate retained as a consistency diagnostic.
 - Ion saturation current, `Iis`, from the low-bias ion region.
-- Electron saturation current, `Ies`, from the high-bias electron region.
+- Electron saturation current, `Ies`, using the selected plasma-potential or
+  high-bias method described below.
 - Electron temperature, `Te`, from a single-temperature semilog fit to the
   electron-retarding branch after subtracting the measured ion-region current.
 - Electron density, `n_e`, from the planar Maxwellian electron-saturation
   current relation using the configured probe area.
+
+#### Electron-saturation current methods
+
+The **Ies estimation method** control provides two definitions. The selected
+`Ies` is also used by the electron-temperature fit thresholds, the fitted-`Vp`
+consistency diagnostic, and the electron-density calculation.
+
+- **At plasma potential (ion-subtracted)** (`at_vp`) subtracts the median
+  low-bias ion-region current from the binned measured current, then linearly
+  interpolates that electron current at the derivative-based `Vp` found from
+  the `dI/dV` peak. This method does not assume that the positive-bias branch
+  reaches a flat plateau. It is therefore less susceptible to an increasing
+  collection area caused by sheath expansion, but it is more sensitive to the
+  accuracy of the local `Vp`, ion-current, and current measurements.
+- **High-bias regional median** (`high_bias_median`) is the original method and
+  remains the default for backward-compatible results. It selects binned
+  points satisfying
+  `V >= Vp + 0.5 * (Vmax - Vp)` and uses their median measured current. The
+  regional median is resistant to point noise, but interpreting it as `Ies`
+  assumes that this part of the electron branch is effectively saturated. If
+  sheath expansion makes current continue to rise above `Vp`, this method will
+  generally return a larger `Ies` and consequently a larger inferred density
+  than the `at_vp` method.
+
+The two definitions coincide only when the ion-subtracted electron current at
+`Vp` is equal to a flat high-bias saturation level. Saved HDF5 and NPZ results
+record both `ies_method` and a human-readable `ies_definition` so the choice is
+not ambiguous during later analysis.
 
 The solver records fit quality, uncertainties, model-consistency notes, and
 rejection reasons. Finite estimates may be retained for diagnosis even when a
