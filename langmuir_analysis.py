@@ -6,6 +6,17 @@ loop stays responsive while data are read, analyzed, plotted, and saved.  The
 trace-level numerical analysis remains in :mod:`langmuir_analysis_core`.
 """
 
+# The documented no-argument desktop launch takes this lightweight path before
+# importing Astropy, SciPy, Matplotlib, bapsflib, and the numerical pipelines.
+# Worker/CLI invocations continue below and load the full analysis environment.
+if __name__ == "__main__":
+    import sys as _startup_sys
+
+    if len(_startup_sys.argv) == 1:
+        from langmuir_analysis_gui import launch_gui as _launch_gui_immediately
+
+        raise SystemExit(_launch_gui_immediately())
+
 # %% Imports
 import argparse
 import io

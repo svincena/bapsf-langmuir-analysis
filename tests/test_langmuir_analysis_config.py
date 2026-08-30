@@ -26,6 +26,35 @@ def test_defaults_are_complete_and_valid(geometry):
     assert validate_parameters(geometry, defaults) == defaults
 
 
+@pytest.mark.parametrize(
+    ("geometry", "spatial_keys"),
+    (
+        ("x_line", ("nx", "x_min_cm", "x_max_cm")),
+        (
+            "xy_plane",
+            ("nx", "x_min_cm", "x_max_cm", "ny", "y_min_cm", "y_max_cm"),
+        ),
+    ),
+)
+def test_spatial_and_acquisition_geometry_are_separate_adjacent_sections(
+    geometry, spatial_keys
+):
+    sections = PARAMETER_SECTIONS[geometry]
+    titles = tuple(section.title for section in sections)
+    spatial_index = titles.index("Spatial geometry")
+    acquisition_index = titles.index("Acquisition geometry")
+
+    assert "Scan geometry" not in titles
+    assert acquisition_index == spatial_index + 1
+    assert tuple(
+        parameter.key for parameter in sections[spatial_index].parameters
+    ) == spatial_keys
+    assert tuple(
+        parameter.key for parameter in sections[acquisition_index].parameters
+    ) == ("nshots", "nt_full", "data_offset")
+    assert sections[acquisition_index].stack_with_previous
+
+
 def test_parameter_file_round_trip_preserves_both_tabs(tmp_path):
     path = tmp_path / "last_parameters.json"
     parameters = {

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 import sys
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 
 from langmuir_analysis_config import (
     LAST_PARAMETERS_PATH,
@@ -29,10 +30,401 @@ CHOICE_LABELS = {
 }
 
 
+SPLASH_DURATION_MS = 2_000
+SPLASH_TITLE = "LAPD Langmuir Analysis Studio"
+SPLASH_CANVAS_SIZE = QtCore.QSize(1200, 750)
+ASSET_ROOT = Path(__file__).resolve().parent / "assets"
+SPLASH_BACKGROUND_PATH = ASSET_ROOT / "splash" / "plasma_background.png"
+SPLASH_LOGO_PATHS = {
+    "bapsf": ASSET_ROOT / "branding" / "bapsf_logo.png",
+    "ucla": ASSET_ROOT / "branding" / "ucla_logo.svg",
+    "doe": ASSET_ROOT / "branding" / "doe_seal.svg",
+}
+
+
+def _splash_font(point_size, weight=QtGui.QFont.Normal, *, letter_spacing=0):
+    font = QtGui.QFont("Avenir Next")
+    font.setPointSizeF(float(point_size))
+    font.setWeight(weight)
+    if letter_spacing:
+        font.setLetterSpacing(QtGui.QFont.AbsoluteSpacing, letter_spacing)
+    return font
+
+
+def _aspect_fit_rect(source_size, bounds):
+    """Center one image inside *bounds* without changing its proportions."""
+    source_width = float(source_size.width())
+    source_height = float(source_size.height())
+    if source_width <= 0 or source_height <= 0:
+        return QtCore.QRectF()
+    scale = min(bounds.width() / source_width, bounds.height() / source_height)
+    width = source_width * scale
+    height = source_height * scale
+    return QtCore.QRectF(
+        bounds.center().x() - width / 2,
+        bounds.center().y() - height / 2,
+        width,
+        height,
+    )
+
+
+def _draw_splash_asset(painter, path, bounds):
+    """Draw a PNG or SVG branding asset at the highest available fidelity."""
+    path = Path(path)
+    if path.suffix.lower() == ".svg":
+        renderer = QtSvg.QSvgRenderer(str(path))
+        if not renderer.isValid():
+            return False
+        target = _aspect_fit_rect(renderer.defaultSize(), bounds)
+        renderer.render(painter, target)
+        return True
+
+    pixmap = QtGui.QPixmap(str(path))
+    if pixmap.isNull():
+        return False
+    target = _aspect_fit_rect(pixmap.size(), bounds)
+    painter.drawPixmap(target, pixmap, QtCore.QRectF(pixmap.rect()))
+    return True
+
+
+def _draw_splash_title(painter):
+    facility_font = _splash_font(
+        9.5, QtGui.QFont.DemiBold, letter_spacing=1.8
+    )
+    facility_text = "BASIC PLASMA SCIENCE FACILITY  •  UCLA"
+    facility_metrics = QtGui.QFontMetricsF(facility_font)
+    facility_width = facility_metrics.horizontalAdvance(facility_text) + 30
+    facility_rect = QtCore.QRectF(76, 42, facility_width, 30)
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.setBrush(QtGui.QColor(22, 72, 91, 208))
+    painter.drawRoundedRect(facility_rect, 15, 15)
+    painter.setFont(facility_font)
+    painter.setPen(QtGui.QColor("#9CF4E2"))
+    painter.drawText(facility_rect, QtCore.Qt.AlignCenter, facility_text)
+
+    lapd_font = _splash_font(47, QtGui.QFont.Bold, letter_spacing=0.3)
+    studio_font = _splash_font(34, QtGui.QFont.DemiBold, letter_spacing=0.15)
+    baseline = 137
+    title_x = 76
+    lapd_gradient = QtGui.QLinearGradient(title_x, 85, title_x + 165, 142)
+    lapd_gradient.setColorAt(0, QtGui.QColor("#88F7E1"))
+    lapd_gradient.setColorAt(0.52, QtGui.QColor("#43CBE7"))
+    lapd_gradient.setColorAt(1, QtGui.QColor("#51A7E8"))
+    painter.setFont(lapd_font)
+    painter.setPen(QtGui.QPen(QtGui.QBrush(lapd_gradient), 1))
+    painter.drawText(QtCore.QPointF(title_x, baseline), "LAPD")
+
+    lapd_width = QtGui.QFontMetricsF(lapd_font).horizontalAdvance("LAPD")
+    painter.setFont(studio_font)
+    painter.setPen(QtGui.QColor("#F7FBFF"))
+    painter.drawText(
+        QtCore.QPointF(title_x + lapd_width + 22, baseline - 2),
+        "Langmuir Analysis Studio",
+    )
+
+    painter.setFont(_splash_font(10.5, QtGui.QFont.Medium, letter_spacing=1.2))
+    painter.setPen(QtGui.QColor(161, 194, 217, 224))
+    painter.drawText(
+        QtCore.QRectF(79, 151, 800, 22),
+        QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+        "PRECISION I–V DIAGNOSTICS FOR THE LARGE PLASMA DEVICE",
+    )
+
+
+def _draw_langmuir_trace(painter):
+    card = QtCore.QRectF(76, 194, 1048, 342)
+    shadow = card.translated(0, 8)
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.setBrush(QtGui.QColor(0, 0, 0, 72))
+    painter.drawRoundedRect(shadow, 24, 24)
+
+    card_gradient = QtGui.QLinearGradient(card.topLeft(), card.bottomRight())
+    card_gradient.setColorAt(0, QtGui.QColor(7, 22, 38, 224))
+    card_gradient.setColorAt(0.58, QtGui.QColor(7, 28, 46, 212))
+    card_gradient.setColorAt(1, QtGui.QColor(7, 42, 54, 202))
+    painter.setBrush(card_gradient)
+    painter.setPen(QtGui.QPen(QtGui.QColor(86, 169, 201, 92), 1.1))
+    painter.drawRoundedRect(card, 24, 24)
+
+    painter.setFont(_splash_font(9.5, QtGui.QFont.DemiBold, letter_spacing=1.7))
+    painter.setPen(QtGui.QColor(121, 228, 215, 228))
+    painter.drawText(
+        QtCore.QRectF(110, 211, 500, 26),
+        QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
+        "LANGMUIR I–V SIGNATURE",
+    )
+    painter.setFont(_splash_font(8.5, QtGui.QFont.Medium, letter_spacing=1.2))
+    painter.setPen(QtGui.QColor(130, 165, 190, 190))
+    painter.drawText(
+        QtCore.QRectF(750, 211, 338, 26),
+        QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+        "PROBE-BIAS SWEEP  →",
+    )
+
+    plot = QtCore.QRectF(116, 247, 968, 248)
+    grid_pen = QtGui.QPen(QtGui.QColor(80, 145, 174, 36), 1)
+    painter.setPen(grid_pen)
+    for index in range(1, 9):
+        x_pos = plot.left() + index * plot.width() / 9
+        painter.drawLine(QtCore.QPointF(x_pos, plot.top()), QtCore.QPointF(x_pos, plot.bottom()))
+    for index in range(1, 5):
+        y_pos = plot.top() + index * plot.height() / 5
+        painter.drawLine(QtCore.QPointF(plot.left(), y_pos), QtCore.QPointF(plot.right(), y_pos))
+
+    minimum_current = -0.28
+    maximum_current = 1.0
+
+    def map_current(value):
+        fraction = (maximum_current - value) / (maximum_current - minimum_current)
+        return plot.top() + fraction * plot.height()
+
+    zero_y = map_current(0)
+    axis_pen = QtGui.QPen(QtGui.QColor(149, 191, 214, 112), 1.2)
+    painter.setPen(axis_pen)
+    painter.drawLine(
+        QtCore.QPointF(plot.left(), zero_y),
+        QtCore.QPointF(plot.right(), zero_y),
+    )
+    painter.drawLine(plot.bottomLeft(), plot.topLeft())
+
+    painter.setFont(_splash_font(9, QtGui.QFont.DemiBold))
+    painter.setPen(QtGui.QColor(165, 201, 220, 198))
+    painter.drawText(QtCore.QPointF(plot.left() - 3, plot.top() - 8), "I")
+    painter.drawText(QtCore.QPointF(plot.right() + 8, zero_y + 4), "V")
+
+    def trace_current(t):
+        saturation = 1.11 / (1 + math.exp(-13.5 * (t - 0.58)))
+        sheath_slope = 0.055 * max(t - 0.73, 0)
+        return -0.22 + saturation + sheath_slope
+
+    trace = QtGui.QPainterPath()
+    sample_count = 220
+    trace_points = []
+    for index in range(sample_count):
+        t = index / (sample_count - 1)
+        point = QtCore.QPointF(
+            plot.left() + t * plot.width(), map_current(trace_current(t))
+        )
+        trace_points.append(point)
+        if index == 0:
+            trace.moveTo(point)
+        else:
+            trace.lineTo(point)
+
+    painter.setBrush(QtCore.Qt.NoBrush)
+    painter.setPen(
+        QtGui.QPen(
+            QtGui.QColor(38, 221, 234, 34),
+            14,
+            QtCore.Qt.SolidLine,
+            QtCore.Qt.RoundCap,
+            QtCore.Qt.RoundJoin,
+        )
+    )
+    painter.drawPath(trace)
+    painter.setPen(
+        QtGui.QPen(
+            QtGui.QColor(66, 231, 231, 100),
+            7,
+            QtCore.Qt.SolidLine,
+            QtCore.Qt.RoundCap,
+            QtCore.Qt.RoundJoin,
+        )
+    )
+    painter.drawPath(trace)
+    trace_gradient = QtGui.QLinearGradient(plot.left(), 0, plot.right(), 0)
+    trace_gradient.setColorAt(0, QtGui.QColor("#43C9F1"))
+    trace_gradient.setColorAt(0.55, QtGui.QColor("#69F0D2"))
+    trace_gradient.setColorAt(1, QtGui.QColor("#F3C56B"))
+    painter.setPen(
+        QtGui.QPen(
+            QtGui.QBrush(trace_gradient),
+            3.2,
+            QtCore.Qt.SolidLine,
+            QtCore.Qt.RoundCap,
+            QtCore.Qt.RoundJoin,
+        )
+    )
+    painter.drawPath(trace)
+
+    marker_specs = (
+        (0.47, "Vf", QtGui.QColor("#78EED7")),
+        (0.60, "Vp", QtGui.QColor("#F1C56D")),
+    )
+    for t, label, color in marker_specs:
+        point = trace_points[round(t * (sample_count - 1))]
+        marker_pen = QtGui.QPen(QtGui.QColor(color.red(), color.green(), color.blue(), 115), 1)
+        marker_pen.setStyle(QtCore.Qt.DashLine)
+        painter.setPen(marker_pen)
+        painter.drawLine(
+            QtCore.QPointF(point.x(), plot.top() + 12),
+            QtCore.QPointF(point.x(), plot.bottom()),
+        )
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(color)
+        painter.drawEllipse(point, 4.2, 4.2)
+        painter.setFont(_splash_font(9.5, QtGui.QFont.DemiBold))
+        painter.setPen(color)
+        painter.drawText(
+            QtCore.QRectF(point.x() - 22, plot.top() + 5, 44, 20),
+            QtCore.Qt.AlignCenter,
+            label,
+        )
+
+
+def _draw_logo_rail(painter):
+    rail = QtCore.QRectF(76, 561, 1048, 155)
+    shadow = rail.translated(0, 7)
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.setBrush(QtGui.QColor(0, 0, 0, 68))
+    painter.drawRoundedRect(shadow, 22, 22)
+
+    rail_gradient = QtGui.QLinearGradient(rail.topLeft(), rail.bottomRight())
+    rail_gradient.setColorAt(0, QtGui.QColor(249, 252, 253, 244))
+    rail_gradient.setColorAt(0.55, QtGui.QColor(242, 248, 250, 242))
+    rail_gradient.setColorAt(1, QtGui.QColor(233, 243, 246, 239))
+    painter.setBrush(rail_gradient)
+    painter.setPen(QtGui.QPen(QtGui.QColor(154, 211, 221, 120), 1.1))
+    painter.drawRoundedRect(rail, 22, 22)
+
+    for x_pos in (429, 794):
+        painter.setPen(QtGui.QPen(QtGui.QColor(47, 88, 108, 42), 1))
+        painter.drawLine(QtCore.QPointF(x_pos, 586), QtCore.QPointF(x_pos, 690))
+
+    caption_font = _splash_font(7.8, QtGui.QFont.DemiBold, letter_spacing=1.25)
+    painter.setFont(caption_font)
+    painter.setPen(QtGui.QColor("#557184"))
+    captions = (
+        (QtCore.QRectF(101, 577, 304, 18), "FACILITY"),
+        (QtCore.QRectF(454, 577, 315, 18), "UNIVERSITY"),
+        (QtCore.QRectF(819, 577, 280, 18), "RESEARCH SUPPORT"),
+    )
+    for bounds, caption in captions:
+        painter.drawText(bounds, QtCore.Qt.AlignCenter, caption)
+
+    assets = (
+        (SPLASH_LOGO_PATHS["bapsf"], QtCore.QRectF(114, 600, 278, 92)),
+        (SPLASH_LOGO_PATHS["ucla"], QtCore.QRectF(478, 604, 267, 87)),
+        (SPLASH_LOGO_PATHS["doe"], QtCore.QRectF(899, 597, 116, 104)),
+    )
+    for path, bounds in assets:
+        if not _draw_splash_asset(painter, path, bounds):
+            painter.setFont(_splash_font(10, QtGui.QFont.DemiBold))
+            painter.setPen(QtGui.QColor("#8B2030"))
+            painter.drawText(bounds, QtCore.Qt.AlignCenter, path.stem.upper())
+
+
+def compose_splash_pixmap():
+    """Compose the splash from exact branding assets and vector overlays."""
+    canvas = QtGui.QPixmap(SPLASH_CANVAS_SIZE)
+    canvas.fill(QtGui.QColor("#07111F"))
+    painter = QtGui.QPainter(canvas)
+    painter.setRenderHints(
+        QtGui.QPainter.Antialiasing
+        | QtGui.QPainter.TextAntialiasing
+        | QtGui.QPainter.SmoothPixmapTransform
+    )
+
+    background = QtGui.QPixmap(str(SPLASH_BACKGROUND_PATH))
+    if not background.isNull():
+        painter.drawPixmap(
+            QtCore.QRectF(0, 0, canvas.width(), canvas.height()),
+            background,
+            QtCore.QRectF(background.rect()),
+        )
+
+    veil = QtGui.QLinearGradient(0, 0, 0, canvas.height())
+    veil.setColorAt(0, QtGui.QColor(2, 9, 18, 78))
+    veil.setColorAt(0.24, QtGui.QColor(4, 14, 27, 35))
+    veil.setColorAt(0.72, QtGui.QColor(3, 13, 23, 20))
+    veil.setColorAt(1, QtGui.QColor(2, 9, 17, 92))
+    painter.fillRect(canvas.rect(), veil)
+
+    _draw_splash_title(painter)
+    _draw_langmuir_trace(painter)
+    _draw_logo_rail(painter)
+    painter.end()
+    return canvas
+
+
+class StartupSplashScreen(QtWidgets.QWidget):
+    """Frameless startup window with no implicit Qt splash dismissal."""
+
+    def __init__(self, pixmap, flags, parent=None):
+        super().__init__(parent, flags)
+        self._pixmap = pixmap
+        device_ratio = max(1.0, pixmap.devicePixelRatio())
+        self.setFixedSize(
+            round(pixmap.width() / device_ratio),
+            round(pixmap.height() / device_ratio),
+        )
+        self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+        painter.drawPixmap(
+            QtCore.QRectF(self.rect()),
+            self._pixmap,
+            QtCore.QRectF(self._pixmap.rect()),
+        )
+        event.accept()
+
+    def finish(self, _main_window):
+        self.hide()
+
+    def mousePressEvent(self, event):
+        # QSplashScreen normally hides itself on any click.  When the app is
+        # started from an IDE or dock, that launch click can arrive just after
+        # this window is mapped and make the splash appear to flash briefly.
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        event.accept()
+
+
+def create_splash_screen(application):
+    """Return a centered splash sized safely for the active display."""
+    pixmap = compose_splash_pixmap()
+    screen = application.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry().size()
+        maximum = QtCore.QSize(
+            max(640, round(available.width() * 0.88)),
+            max(400, round(available.height() * 0.88)),
+        )
+        if pixmap.width() > maximum.width() or pixmap.height() > maximum.height():
+            pixmap = pixmap.scaled(
+                maximum,
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            )
+
+    flags = (
+        QtCore.Qt.Window
+        | QtCore.Qt.FramelessWindowHint
+        | QtCore.Qt.WindowStaysOnTopHint
+    )
+    splash = StartupSplashScreen(pixmap, flags)
+    if screen is not None:
+        available_rect = screen.availableGeometry()
+        splash.move(available_rect.center() - splash.rect().center())
+    splash.setObjectName("startupSplash")
+    splash.setAccessibleName(SPLASH_TITLE)
+    splash.setProperty("titleText", SPLASH_TITLE)
+    splash.setProperty("titleBounds", QtCore.QRect(76, 42, 1048, 132))
+    splash.setProperty("traceBounds", QtCore.QRect(116, 247, 968, 248))
+    splash.setProperty("logoRailBounds", QtCore.QRect(76, 561, 1048, 155))
+    splash.setProperty(
+        "logoPaths", tuple(str(path) for path in SPLASH_LOGO_PATHS.values())
+    )
+    return splash
+
+
 STYLE_SHEET = """
 QWidget {
     color: #dce7f4;
-    font-family: "Inter", "Avenir Next", "SF Pro Text", sans-serif;
+    font-family: "Avenir Next";
     font-size: 13px;
 }
 QMainWindow, QWidget#root { background: #0b111b; }
@@ -288,6 +680,7 @@ class ParameterTab(QtWidgets.QWidget):
         self.geometry = geometry
         self.editors = {}
         self.specs = {}
+        self.section_cards = {}
 
         root_layout = QtWidgets.QVBoxLayout(self)
         root_layout.setContentsMargins(0, 12, 0, 0)
@@ -305,9 +698,21 @@ class ParameterTab(QtWidgets.QWidget):
             column.setSpacing(12)
             card_columns_layout.addLayout(column, 1)
 
-        for index, section in enumerate(PARAMETER_SECTIONS[geometry]):
+        # Alternate ordinary cards between columns while keeping an explicitly
+        # paired card directly below its predecessor in the same column.
+        next_column = 0
+        previous_column = None
+        for section in PARAMETER_SECTIONS[geometry]:
+            if section.stack_with_previous and previous_column is not None:
+                column_index = previous_column
+            else:
+                column_index = next_column
+                next_column = 1 - next_column
             card = self._build_section_card(section)
-            card_columns[index % 2].addWidget(card)
+            card.setProperty("layoutColumn", column_index)
+            self.section_cards[section.title] = card
+            card_columns[column_index].addWidget(card)
+            previous_column = column_index
         for column in card_columns:
             column.addStretch(1)
         self._wire_dependencies()
@@ -679,8 +1084,8 @@ class LangmuirAnalysisWindow(QtWidgets.QMainWindow):
         event.accept()
 
 
-def launch_gui():
-    """Create and run the desktop application."""
+def launch_gui(*, splash_duration_ms=SPLASH_DURATION_MS):
+    """Create the desktop application and reveal it after the startup splash."""
     application = QtWidgets.QApplication.instance()
     owns_application = application is None
     if application is None:
@@ -688,8 +1093,33 @@ def launch_gui():
     application.setApplicationName("Langmuir Analysis Studio")
     application.setStyle("Fusion")
     application.setStyleSheet(STYLE_SHEET)
+
+    splash = create_splash_screen(application)
+    splash.show()
+    splash.raise_()
+    splash.activateWindow()
+    # Flush the first paint before constructing the larger parameter editor.
+    application.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
+
     window = LangmuirAnalysisWindow()
-    window.show()
+    window._startup_splash = splash
+
+    def reveal_main_window():
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        splash.finish(window)
+        splash.deleteLater()
+        window._startup_splash = None
+        window._startup_timer = None
+
+    startup_timer = QtCore.QTimer(window)
+    startup_timer.setSingleShot(True)
+    startup_timer.setTimerType(QtCore.Qt.PreciseTimer)
+    startup_timer.setInterval(max(0, int(splash_duration_ms)))
+    startup_timer.timeout.connect(reveal_main_window)
+    window._startup_timer = startup_timer
+    startup_timer.start()
     if owns_application:
         return application.exec()
     return window

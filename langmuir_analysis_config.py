@@ -39,6 +39,7 @@ class SectionSpec:
     title: str
     description: str
     parameters: tuple[ParameterSpec, ...]
+    stack_with_previous: bool = False
 
 
 def _p(
@@ -155,8 +156,8 @@ def _sections_for_geometry(geometry):
             ),
         ),
         SectionSpec(
-            "Scan geometry",
-            "Spatial grid, repeated shots, trace length, and acquisition offset.",
+            "Spatial geometry",
+            "Spatial coordinates sampled by the probe scan.",
             tuple(
                 [
                     _p(
@@ -167,24 +168,6 @@ def _sections_for_geometry(geometry):
                         "Number of x positions.",
                         minimum=1,
                         maximum=100_000,
-                    ),
-                    _p(
-                        "nshots",
-                        "Shots per position",
-                        "int",
-                        nshots,
-                        "Repeated shots at each spatial location.",
-                        minimum=1,
-                        maximum=100_000,
-                    ),
-                    _p(
-                        "nt_full",
-                        "Samples per trace",
-                        "int",
-                        nt_full,
-                        "Full digitizer trace length.",
-                        minimum=2,
-                        maximum=100_000_000,
                     ),
                     _p(
                         "x_min_cm",
@@ -250,18 +233,41 @@ def _sections_for_geometry(geometry):
                         ),
                     ]
                 )
-                + [
-                    _p(
-                        "data_offset",
-                        "Shot offset",
-                        "int",
-                        data_offset,
-                        "Number of leading acquisition shots to skip.",
-                        minimum=0,
-                        maximum=2_000_000_000,
-                    ),
-                ]
             ),
+        ),
+        SectionSpec(
+            "Acquisition geometry",
+            "Repeated shots, trace length, and acquisition offset.",
+            (
+                _p(
+                    "nshots",
+                    "Shots per position",
+                    "int",
+                    nshots,
+                    "Repeated shots at each spatial location.",
+                    minimum=1,
+                    maximum=100_000,
+                ),
+                _p(
+                    "nt_full",
+                    "Samples per trace",
+                    "int",
+                    nt_full,
+                    "Full digitizer trace length.",
+                    minimum=2,
+                    maximum=100_000_000,
+                ),
+                _p(
+                    "data_offset",
+                    "Shot offset",
+                    "int",
+                    data_offset,
+                    "Number of leading acquisition shots to skip.",
+                    minimum=0,
+                    maximum=2_000_000_000,
+                ),
+            ),
+            stack_with_previous=True,
         ),
         SectionSpec(
             "Digitizer and probe",
