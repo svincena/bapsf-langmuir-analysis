@@ -48,6 +48,54 @@ def test_gui_has_one_fully_populated_tab_per_geometry(
     window.close()
 
 
+def test_sis_configuration_picker_reads_immediate_digitizer_groups(
+    application, monkeypatch, tmp_path
+):
+    import h5py
+
+    hdf5_path = tmp_path / "experiment.hdf5"
+    with h5py.File(hdf5_path, "w") as h5_file:
+        digitizer_group = h5_file.create_group(
+            "Raw data + config"
+        ).create_group("SIS crate")
+        digitizer_group.create_group("Config B")
+        digitizer_group.create_group("Config A")
+        digitizer_group.create_dataset(
+            "not_a_configuration", data=[1, 2, 3]
+        )
+
+    assert gui.discover_sis_configurations(hdf5_path, "SIS crate") == (
+        "Config A",
+        "Config B",
+    )
+
+    monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", tmp_path / "parameters.json")
+    offered_choices = []
+
+    def choose_second(_parent, _title, _label, items, _current, _editable):
+        offered_choices.append(tuple(items))
+        return "Config B", True
+
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", choose_second)
+    window = LangmuirAnalysisWindow()
+    for tab in window.parameter_tabs.values():
+        tab.set_values(
+            {
+                "filename": str(hdf5_path),
+                "digitizer": "SIS crate",
+                "adc": "This value is deliberately ignored by the picker",
+                "sis_config_name": "previous value",
+            }
+        )
+        editor = tab.editors["sis_config_name"]
+        assert isinstance(editor, gui.SisConfigurationEditor)
+        editor.browse_button.click()
+        assert editor.value() == "Config B"
+
+    assert offered_choices == [("Config A", "Config B")] * 2
+    window.close()
+
+
 def test_splash_composes_required_title_trace_and_branding(application):
     assert gui.SPLASH_DURATION_MS == 2_000
     assert gui.SPLASH_TITLE == "LAPD Langmuir Analysis Studio"

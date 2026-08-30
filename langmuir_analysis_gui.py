@@ -535,6 +535,47 @@ QToolTip { color: #eaf3fa; background: #152333; border: 1px solid #3a526a; paddi
 """
 
 
+def discover_sis_configurations(filename, digitizer):
+    """Return immediate group names under one HDF5 digitizer group."""
+    filename = Path(filename).expanduser()
+    digitizer = str(digitizer).strip()
+    if not filename.is_file():
+        raise ValueError(f"Experiment HDF5 file does not exist: {filename}")
+    if not digitizer:
+        raise ValueError("Digitizer group cannot be empty.")
+
+    # Keep h5py out of the GUI's lightweight splash-startup import path.
+    import h5py
+
+    group_names = ("Raw data + config", digitizer)
+    try:
+        with h5py.File(filename, "r") as h5_file:
+            group = h5_file
+            traversed = []
+            for group_name in group_names:
+                traversed.append(group_name)
+                if group_name not in group:
+                    hdf5_path = "/" + "/".join(traversed)
+                    raise ValueError(f'HDF5 group "{hdf5_path}" was not found.')
+                group = group[group_name]
+                if not isinstance(group, h5py.Group):
+                    hdf5_path = "/" + "/".join(traversed)
+                    raise ValueError(f'HDF5 object "{hdf5_path}" is not a group.')
+
+            return tuple(
+                sorted(
+                    (
+                        name
+                        for name, item in group.items()
+                        if isinstance(item, h5py.Group)
+                    ),
+                    key=str.casefold,
+                )
+            )
+    except OSError as error:
+        raise ValueError(f"Could not open HDF5 file {filename}: {error}") from error
+
+
 class PathEditor(QtWidgets.QWidget):
     """Line editor with a native file or directory picker."""
 
@@ -580,6 +621,69 @@ class PathEditor(QtWidgets.QWidget):
         self.line_edit.setText(str(value))
 
 
+class SisConfigurationEditor(QtWidgets.QWidget):
+    """Editable SIS configuration name with HDF5-backed candidate selection."""
+
+    def __init__(self, value, source_values, parent=None):
+        super().__init__(parent)
+        self.source_values = source_values
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.line_edit = QtWidgets.QLineEdit(str(value))
+        self.line_edit.setToolTip(str(value))
+        self.line_edit.textChanged.connect(self.line_edit.setToolTip)
+        self.browse_button = QtWidgets.QPushButton("…")
+        self.browse_button.setObjectName("browseButton")
+        self.browse_button.setToolTip(
+            "Choose a configuration found in the selected HDF5 file"
+        )
+        self.browse_button.clicked.connect(self._browse)
+        layout.addWidget(self.line_edit, 1)
+        layout.addWidget(self.browse_button)
+
+    def _browse(self):
+        filename, digitizer = self.source_values()
+        try:
+            candidates = discover_sis_configurations(filename, digitizer)
+        except ValueError as error:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Could not find SIS configurations",
+                str(error),
+            )
+            return
+
+        if not candidates:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No SIS configurations found",
+                "The selected digitizer group contains no configuration groups.",
+            )
+            return
+
+        current_value = self.value()
+        current_index = (
+            candidates.index(current_value) if current_value in candidates else 0
+        )
+        selected, accepted = QtWidgets.QInputDialog.getItem(
+            self,
+            "Choose SIS configuration",
+            "Available configurations:",
+            candidates,
+            current_index,
+            False,
+        )
+        if accepted:
+            self.set_value(selected)
+
+    def value(self):
+        return self.line_edit.text().strip()
+
+    def set_value(self, value):
+        self.line_edit.setText(str(value))
+
+
 class IntegerPairEditor(QtWidgets.QWidget):
     """Compact y/x integer-pair editor for two-dimensional neighborhoods."""
 
@@ -604,8 +708,10 @@ class IntegerPairEditor(QtWidgets.QWidget):
         self.x_value.setValue(int(value[1]))
 
 
-def _make_editor(spec):
-    if spec.kind == "bool":
+def _make_editor(spec, *, sis_source_values=None):
+    if spec.key == "sis_config_name":
+        editor = SisConfigurationEditor(spec.default, sis_source_values)
+    elif spec.kind == "bool":
         editor = QtWidgets.QCheckBox("Enabled")
         editor.setChecked(bool(spec.default))
     elif spec.kind == "int":
@@ -642,7 +748,7 @@ def _make_editor(spec):
 
 
 def _editor_value(editor, spec):
-    if isinstance(editor, (PathEditor, IntegerPairEditor)):
+    if isinstance(editor, (PathEditor, SisConfigurationEditor, IntegerPairEditor)):
         return editor.value()
     if spec.kind == "bool":
         return editor.isChecked()
@@ -656,7 +762,7 @@ def _editor_value(editor, spec):
 
 
 def _set_editor_value(editor, spec, value):
-    if isinstance(editor, (PathEditor, IntegerPairEditor)):
+    if isinstance(editor, (PathEditor, SisConfigurationEditor, IntegerPairEditor)):
         editor.set_value(value)
     elif spec.kind == "bool":
         editor.setChecked(bool(value))
@@ -762,12 +868,26 @@ class ParameterTab(QtWidgets.QWidget):
             label = QtWidgets.QLabel(label_text)
             label.setObjectName("fieldLabel")
             label.setToolTip(spec.description)
-            editor = _make_editor(spec)
+            editor = _make_editor(
+                spec,
+                sis_source_values=(
+                    self._sis_source_values
+                    if spec.key == "sis_config_name"
+                    else None
+                ),
+            )
             self.editors[spec.key] = editor
             self.specs[spec.key] = spec
             form.addRow(label, editor)
         card_layout.addLayout(form)
         return card
+
+    def _sis_source_values(self):
+        """Read the current file and digitizer values from this tab."""
+        return tuple(
+            _editor_value(self.editors[key], self.specs[key])
+            for key in ("filename", "digitizer")
+        )
 
     def _wire_dependencies(self):
         """Dim controls that have no effect while their feature is disabled."""
