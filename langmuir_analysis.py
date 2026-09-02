@@ -143,6 +143,12 @@ diagnostic_plot_output_dir: Any = _RUNTIME_UNCONFIGURED
 make_all_iv_diagnostic_plot: Any = _RUNTIME_UNCONFIGURED
 
 
+def diagnostic_plot_directory(source_filename):
+    """Return the diagnostic directory stored beside an HDF5 source file."""
+    source_path = Path(source_filename).expanduser()
+    return source_path.parent / f"{source_path.stem}_Langmuir_diagnostic_plots"
+
+
 def configure_analysis(geometry, parameter_values):
     """Validate GUI values and populate the globals consumed by one pipeline."""
     if geometry not in _SUPPORTED_ANALYSIS_GEOMETRIES:
@@ -181,7 +187,7 @@ def configure_analysis(geometry, parameter_values):
         isweep_dc_offset_end_index=values["isweep_dc_offset_end_index"],
         isat_start_index=values["isat_start_index"],
         isat_end_index=values["isat_end_index"],
-        diagnostic_plot_output_dir=Path(values["diagnostic_plot_output_dir"]),
+        diagnostic_plot_output_dir=diagnostic_plot_directory(values["filename"]),
         te_subtract_i0=True,
         f_microwave=values["f_microwave_GHz"] * u.GHz,
         N_passes=values["N_passes"],

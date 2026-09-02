@@ -41,6 +41,18 @@ def test_configure_xy_analysis_derives_spatial_and_shot_shapes():
     assert analysis.Y.shape == (values["ny"], values["nx"])
     assert analysis.nt == (values["sweep_end_index"] - values["sweep_start_index"] + 1)
     assert analysis.n_expected_shots == (values["ny"] * values["nx"] * values["nshots"])
+    source_path = analysis.Path(values["filename"])
+    assert analysis.diagnostic_plot_output_dir == source_path.with_name(
+        f"{source_path.stem}_Langmuir_diagnostic_plots"
+    )
+
+
+def test_diagnostic_plot_directory_is_named_for_and_beside_source_file(tmp_path):
+    source_path = tmp_path / "experiment run.hdf5"
+
+    assert analysis.diagnostic_plot_directory(source_path) == (
+        tmp_path / "experiment run_Langmuir_diagnostic_plots"
+    )
 
 
 def test_select_xline_from_xy_map_uses_nearest_y_coordinate():

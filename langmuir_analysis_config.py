@@ -818,13 +818,6 @@ def _sections_for_geometry(geometry):
                         step=0.1,
                     ),
                     _p(
-                        "diagnostic_plot_output_dir",
-                        "Diagnostic output folder",
-                        "directory",
-                        "output_diagnostic_plots",
-                        "Folder for saved diagnostic PNG files.",
-                    ),
-                    _p(
                         "make_all_iv_diagnostic_plot",
                         "Plot all representative I–V curves",
                         "bool",
