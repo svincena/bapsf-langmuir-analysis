@@ -52,6 +52,39 @@ def test_gui_has_one_fully_populated_tab_per_geometry(
     window.close()
 
 
+def test_numeric_fields_use_direct_inputs_except_worker_processes(
+    application, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", tmp_path / "parameters.json")
+    window = LangmuirAnalysisWindow()
+
+    for tab in window.parameter_tabs.values():
+        for key, spec in tab.specs.items():
+            editor = tab.editors[key]
+            if spec.kind in {"int", "float"}:
+                assert isinstance(editor, gui.DirectNumericInput)
+                assert not isinstance(editor, QtWidgets.QAbstractSpinBox)
+            elif spec.kind == "int_pair":
+                assert isinstance(editor, gui.IntegerPairEditor)
+                assert isinstance(editor.y_value, gui.DirectNumericInput)
+                assert isinstance(editor.x_value, gui.DirectNumericInput)
+            elif spec.kind == "choice":
+                assert isinstance(editor, QtWidgets.QComboBox)
+            elif spec.kind == "optional_int":
+                assert key == "analysis_processes"
+                assert isinstance(editor, QtWidgets.QSpinBox)
+                assert editor.specialValueText() == "Automatic"
+
+    nx_editor = window.parameter_tabs["x_line"].editors["nx"]
+    nx_editor.setText("17")
+    assert window.parameter_tabs["x_line"].values()["nx"] == 17
+    nx_editor.setText("")
+    with pytest.raises(ValueError, match="must be an integer"):
+        window.parameter_tabs["x_line"].values()
+
+    window.close()
+
+
 def test_sis_configuration_picker_reads_immediate_digitizer_groups(
     application, monkeypatch, tmp_path
 ):

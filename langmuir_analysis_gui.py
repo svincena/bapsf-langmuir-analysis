@@ -476,7 +476,7 @@ QFrame#sectionCard {
 QLabel#sectionTitle { color: #f3f8fd; font-size: 16px; font-weight: 700; }
 QLabel#sectionDescription { color: #8399ae; font-size: 11px; }
 QLabel#fieldLabel { color: #b6c6d6; font-weight: 550; }
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+QLineEdit, QSpinBox, QComboBox {
     color: #edf5fc;
     background: #0c1521;
     border: 1px solid #30445b;
@@ -485,11 +485,12 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     padding: 0 9px;
     selection-background-color: #2b7a78;
 }
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
     border: 1px solid #55cdb7;
 }
-QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
-QComboBox:disabled { color: #617488; background: #111923; }
+QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {
+    color: #617488; background: #111923;
+}
 QComboBox::drop-down { border: 0; width: 28px; }
 QComboBox QAbstractItemView {
     color: #e9f2fa; background: #111c29; border: 1px solid #34495f;
@@ -686,6 +687,63 @@ class SisConfigurationEditor(QtWidgets.QWidget):
         self.line_edit.setText(str(value))
 
 
+class DirectNumericInput(QtWidgets.QLineEdit):
+    """Validated numeric text input with no scroll-wheel adjustment behavior."""
+
+    def __init__(
+        self,
+        value,
+        *,
+        numeric_kind,
+        minimum,
+        maximum,
+        decimals=3,
+        parent=None,
+    ):
+        super().__init__(parent)
+        if numeric_kind not in {"int", "float"}:
+            raise ValueError(f"Unsupported numeric input kind {numeric_kind!r}.")
+
+        self.numeric_kind = numeric_kind
+        self.minimum = minimum
+        self.maximum = maximum
+        self.decimals = int(decimals)
+        locale = QtCore.QLocale.c()
+        locale.setNumberOptions(QtCore.QLocale.RejectGroupSeparator)
+
+        if numeric_kind == "int":
+            validator = QtGui.QIntValidator(int(minimum), int(maximum), self)
+        else:
+            validator = QtGui.QDoubleValidator(
+                float(minimum),
+                float(maximum),
+                self.decimals,
+                self,
+            )
+            validator.setNotation(QtGui.QDoubleValidator.ScientificNotation)
+        validator.setLocale(locale)
+        self.setValidator(validator)
+        self.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.set_value(value)
+
+    def value(self):
+        text = self.text().strip()
+        state, _text, _position = self.validator().validate(text, 0)
+        if state != QtGui.QValidator.Acceptable:
+            kind = "an integer" if self.numeric_kind == "int" else "a number"
+            raise ValueError(
+                f"Value must be {kind} from {self.minimum} to {self.maximum}."
+            )
+        return int(text) if self.numeric_kind == "int" else float(text)
+
+    def set_value(self, value):
+        if self.numeric_kind == "int":
+            text = str(int(value))
+        else:
+            text = format(float(value), ".15g")
+        self.setText(text)
+
+
 class IntegerPairEditor(QtWidgets.QWidget):
     """Compact y/x integer-pair editor for two-dimensional neighborhoods."""
 
@@ -694,20 +752,30 @@ class IntegerPairEditor(QtWidgets.QWidget):
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
-        self.y_value = QtWidgets.QSpinBox()
-        self.x_value = QtWidgets.QSpinBox()
+        self.y_value = DirectNumericInput(
+            value[0],
+            numeric_kind="int",
+            minimum=minimum,
+            maximum=maximum,
+        )
+        self.x_value = DirectNumericInput(
+            value[1],
+            numeric_kind="int",
+            minimum=minimum,
+            maximum=maximum,
+        )
         for label, editor in (("Y", self.y_value), ("X", self.x_value)):
-            editor.setRange(int(minimum), int(maximum))
-            editor.setPrefix(f"{label}  ")
+            axis_label = QtWidgets.QLabel(label)
+            axis_label.setObjectName("fieldLabel")
+            layout.addWidget(axis_label)
             layout.addWidget(editor, 1)
-        self.set_value(value)
 
     def value(self):
         return self.y_value.value(), self.x_value.value()
 
     def set_value(self, value):
-        self.y_value.setValue(int(value[0]))
-        self.x_value.setValue(int(value[1]))
+        self.y_value.set_value(value[0])
+        self.x_value.set_value(value[1])
 
 
 def _make_editor(spec, *, sis_source_values=None):
@@ -717,22 +785,25 @@ def _make_editor(spec, *, sis_source_values=None):
         editor = QtWidgets.QCheckBox("Enabled")
         editor.setChecked(bool(spec.default))
     elif spec.kind == "int":
-        editor = QtWidgets.QSpinBox()
-        editor.setRange(int(spec.minimum), int(spec.maximum))
-        editor.setSingleStep(max(1, int(spec.step)))
-        editor.setValue(int(spec.default))
+        editor = DirectNumericInput(
+            spec.default,
+            numeric_kind="int",
+            minimum=spec.minimum,
+            maximum=spec.maximum,
+        )
     elif spec.kind == "optional_int":
         editor = QtWidgets.QSpinBox()
         editor.setRange(int(spec.minimum), int(spec.maximum))
         editor.setSpecialValueText("Automatic")
         editor.setValue(0 if spec.default is None else int(spec.default))
     elif spec.kind == "float":
-        editor = QtWidgets.QDoubleSpinBox()
-        editor.setRange(float(spec.minimum), float(spec.maximum))
-        editor.setDecimals(spec.decimals)
-        editor.setSingleStep(float(spec.step))
-        editor.setValue(float(spec.default))
-        editor.setGroupSeparatorShown(True)
+        editor = DirectNumericInput(
+            spec.default,
+            numeric_kind="float",
+            minimum=spec.minimum,
+            maximum=spec.maximum,
+            decimals=spec.decimals,
+        )
     elif spec.kind == "choice":
         editor = QtWidgets.QComboBox()
         for choice in spec.choices:
@@ -764,16 +835,15 @@ def _editor_value(editor, spec):
 
 
 def _set_editor_value(editor, spec, value):
-    if isinstance(editor, (PathEditor, SisConfigurationEditor, IntegerPairEditor)):
+    if isinstance(
+        editor,
+        (PathEditor, SisConfigurationEditor, IntegerPairEditor, DirectNumericInput),
+    ):
         editor.set_value(value)
     elif spec.kind == "bool":
         editor.setChecked(bool(value))
     elif spec.kind == "optional_int":
         editor.setValue(0 if value is None else int(value))
-    elif spec.kind == "int":
-        editor.setValue(int(value))
-    elif spec.kind == "float":
-        editor.setValue(float(value))
     elif spec.kind == "choice":
         editor.setCurrentIndex(editor.findData(str(value)))
     else:
