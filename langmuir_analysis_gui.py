@@ -974,7 +974,6 @@ class ParameterTab(QtWidgets.QWidget):
                     "f_microwave_GHz",
                     "N_passes",
                     "interferometer_phase_rad",
-                    "interferometer_physical_constant",
                     "interferometer_profile_y_cm",
                 )
                 if key in self.editors

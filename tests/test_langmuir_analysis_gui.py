@@ -28,6 +28,10 @@ def test_gui_has_one_fully_populated_tab_per_geometry(
     assert "XY-plane scan" in window.parameter_tabs["xy_plane"].start_button.text()
     assert "interferometer_profile_y_cm" not in window.parameter_tabs["x_line"].values()
     assert "interferometer_profile_y_cm" in window.parameter_tabs["xy_plane"].values()
+    assert all(
+        "interferometer_physical_constant" not in tab.values()
+        for tab in window.parameter_tabs.values()
+    )
 
     xline_tab = window.parameter_tabs["x_line"]
     for tab in window.parameter_tabs.values():

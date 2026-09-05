@@ -722,18 +722,6 @@ def _sections_for_geometry(geometry):
                         maximum=1e12,
                         decimals=6,
                     ),
-                    _p(
-                        "interferometer_physical_constant",
-                        "Physical coefficient",
-                        "float",
-                        1.18e6,
-                        "Coefficient 1/(c r_e), with the explicit per-radian unit.",
-                        unit="s m⁻² rad⁻¹",
-                        minimum=1e-12,
-                        maximum=1e15,
-                        decimals=3,
-                        step=1000,
-                    ),
                 ]
                 + (
                     []

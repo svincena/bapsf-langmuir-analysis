@@ -56,6 +56,7 @@ from langmuir_diagnostics import (
 analysis_geometry = None
 _SUPPORTED_ANALYSIS_GEOMETRIES = set(SUPPORTED_GEOMETRIES)
 _configured_parameter_values = None
+INTERFEROMETER_PHYSICAL_COEFFICIENT = 1.18e6 * u.s / u.m**2 / u.rad
 
 # The geometry pipelines predate the GUI and intentionally read module-level
 # runtime values. These placeholders document the names installed atomically by
@@ -130,7 +131,6 @@ calculate_shape_factor: Any = _RUNTIME_UNCONFIGURED
 f_microwave: Any = _RUNTIME_UNCONFIGURED
 N_passes: Any = _RUNTIME_UNCONFIGURED
 interferometer_phase: Any = _RUNTIME_UNCONFIGURED
-interferometer_physical_constant: Any = _RUNTIME_UNCONFIGURED
 interferometer_scaling: Any = _RUNTIME_UNCONFIGURED
 interferometer_profile_y_cm: Any = _RUNTIME_UNCONFIGURED
 save_results: Any = _RUNTIME_UNCONFIGURED
@@ -193,9 +193,6 @@ def configure_analysis(geometry, parameter_values):
         f_microwave=values["f_microwave_GHz"] * u.GHz,
         N_passes=values["N_passes"],
         interferometer_phase=values["interferometer_phase_rad"] * u.rad,
-        interferometer_physical_constant=(
-            values["interferometer_physical_constant"] * u.s / u.m**2 / u.rad
-        ),
     )
 
     n_spatial_positions = values["nx"]
@@ -219,7 +216,7 @@ def configure_analysis(geometry, parameter_values):
         runtime["shotnum_end"] - runtime["shotnum_start"]
     )
     runtime["interferometer_scaling"] = (
-        runtime["interferometer_physical_constant"]
+        INTERFEROMETER_PHYSICAL_COEFFICIENT
         * runtime["f_microwave"]
         * runtime["interferometer_phase"]
         / runtime["N_passes"]

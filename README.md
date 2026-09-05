@@ -56,7 +56,8 @@ The program performs the full dataset workflow:
 6. Applies the common interferometer calibration. For an xy plane, the row
    nearest `interferometer_profile_y_cm` is extracted as an x-line; its
    normalized spatial profile and shape factor calibrate the complete density
-   map.
+   map. The physical coefficient `1/(c r_e) = 1.18e6 s m⁻² rad⁻¹` is an
+   internal constant rather than a user-configurable parameter.
 7. Produces diagnostic figures and optionally writes results into the source
    HDF5 file and a compressed NPZ file.
 

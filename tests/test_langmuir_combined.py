@@ -42,6 +42,15 @@ def test_configure_xy_analysis_derives_spatial_and_shot_shapes():
     assert analysis.nt == (values["sweep_end_index"] - values["sweep_start_index"] + 1)
     assert analysis.n_expected_shots == (values["ny"] * values["nx"] * values["nshots"])
     assert analysis.shot_analysis_mode == "individual"
+    expected_scaling = (
+        analysis.INTERFEROMETER_PHYSICAL_COEFFICIENT
+        * values["f_microwave_GHz"]
+        * u.GHz
+        * values["interferometer_phase_rad"]
+        * u.rad
+        / values["N_passes"]
+    )
+    assert u.allclose(analysis.interferometer_scaling, expected_scaling)
     source_path = analysis.Path(values["filename"])
     assert analysis.diagnostic_plot_output_dir == source_path.with_name(
         f"{source_path.stem}_Langmuir_diagnostic_plots"

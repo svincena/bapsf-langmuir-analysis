@@ -23,6 +23,7 @@ def test_defaults_are_complete_and_valid(geometry):
 
     assert len(keys) == len(set(keys))
     assert set(defaults) == set(keys)
+    assert "interferometer_physical_constant" not in defaults
     assert validate_parameters(geometry, defaults) == defaults
 
 
