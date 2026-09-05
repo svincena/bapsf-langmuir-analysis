@@ -51,7 +51,7 @@ def test_spatial_and_acquisition_geometry_are_separate_adjacent_sections(
     ) == spatial_keys
     assert tuple(
         parameter.key for parameter in sections[acquisition_index].parameters
-    ) == ("nshots", "nt_full", "data_offset")
+    ) == ("nshots", "shot_analysis_mode", "nt_full", "data_offset")
     assert sections[acquisition_index].stack_with_previous
 
 
@@ -112,3 +112,16 @@ def test_ies_method_is_selectable_and_validated():
     values["ies_method"] = "unsupported"
     with pytest.raises(ValueError, match="Ies estimation method"):
         validate_parameters("x_line", values)
+
+
+@pytest.mark.parametrize("geometry", SUPPORTED_GEOMETRIES)
+def test_shot_analysis_mode_is_selectable_and_validated(geometry):
+    values = default_parameters(geometry)
+    assert values["shot_analysis_mode"] == "individual"
+
+    values["shot_analysis_mode"] = "average"
+    assert validate_parameters(geometry, values)["shot_analysis_mode"] == "average"
+
+    values["shot_analysis_mode"] = "unsupported"
+    with pytest.raises(ValueError, match="Shot fitting mode"):
+        validate_parameters(geometry, values)

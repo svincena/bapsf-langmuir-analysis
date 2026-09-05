@@ -227,6 +227,8 @@ def print_summary(data):
     print(f"geometry: {geometry}")
 
     for key in (
+        "shot_analysis_mode",
+        "shot_statistics_available",
         "calculate_shape_factor",
         "shape_factor_m",
         "density_scale",
@@ -270,8 +272,14 @@ def print_summary(data):
         print(f"{label}: {shape_factor_m:.4g} m")
 
     if "analysis_valid_count" in data:
+        analysis_label = (
+            "accepted averaged analyses"
+            if _scalar_text(data.get("shot_analysis_mode", "individual"))
+            == "average"
+            else "accepted shot analyses"
+        )
         print(
-            "accepted shot analyses: "
+            f"{analysis_label}: "
             f"{int(np.sum(np.asarray(data['analysis_valid_count'])))}"
         )
     elif "te_raw_eV" in data:

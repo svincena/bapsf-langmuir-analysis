@@ -41,6 +41,7 @@ def test_configure_xy_analysis_derives_spatial_and_shot_shapes():
     assert analysis.Y.shape == (values["ny"], values["nx"])
     assert analysis.nt == (values["sweep_end_index"] - values["sweep_start_index"] + 1)
     assert analysis.n_expected_shots == (values["ny"] * values["nx"] * values["nshots"])
+    assert analysis.shot_analysis_mode == "individual"
     source_path = analysis.Path(values["filename"])
     assert analysis.diagnostic_plot_output_dir == source_path.with_name(
         f"{source_path.stem}_Langmuir_diagnostic_plots"
@@ -53,6 +54,59 @@ def test_diagnostic_plot_directory_is_named_for_and_beside_source_file(tmp_path)
     assert analysis.diagnostic_plot_directory(source_path) == (
         tmp_path / "experiment run_Langmuir_diagnostic_plots"
     )
+
+
+def test_prepare_trace_for_analysis_selects_one_individual_shot():
+    voltage = np.array([[[0.0, 1.0, 2.0], [0.1, 1.1, 2.1]]])
+    current = 2.0 * voltage - 1.0
+
+    selected_voltage, selected_current = analysis.prepare_trace_for_analysis(
+        voltage,
+        current,
+        (0, 1),
+        "individual",
+        0.25,
+    )
+
+    assert np.array_equal(selected_voltage, voltage[0, 1])
+    assert np.array_equal(selected_current, current[0, 1])
+
+
+def test_prepare_trace_for_analysis_averages_shots_in_voltage_bins():
+    voltage = np.array([[[0.0, 1.0, 2.0], [0.1, 1.1, 2.1]]])
+    current = np.array([[[0.0, 2.0, 4.0], [2.0, 4.0, 6.0]]])
+
+    averaged_voltage, averaged_current = analysis.prepare_trace_for_analysis(
+        voltage,
+        current,
+        (0, 0),
+        "average",
+        0.5,
+    )
+
+    assert np.allclose(averaged_voltage, [0.05, 1.05, 2.05])
+    assert np.allclose(averaged_current, [1.0, 3.0, 5.0])
+
+
+def test_averaged_mode_marks_per_shot_fit_products_unavailable():
+    assert analysis.analysis_trace_shape((2, 3), 4, "individual") == (2, 3, 4)
+    assert analysis.analysis_trace_shape((2, 3), 4, "average") == (2, 3, 1)
+
+    products = analysis.unavailable_per_shot_fit_products((2, 3), 4, 8)
+
+    assert products["te_shot"].shape == (2, 3, 4)
+    assert np.all(np.isnan(products["te_shot"]))
+    assert products["iv_current_grid_shot"].shape == (2, 3, 4, 8)
+    assert np.all(np.isnan(products["iv_current_grid_shot"]))
+    assert not np.any(products["analysis_ok_shot"])
+
+    available, stage = analysis.shot_statistics_metadata("average", 4)
+    assert not available
+    assert "unavailable" in stage
+
+    available, stage = analysis.shot_statistics_metadata("individual", 4)
+    assert available
+    assert "individual fits" in stage
 
 
 def test_select_xline_from_xy_map_uses_nearest_y_coordinate():

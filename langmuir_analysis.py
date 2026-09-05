@@ -44,7 +44,7 @@ from langmuir_analysis_config import (
     load_last_parameters,
     validate_parameters,
 )
-from langmuir_analysis_core import analyze_iv_trace
+from langmuir_analysis_core import analyze_iv_trace, bin_average_by_voltage
 from langmuir_diagnostics import (
     render_iv_diagnostic_plot as render_analysis_iv_diagnostic_plot,
 )
@@ -68,6 +68,7 @@ sis_config_name: Any = _RUNTIME_UNCONFIGURED
 nx: Any = _RUNTIME_UNCONFIGURED
 ny: Any = _RUNTIME_UNCONFIGURED
 nshots: Any = _RUNTIME_UNCONFIGURED
+shot_analysis_mode: Any = _RUNTIME_UNCONFIGURED
 nt_full: Any = _RUNTIME_UNCONFIGURED
 x_min: Any = _RUNTIME_UNCONFIGURED
 x_max: Any = _RUNTIME_UNCONFIGURED
@@ -559,6 +560,94 @@ def analyze_trace_worker(task):
     result["flat_index"] = flat_index
     result["idx"] = idx
     return result
+
+
+def analysis_trace_shape(spatial_shape, shot_count, mode):
+    """Return the fit-array shape for individual-shot or averaged analysis."""
+    if mode == "individual":
+        return tuple(spatial_shape) + (int(shot_count),)
+    if mode == "average":
+        return tuple(spatial_shape) + (1,)
+    raise ValueError(f"Unknown shot analysis mode {mode!r}.")
+
+
+def prepare_trace_for_analysis(
+    voltage_by_shot,
+    current_by_shot,
+    fit_index,
+    mode,
+    voltage_bin_width,
+):
+    """Select one shot or form one voltage-binned mean across all shots."""
+    voltage_by_shot = np.asarray(voltage_by_shot, dtype=float)
+    current_by_shot = np.asarray(current_by_shot, dtype=float)
+    if voltage_by_shot.shape != current_by_shot.shape:
+        raise ValueError("Voltage and current shot arrays must have the same shape.")
+
+    fit_index = tuple(fit_index)
+    if mode == "individual":
+        return (
+            voltage_by_shot[fit_index + (slice(None),)],
+            current_by_shot[fit_index + (slice(None),)],
+        )
+    if mode != "average":
+        raise ValueError(f"Unknown shot analysis mode {mode!r}.")
+
+    # The final fit-index entry is a singleton fit axis, not a physical shot.
+    # Pooling first and then binning by measured voltage tolerates small timing
+    # and endpoint differences between otherwise repeated voltage sweeps.
+    spatial_index = fit_index[:-1]
+    voltage = voltage_by_shot[spatial_index].reshape(-1)
+    current = current_by_shot[spatial_index].reshape(-1)
+    voltage_mean, current_mean = bin_average_by_voltage(
+        voltage,
+        current,
+        bin_width=voltage_bin_width,
+    )
+    if voltage_mean is None:
+        return np.empty(0, dtype=float), np.empty(0, dtype=float)
+    return voltage_mean, current_mean
+
+
+def unavailable_per_shot_fit_products(spatial_shape, shot_count, diagnostic_points):
+    """Return empty per-shot products when only an averaged fit was performed."""
+    shot_shape = tuple(spatial_shape) + (int(shot_count),)
+    grid_shape = shot_shape + (int(diagnostic_points),)
+    return {
+        "te_shot": np.full(shot_shape, np.nan),
+        "vp_shot": np.full(shot_shape, np.nan),
+        "vf_shot": np.full(shot_shape, np.nan),
+        "ies_shot": np.full(shot_shape, np.nan),
+        "iis_shot": np.full(shot_shape, np.nan),
+        "n_e_shot": np.full(shot_shape, np.nan),
+        "analysis_ok_shot": np.zeros(shot_shape, dtype=np.uint8),
+        "statistics_fit_mask": np.zeros(shot_shape, dtype=bool),
+        "te_fit_r2_shot": np.full(shot_shape, np.nan),
+        "te_fit_rmse_shot": np.full(shot_shape, np.nan),
+        "te_fit_npts_shot": np.full(shot_shape, np.nan),
+        "te_fit_vstart_shot": np.full(shot_shape, np.nan),
+        "te_fit_vstop_shot": np.full(shot_shape, np.nan),
+        "te_fit_slope_shot": np.full(shot_shape, np.nan),
+        "te_fit_intercept_shot": np.full(shot_shape, np.nan),
+        "te_fit_i0_shot": np.full(shot_shape, np.nan),
+        "te_fit_passed_r2_shot": np.zeros(shot_shape, dtype=np.uint8),
+        "te_fit_candidate_count_shot": np.zeros(shot_shape, dtype=int),
+        "iv_voltage_grid_shot": np.full(grid_shape, np.nan),
+        "iv_current_grid_shot": np.full(grid_shape, np.nan),
+        "iv_didv_grid_shot": np.full(grid_shape, np.nan),
+        "iv_fit_mask_grid_shot": np.zeros(grid_shape, dtype=np.uint8),
+    }
+
+
+def shot_statistics_metadata(mode, shot_count):
+    """Describe whether fit-derived shot statistics exist for this run."""
+    if mode == "average":
+        return False, "unavailable; shots averaged in voltage bins before fitting"
+    if mode == "individual":
+        if int(shot_count) < 2:
+            return False, "unavailable; only one shot was configured"
+        return True, "individual fits before spatial post-processing"
+    raise ValueError(f"Unknown shot analysis mode {mode!r}.")
 
 
 def choose_analysis_process_count(n_traces, requested_processes=None):
@@ -1572,7 +1661,7 @@ def run_xline_analysis():
     # Prepare output arrays
 
     spatial_shape = (nx,)
-    trace_shape = spatial_shape + (nshots,)
+    trace_shape = analysis_trace_shape(spatial_shape, nshots, shot_analysis_mode)
     n_traces = int(np.prod(trace_shape))
 
     te_shot = np.full(trace_shape, np.nan)
@@ -1607,6 +1696,13 @@ def run_xline_analysis():
     for flat_index in range(n_traces):
         idx = np.unravel_index(flat_index, trace_shape)
         ix, ishot = idx
+        bias_values, current_values = prepare_trace_for_analysis(
+            vsweep_shot.value,
+            isweep_shot.value,
+            idx,
+            shot_analysis_mode,
+            voltage_bin_width,
+        )
         include_diagnostic_data = (
             diagnostic_plot_every is not None
             and diagnostic_plot_every > 0
@@ -1617,8 +1713,8 @@ def run_xline_analysis():
             (
                 flat_index,
                 idx,
-                vsweep_shot.value[idx + (slice(None),)],
-                isweep_shot.value[idx + (slice(None),)],
+                bias_values,
+                current_values,
                 include_diagnostic_data,
                 langmuir_analysis_config,
             )
@@ -1693,14 +1789,26 @@ def run_xline_analysis():
 
                 diagnostic_data = result["diagnostic_data"]
                 if diagnostic_data is not None:
+                    fit_label = (
+                        "averaged shots"
+                        if shot_analysis_mode == "average"
+                        else f"shot {ishot}"
+                    )
+                    file_label = (
+                        "shots_averaged"
+                        if shot_analysis_mode == "average"
+                        else f"shot{ishot:03d}"
+                    )
                     fig = render_analysis_iv_diagnostic_plot(
                         result,
-                        f"Diagnostic IV analysis at x index {ix}, shot {ishot} (x = {x[ix]:.2f} cm)",
+                        f"Diagnostic IV analysis at x index {ix}, {fit_label} "
+                        f"(x = {x[ix]:.2f} cm)",
                     )
                     save_diagnostic_figure(
                         fig,
                         diagnostic_plot_output_dir,
-                        f"{Path(filename).stem}_iv_diagnostic_ix{ix:03d}_shot{ishot:03d}_x_{x[ix]:+.2f}cm",
+                        f"{Path(filename).stem}_iv_diagnostic_ix{ix:03d}_"
+                        f"{file_label}_x_{x[ix]:+.2f}cm",
                     )
                     plt.show(block=False)
                     plt.pause(example_pause_seconds)
@@ -1758,14 +1866,26 @@ def run_xline_analysis():
 
             diagnostic_data = result["diagnostic_data"]
             if diagnostic_data is not None:
+                fit_label = (
+                    "averaged shots"
+                    if shot_analysis_mode == "average"
+                    else f"shot {ishot}"
+                )
+                file_label = (
+                    "shots_averaged"
+                    if shot_analysis_mode == "average"
+                    else f"shot{ishot:03d}"
+                )
                 fig = render_analysis_iv_diagnostic_plot(
                     result,
-                    f"Diagnostic IV analysis at x index {ix}, shot {ishot} (x = {x[ix]:.2f} cm)",
+                    f"Diagnostic IV analysis at x index {ix}, {fit_label} "
+                    f"(x = {x[ix]:.2f} cm)",
                 )
                 save_diagnostic_figure(
                     fig,
                     diagnostic_plot_output_dir,
-                    f"{Path(filename).stem}_iv_diagnostic_ix{ix:03d}_shot{ishot:03d}_x_{x[ix]:+.2f}cm",
+                    f"{Path(filename).stem}_iv_diagnostic_ix{ix:03d}_"
+                    f"{file_label}_x_{x[ix]:+.2f}cm",
                 )
                 plt.show(block=False)
                 plt.pause(example_pause_seconds)
@@ -1808,9 +1928,14 @@ def run_xline_analysis():
     analysis_ok = (analysis_valid_count > 0).astype(np.uint8)
     accepted_trace_count = int(np.sum(analysis_ok_shot))
     reported_trace_count = int(np.count_nonzero(np.isfinite(te_shot)))
+    fit_description = (
+        "shot-averaged fits"
+        if shot_analysis_mode == "average"
+        else "per-shot fits"
+    )
     analysis_status = (
-        f"Reported {reported_trace_count}/{n_traces} finite fits; "
-        f"accepted {accepted_trace_count}/{n_traces} fits"
+        f"Reported {reported_trace_count}/{n_traces} finite {fit_description}; "
+        f"accepted {accepted_trace_count}/{n_traces} {fit_description}"
     )
     if analysis_rejection_counts:
         common_reason, common_count = analysis_rejection_counts.most_common(1)[0]
@@ -1825,7 +1950,48 @@ def run_xline_analysis():
     iv_didv_grid = np.nanmean(iv_didv_grid_shot, axis=-2)
     iv_fit_mask_grid = np.any(iv_fit_mask_grid_shot.astype(bool), axis=-2).astype(np.uint8)
 
-    print("Finished per-shot Langmuir probe analysis and spatial statistics")
+    shot_statistics_available, shot_statistics_stage = shot_statistics_metadata(
+        shot_analysis_mode,
+        nshots,
+    )
+    if shot_analysis_mode == "average":
+        isat_std = np.full(spatial_shape, np.nan) * u.A
+        unavailable = unavailable_per_shot_fit_products(
+            spatial_shape,
+            nshots,
+            iv_npts,
+        )
+        te_shot = unavailable["te_shot"]
+        vp_shot = unavailable["vp_shot"]
+        vf_shot = unavailable["vf_shot"]
+        ies_shot = unavailable["ies_shot"]
+        iis_shot = unavailable["iis_shot"]
+        n_e_shot = unavailable["n_e_shot"]
+        analysis_ok_shot = unavailable["analysis_ok_shot"]
+        statistics_fit_mask = unavailable["statistics_fit_mask"]
+        te_fit_r2_shot = unavailable["te_fit_r2_shot"]
+        te_fit_rmse_shot = unavailable["te_fit_rmse_shot"]
+        te_fit_npts_shot = unavailable["te_fit_npts_shot"]
+        te_fit_vstart_shot = unavailable["te_fit_vstart_shot"]
+        te_fit_vstop_shot = unavailable["te_fit_vstop_shot"]
+        te_fit_slope_shot = unavailable["te_fit_slope_shot"]
+        te_fit_intercept_shot = unavailable["te_fit_intercept_shot"]
+        te_fit_i0_shot = unavailable["te_fit_i0_shot"]
+        te_fit_passed_r2_shot = unavailable["te_fit_passed_r2_shot"]
+        te_fit_candidate_count_shot = unavailable["te_fit_candidate_count_shot"]
+        iv_voltage_grid_shot = unavailable["iv_voltage_grid_shot"]
+        iv_current_grid_shot = unavailable["iv_current_grid_shot"]
+        iv_didv_grid_shot = unavailable["iv_didv_grid_shot"]
+        iv_fit_mask_grid_shot = unavailable["iv_fit_mask_grid_shot"]
+
+    print(
+        "Finished "
+        + (
+            "shot-averaged Langmuir probe analysis"
+            if shot_analysis_mode == "average"
+            else "per-shot Langmuir probe analysis and spatial statistics"
+        )
+    )
 
     # %%
     # Optional post-processing along x
@@ -1922,7 +2088,7 @@ def run_xline_analysis():
             ies_std=ies_std,
             iis_std=iis_std,
             n_e_std=n_e_std,
-            plot_stds=plot_summary_stds and nshots > 1,
+            plot_stds=plot_summary_stds and shot_statistics_available,
             vp_spike_mask=vp_spike_mask,
             vp_raw=vp_raw,
             te_fit_r2=te_fit_r2,
@@ -2103,7 +2269,7 @@ def run_xline_analysis():
                     ies_std=ies_std,
                     iis_std=iis_std,
                     n_e_std=n_e_std,
-                    plot_stds=plot_summary_stds and nshots > 1,
+                    plot_stds=plot_summary_stds and shot_statistics_available,
                     vp_spike_mask=vp_spike_mask,
                     vp_raw=vp_raw,
                     te_fit_r2=te_fit_r2,
@@ -2141,9 +2307,12 @@ def run_xline_analysis():
             grp.attrs["fixed_y_cm"] = 0.0
 
             grp.attrs["nx"] = nx
-            grp.attrs["n_traces"] = n_traces
+            grp.attrs["n_traces"] = nx * nshots
+            grp.attrs["n_analysis_traces"] = n_traces
+            grp.attrs["n_acquired_traces"] = nx * nshots
             grp.attrs["trace_spatial_ndim"] = len(spatial_shape)
             grp.attrs["nshots"] = nshots
+            grp.attrs["shot_analysis_mode"] = shot_analysis_mode
             grp.attrs["nt_full"] = nt_full
             grp.attrs["nt_sweep"] = nt
             grp.attrs["dt_s"] = dt
@@ -2215,8 +2384,11 @@ def run_xline_analysis():
             grp.attrs["enforce_ideal_model_checks"] = int(enforce_ideal_model_checks)
             grp.attrs["subtract_dc"] = int(subtract_dc)
             grp.attrs["shot_standard_deviation_ddof"] = 1
+            grp.attrs["shot_statistics_available"] = int(
+                shot_statistics_available
+            )
             grp.attrs["per_shot_axis_order"] = "x,shot"
-            grp.attrs["shot_statistics_stage"] = "individual fits before spatial post-processing"
+            grp.attrs["shot_statistics_stage"] = shot_statistics_stage
             grp.attrs["profile_value_policy"] = (
                 "finite estimates retained; analysis_ok records fit acceptance"
             )
@@ -2244,6 +2416,12 @@ def run_xline_analysis():
         xline_npz_data = {
             "source_file": np.array(str(filename)),
             "geometry": np.array("x_line"),
+            "shot_analysis_mode": np.array(shot_analysis_mode),
+            "shot_statistics_available": np.array(
+                int(shot_statistics_available)
+            ),
+            "n_analysis_traces": np.array(n_traces),
+            "n_acquired_traces": np.array(nx * nshots),
             "fixed_y_cm": np.array(0.0),
             "x_cm": x,
             "y_cm": xline_y,
@@ -2340,7 +2518,7 @@ def run_xline_analysis():
             "te_fit_candidate_count_shot": te_fit_candidate_count_shot,
             "shot_standard_deviation_ddof": np.array(1),
             "per_shot_axis_order": np.array("x,shot"),
-            "shot_statistics_stage": np.array("individual fits before spatial post-processing"),
+            "shot_statistics_stage": np.array(shot_statistics_stage),
             "profile_value_policy": np.array(
                 "finite estimates retained; analysis_ok records fit acceptance"
             ),
@@ -2503,7 +2681,7 @@ def run_xy_analysis():
     # Prepare output arrays
 
     spatial_shape = (ny, nx)
-    trace_shape = spatial_shape + (nshots,)
+    trace_shape = analysis_trace_shape(spatial_shape, nshots, shot_analysis_mode)
     n_traces = int(np.prod(trace_shape))
 
     te_shot = np.full(trace_shape, np.nan)
@@ -2537,6 +2715,13 @@ def run_xy_analysis():
     analysis_tasks = []
     for flat_index in range(n_traces):
         idx = np.unravel_index(flat_index, trace_shape)
+        bias_values, current_values = prepare_trace_for_analysis(
+            vsweep_shot.value,
+            isweep_shot.value,
+            idx,
+            shot_analysis_mode,
+            voltage_bin_width,
+        )
         include_diagnostic_data = (
             diagnostic_plot_every is not None
             and diagnostic_plot_every > 0
@@ -2546,8 +2731,8 @@ def run_xy_analysis():
             (
                 flat_index,
                 idx,
-                vsweep_shot.value[idx + (slice(None),)],
-                isweep_shot.value[idx + (slice(None),)],
+                bias_values,
+                current_values,
                 include_diagnostic_data,
                 langmuir_analysis_config,
             )
@@ -2622,16 +2807,26 @@ def run_xy_analysis():
 
                 diagnostic_data = result["diagnostic_data"]
                 if diagnostic_data is not None:
+                    fit_label = (
+                        "averaged shots"
+                        if shot_analysis_mode == "average"
+                        else f"shot {ishot}"
+                    )
+                    file_label = (
+                        "shots_averaged"
+                        if shot_analysis_mode == "average"
+                        else f"shot{ishot:03d}"
+                    )
                     fig = render_analysis_iv_diagnostic_plot(
                         result,
-                        f"Diagnostic IV analysis at index {idx} "
-                        f"shot {ishot} (x = {x[ix]:.2f} cm, y = {y[iy]:.2f} cm)",
+                        f"Diagnostic IV analysis at (y, x) index ({iy}, {ix}), "
+                        f"{fit_label} (x = {x[ix]:.2f} cm, y = {y[iy]:.2f} cm)",
                     )
                     save_diagnostic_figure(
                         fig,
                         diagnostic_plot_output_dir,
                         f"{Path(filename).stem}_iv_diagnostic_iy{iy:03d}_ix{ix:03d}_"
-                        f"shot{ishot:03d}_y_{y[iy]:+.2f}cm_x_{x[ix]:+.2f}cm",
+                        f"{file_label}_y_{y[iy]:+.2f}cm_x_{x[ix]:+.2f}cm",
                     )
                     plt.show(block=False)
                     plt.pause(example_pause_seconds)
@@ -2689,16 +2884,26 @@ def run_xy_analysis():
 
             diagnostic_data = result["diagnostic_data"]
             if diagnostic_data is not None:
+                fit_label = (
+                    "averaged shots"
+                    if shot_analysis_mode == "average"
+                    else f"shot {ishot}"
+                )
+                file_label = (
+                    "shots_averaged"
+                    if shot_analysis_mode == "average"
+                    else f"shot{ishot:03d}"
+                )
                 fig = render_analysis_iv_diagnostic_plot(
                     result,
-                    f"Diagnostic IV analysis at index {idx} "
-                    f"shot {ishot} (x = {x[ix]:.2f} cm, y = {y[iy]:.2f} cm)",
+                    f"Diagnostic IV analysis at (y, x) index ({iy}, {ix}), "
+                    f"{fit_label} (x = {x[ix]:.2f} cm, y = {y[iy]:.2f} cm)",
                 )
                 save_diagnostic_figure(
                     fig,
                     diagnostic_plot_output_dir,
                     f"{Path(filename).stem}_iv_diagnostic_iy{iy:03d}_ix{ix:03d}_"
-                    f"shot{ishot:03d}_y_{y[iy]:+.2f}cm_x_{x[ix]:+.2f}cm",
+                    f"{file_label}_y_{y[iy]:+.2f}cm_x_{x[ix]:+.2f}cm",
                 )
                 plt.show(block=False)
                 plt.pause(example_pause_seconds)
@@ -2740,9 +2945,14 @@ def run_xy_analysis():
     analysis_ok = (analysis_valid_count > 0).astype(np.uint8)
     accepted_trace_count = int(np.sum(analysis_ok_shot))
     reported_trace_count = int(np.count_nonzero(np.isfinite(te_shot)))
+    fit_description = (
+        "shot-averaged fits"
+        if shot_analysis_mode == "average"
+        else "per-shot fits"
+    )
     analysis_status = (
-        f"Reported {reported_trace_count}/{n_traces} finite fits; "
-        f"accepted {accepted_trace_count}/{n_traces} fits"
+        f"Reported {reported_trace_count}/{n_traces} finite {fit_description}; "
+        f"accepted {accepted_trace_count}/{n_traces} {fit_description}"
     )
     if analysis_rejection_counts:
         common_reason, common_count = analysis_rejection_counts.most_common(1)[0]
@@ -2757,7 +2967,48 @@ def run_xy_analysis():
     iv_didv_grid = np.nanmean(iv_didv_grid_shot, axis=-2)
     iv_fit_mask_grid = np.any(iv_fit_mask_grid_shot.astype(bool), axis=-2).astype(np.uint8)
 
-    print("Finished per-shot Langmuir probe analysis and spatial statistics")
+    shot_statistics_available, shot_statistics_stage = shot_statistics_metadata(
+        shot_analysis_mode,
+        nshots,
+    )
+    if shot_analysis_mode == "average":
+        isat_std = np.full(spatial_shape, np.nan) * u.A
+        unavailable = unavailable_per_shot_fit_products(
+            spatial_shape,
+            nshots,
+            iv_npts,
+        )
+        te_shot = unavailable["te_shot"]
+        vp_shot = unavailable["vp_shot"]
+        vf_shot = unavailable["vf_shot"]
+        ies_shot = unavailable["ies_shot"]
+        iis_shot = unavailable["iis_shot"]
+        n_e_shot = unavailable["n_e_shot"]
+        analysis_ok_shot = unavailable["analysis_ok_shot"]
+        statistics_fit_mask = unavailable["statistics_fit_mask"]
+        te_fit_r2_shot = unavailable["te_fit_r2_shot"]
+        te_fit_rmse_shot = unavailable["te_fit_rmse_shot"]
+        te_fit_npts_shot = unavailable["te_fit_npts_shot"]
+        te_fit_vstart_shot = unavailable["te_fit_vstart_shot"]
+        te_fit_vstop_shot = unavailable["te_fit_vstop_shot"]
+        te_fit_slope_shot = unavailable["te_fit_slope_shot"]
+        te_fit_intercept_shot = unavailable["te_fit_intercept_shot"]
+        te_fit_i0_shot = unavailable["te_fit_i0_shot"]
+        te_fit_passed_r2_shot = unavailable["te_fit_passed_r2_shot"]
+        te_fit_candidate_count_shot = unavailable["te_fit_candidate_count_shot"]
+        iv_voltage_grid_shot = unavailable["iv_voltage_grid_shot"]
+        iv_current_grid_shot = unavailable["iv_current_grid_shot"]
+        iv_didv_grid_shot = unavailable["iv_didv_grid_shot"]
+        iv_fit_mask_grid_shot = unavailable["iv_fit_mask_grid_shot"]
+
+    print(
+        "Finished "
+        + (
+            "shot-averaged Langmuir probe analysis"
+            if shot_analysis_mode == "average"
+            else "per-shot Langmuir probe analysis and spatial statistics"
+        )
+    )
 
     # %%
     # Optional post-processing on XY maps
@@ -3090,9 +3341,12 @@ def run_xy_analysis():
 
             grp.attrs["ny"] = ny
             grp.attrs["nx"] = nx
-            grp.attrs["n_traces"] = n_traces
+            grp.attrs["n_traces"] = ny * nx * nshots
+            grp.attrs["n_analysis_traces"] = n_traces
+            grp.attrs["n_acquired_traces"] = ny * nx * nshots
             grp.attrs["trace_spatial_ndim"] = len(spatial_shape)
             grp.attrs["nshots"] = nshots
+            grp.attrs["shot_analysis_mode"] = shot_analysis_mode
             grp.attrs["nt_full"] = nt_full
             grp.attrs["nt_sweep"] = nt
             grp.attrs["dt_s"] = dt
@@ -3168,8 +3422,11 @@ def run_xy_analysis():
             grp.attrs["enforce_ideal_model_checks"] = int(enforce_ideal_model_checks)
             grp.attrs["subtract_dc"] = int(subtract_dc)
             grp.attrs["shot_standard_deviation_ddof"] = 1
+            grp.attrs["shot_statistics_available"] = int(
+                shot_statistics_available
+            )
             grp.attrs["per_shot_axis_order"] = "y,x,shot"
-            grp.attrs["shot_statistics_stage"] = "individual fits before spatial post-processing"
+            grp.attrs["shot_statistics_stage"] = shot_statistics_stage
             grp.attrs["profile_value_policy"] = (
                 "finite estimates retained; analysis_ok records fit acceptance"
             )
@@ -3198,6 +3455,12 @@ def run_xy_analysis():
         xy_npz_data = {
             "source_file": np.array(str(filename)),
             "geometry": np.array("xy_plane"),
+            "shot_analysis_mode": np.array(shot_analysis_mode),
+            "shot_statistics_available": np.array(
+                int(shot_statistics_available)
+            ),
+            "n_analysis_traces": np.array(n_traces),
+            "n_acquired_traces": np.array(ny * nx * nshots),
             "calculate_shape_factor": np.array(int(calculate_shape_factor)),
             "shape_factor_m": np.array(
                 np.nan if shape_factor is None else shape_factor.to_value(u.m)
@@ -3318,7 +3581,7 @@ def run_xy_analysis():
             "te_fit_candidate_count_shot": te_fit_candidate_count_shot,
             "shot_standard_deviation_ddof": np.array(1),
             "per_shot_axis_order": np.array("y,x,shot"),
-            "shot_statistics_stage": np.array("individual fits before spatial post-processing"),
+            "shot_statistics_stage": np.array(shot_statistics_stage),
             "profile_value_policy": np.array(
                 "finite estimates retained; analysis_ok records fit acceptance"
             ),

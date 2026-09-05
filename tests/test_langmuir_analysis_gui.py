@@ -39,6 +39,10 @@ def test_gui_has_one_fully_populated_tab_per_geometry(
     xline_tab.set_values({"ies_method": "at_vp"})
     assert xline_tab.values()["ies_method"] == "at_vp"
     assert "plasma potential" in xline_tab.editors["ies_method"].currentText()
+    assert xline_tab.values()["shot_analysis_mode"] == "individual"
+    xline_tab.set_values({"shot_analysis_mode": "average"})
+    assert xline_tab.values()["shot_analysis_mode"] == "average"
+    assert "Average shots" in xline_tab.editors["shot_analysis_mode"].currentText()
     assert not xline_tab.editors["isweep_dc_offset_start_index"].isEnabled()
     xline_tab.editors["subtract_dc"].setChecked(True)
     assert xline_tab.editors["isweep_dc_offset_start_index"].isEnabled()

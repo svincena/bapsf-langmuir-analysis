@@ -27,6 +27,8 @@ GEOMETRY_TITLES = {
 CHOICE_LABELS = {
     "high_bias_median": "High-bias regional median",
     "at_vp": "At plasma potential (ion-subtracted)",
+    "individual": "Fit each shot separately",
+    "average": "Average shots before fitting",
 }
 
 

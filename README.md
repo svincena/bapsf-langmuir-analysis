@@ -113,6 +113,17 @@ The two definitions coincide only when the ion-subtracted electron current at
 record both `ies_method` and a human-readable `ies_definition` so the choice is
 not ambiguous during later analysis.
 
+The **Shot fitting mode** control determines when repeated shots are combined.
+**Fit each shot separately** preserves the default workflow: every shot is fit
+independently, then the fitted quantities are averaged and their sample
+standard deviations are calculated. **Average shots before fitting** pools the
+measured samples from all shots at each spatial location, averages them in the
+configured voltage bins, and performs one Langmuir fit on that mean I–V curve.
+This voltage-space average tolerates small timing and endpoint differences
+between sweeps. In averaged mode, fit-derived shot standard deviations and
+per-shot fit products are stored as unavailable (`NaN`); the result metadata
+records `shot_analysis_mode` and `shot_statistics_available`.
+
 The solver records fit quality, uncertainties, model-consistency notes, and
 rejection reasons. Finite estimates may be retained for diagnosis even when a
 trace fails the full acceptance policy; use `analysis_ok` and the related

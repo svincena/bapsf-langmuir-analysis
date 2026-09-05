@@ -17,6 +17,7 @@ from typing import Any
 PARAMETER_FILE_VERSION = 1
 LAST_PARAMETERS_PATH = Path(__file__).with_name("last_parameters.json")
 SUPPORTED_GEOMETRIES = ("x_line", "xy_plane")
+SUPPORTED_SHOT_ANALYSIS_MODES = ("individual", "average")
 
 
 @dataclass(frozen=True)
@@ -247,6 +248,14 @@ def _sections_for_geometry(geometry):
                     "Repeated shots at each spatial location.",
                     minimum=1,
                     maximum=100_000,
+                ),
+                _p(
+                    "shot_analysis_mode",
+                    "Shot fitting mode",
+                    "choice",
+                    "individual",
+                    "Fit every shot independently, or average shots in voltage bins before fitting.",
+                    choices=SUPPORTED_SHOT_ANALYSIS_MODES,
                 ),
                 _p(
                     "nt_full",
