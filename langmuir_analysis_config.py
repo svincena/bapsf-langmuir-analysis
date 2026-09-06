@@ -332,7 +332,7 @@ def _sections_for_geometry(geometry):
             stack_with_previous=True,
         ),
         SectionSpec(
-            "Digitizer and probe",
+            "Probe",
             "Conversion from digitizer signal to probe voltage and current.",
             (
                 _p(

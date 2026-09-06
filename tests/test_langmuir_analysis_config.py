@@ -91,7 +91,7 @@ def test_channel_routing_is_grouped_with_data_source(geometry):
         "board",
         "vsweep_channel",
         "isweep_channel",
-    }.intersection(sections["Digitizer and probe"])
+    }.intersection(sections["Probe"])
 
 
 @pytest.mark.parametrize("geometry", SUPPORTED_GEOMETRIES)
