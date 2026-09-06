@@ -197,18 +197,11 @@ def configure_analysis(geometry, parameter_values):
         N_passes=values["N_passes"],
         interferometer_phase=values["interferometer_phase_rad"] * u.rad,
     )
-    if geometry == "x_line":
-        runtime.update(
-            nramps=values["nramps"],
-            ramp_start_spacing_samples=values["ramp_start_spacing_samples"],
-            ramp_display_mode=values["ramp_display_mode"],
-        )
-    else:
-        runtime.update(
-            nramps=1,
-            ramp_start_spacing_samples=runtime["nt"],
-            ramp_display_mode="separate_profiles",
-        )
+    runtime.update(
+        nramps=values["nramps"],
+        ramp_start_spacing_samples=values["ramp_start_spacing_samples"],
+        ramp_display_mode=values.get("ramp_display_mode", "separate_maps"),
+    )
 
     n_spatial_positions = values["nx"]
     if geometry == "xy_plane":
@@ -536,6 +529,98 @@ def scale_xy_density_map_to_interferometer(
         "normalized_xline": normalized_xline,
         "scaled_xline": scaled_xline,
         "scaled_density_map": scaled_density_map,
+    }
+
+
+def select_xline_from_xy_ramps(y_cm, density_maps, requested_y_cm=0.0):
+    """Select one y row from a single XY map or a stack of ramp maps."""
+    density_shape = np.shape(density_maps)
+    if len(density_shape) == 2:
+        return select_xline_from_xy_map(
+            y_cm,
+            density_maps,
+            requested_y_cm=requested_y_cm,
+        )
+    if len(density_shape) != 3:
+        raise ValueError(
+            "density_maps must have shape (ny, nx) or (ny, nx, nramps); "
+            f"got {density_shape}."
+        )
+    y_index, selected_y_cm, _ = select_xline_from_xy_map(
+        y_cm,
+        density_maps[..., 0],
+        requested_y_cm=requested_y_cm,
+    )
+    return y_index, selected_y_cm, density_maps[y_index, ...]
+
+
+def scale_xy_density_ramps_to_interferometer(
+    x_cm,
+    y_cm,
+    density_maps,
+    line_integrated_density,
+    requested_y_cm=0.0,
+):
+    """Calibrate every XY ramp map independently from the selected x-line."""
+    density = u.Quantity(density_maps).to(u.m**-3)
+    if density.ndim == 2:
+        return scale_xy_density_map_to_interferometer(
+            x_cm,
+            y_cm,
+            density,
+            line_integrated_density,
+            requested_y_cm=requested_y_cm,
+        )
+    if density.ndim != 3 or density.shape[:2] != (len(y_cm), len(x_cm)):
+        raise ValueError(
+            "Multi-ramp XY density must have shape (ny, nx, nramps); "
+            f"got {density.shape}."
+        )
+
+    ramp_results = [
+        scale_xy_density_map_to_interferometer(
+            x_cm,
+            y_cm,
+            density[..., ramp_index],
+            line_integrated_density,
+            requested_y_cm=requested_y_cm,
+        )
+        for ramp_index in range(density.shape[-1])
+    ]
+    return {
+        "selected_y_index": ramp_results[0]["selected_y_index"],
+        "selected_y_cm": ramp_results[0]["selected_y_cm"],
+        "shape_factor": u.Quantity(
+            [result["shape_factor"].to_value(u.m) for result in ramp_results],
+            u.m,
+        ),
+        "density_scale": np.asarray(
+            [result["density_scale"] for result in ramp_results]
+        ),
+        "normalized_xline": np.stack(
+            [result["normalized_xline"] for result in ramp_results],
+            axis=-1,
+        ),
+        "scaled_xline": u.Quantity(
+            np.stack(
+                [
+                    result["scaled_xline"].to_value(u.m**-3)
+                    for result in ramp_results
+                ],
+                axis=-1,
+            ),
+            u.m**-3,
+        ),
+        "scaled_density_map": u.Quantity(
+            np.stack(
+                [
+                    result["scaled_density_map"].to_value(u.m**-3)
+                    for result in ramp_results
+                ],
+                axis=-1,
+            ),
+            u.m**-3,
+        ),
     }
 
 
@@ -1654,6 +1739,46 @@ def apply_optional_xy_postprocessing(
     return result_dict
 
 
+def apply_optional_xy_ramp_postprocessing(te, vp, vf, ies, iis, **kwargs):
+    """Apply XY spatial processing independently to every temporal ramp."""
+    te_values = np.asarray(te, dtype=float)
+    if te_values.ndim == 2:
+        return apply_optional_xy_postprocessing(
+            te,
+            vp,
+            vf,
+            ies,
+            iis,
+            **kwargs,
+        )
+    if te_values.ndim != 3:
+        raise ValueError(
+            "Multi-ramp XY values must have shape (ny, nx, nramps); "
+            f"got {te_values.shape}."
+        )
+
+    n_e = kwargs.pop("n_e", None)
+    ramp_results = []
+    for ramp_index in range(te_values.shape[-1]):
+        ramp_kwargs = dict(kwargs)
+        if n_e is not None:
+            ramp_kwargs["n_e"] = np.asarray(n_e)[..., ramp_index]
+        ramp_results.append(
+            apply_optional_xy_postprocessing(
+                te_values[..., ramp_index],
+                np.asarray(vp)[..., ramp_index],
+                np.asarray(vf)[..., ramp_index],
+                np.asarray(ies)[..., ramp_index],
+                np.asarray(iis)[..., ramp_index],
+                **ramp_kwargs,
+            )
+        )
+    return {
+        key: np.stack([result[key] for result in ramp_results], axis=-1)
+        for key in ramp_results[0]
+    }
+
+
 def _plot_map(ax, x_mesh, y_mesh, values, title, cbar_label):
     values = np.asarray(values, dtype=float)
     finite = np.isfinite(values)
@@ -1798,6 +1923,87 @@ def render_xy_summary_plot(
     return fig
 
 
+def render_xy_ramp_summary_plots(
+    x_mesh,
+    y_mesh,
+    ramp_center_time_s,
+    te,
+    vp,
+    vf,
+    ies,
+    iis,
+    n_e,
+    **kwargs,
+):
+    """Return one six-panel XY summary figure for each temporal ramp."""
+    te_values = np.asarray(te.value)
+    if te_values.ndim == 2:
+        return [
+            render_xy_summary_plot(
+                x_mesh,
+                y_mesh,
+                te,
+                vp,
+                vf,
+                ies,
+                iis,
+                n_e,
+                **kwargs,
+            )
+        ]
+    if te_values.ndim != 3:
+        raise ValueError(
+            "Multi-ramp XY values must have shape (ny, nx, nramps); "
+            f"got {te_values.shape}."
+        )
+
+    ramp_times = np.asarray(ramp_center_time_s, dtype=float)
+    if ramp_times.shape != (te_values.shape[-1],):
+        raise ValueError(
+            "Ramp center times must have one value per XY ramp; "
+            f"got {ramp_times.shape}."
+        )
+    per_ramp_names = (
+        "vp_spike_mask",
+        "vp_raw",
+        "te_fit_r2",
+        "analysis_ok",
+        "shape_factor",
+    )
+    ramp_kwargs = {name: kwargs.pop(name, None) for name in per_ramp_names}
+    base_title = kwargs.pop("title", "Langmuir XY-Plane Summary")
+    figures = []
+    for ramp_index, ramp_time in enumerate(ramp_times):
+        options = dict(kwargs)
+        for name, values in ramp_kwargs.items():
+            if values is None:
+                continue
+            if name == "shape_factor":
+                options[name] = u.Quantity(values)[ramp_index]
+            elif hasattr(values, "unit"):
+                options[name] = values[..., ramp_index]
+            else:
+                options[name] = np.asarray(values)[..., ramp_index]
+        options["title"] = (
+            f"{base_title} - Ramp {ramp_index + 1} "
+            f"(center {ramp_time:.6g} s)"
+        )
+        figures.append(
+            render_xy_summary_plot(
+                x_mesh,
+                y_mesh,
+                te[..., ramp_index],
+                vp[..., ramp_index],
+                vf[..., ramp_index],
+                ies[..., ramp_index],
+                iis[..., ramp_index],
+                n_e[..., ramp_index],
+                **options,
+            )
+        )
+    return figures
+
+
 def render_xy_all_iv_curves_plot(x_coord, y_coord, iv_voltage_grid, iv_current_grid, max_curves=400):
     """Plot a representative subset of interpolated I-V curves colored by y position."""
     fig, ax = plt.subplots(figsize=(9, 6), constrained_layout=True)
@@ -1806,14 +2012,18 @@ def render_xy_all_iv_curves_plot(x_coord, y_coord, iv_voltage_grid, iv_current_g
     y_min = np.nanmin(y_coord)
     y_max = np.nanmax(y_coord)
 
-    flat_indices = np.arange(iv_voltage_grid.shape[0] * iv_voltage_grid.shape[1])
+    iv_voltage_grid = np.asarray(iv_voltage_grid)
+    iv_current_grid = np.asarray(iv_current_grid)
+    curve_shape = iv_voltage_grid.shape[:-1]
+    flat_indices = np.arange(np.prod(curve_shape))
     if flat_indices.size > max_curves:
         flat_indices = np.linspace(0, flat_indices.size - 1, max_curves, dtype=int)
 
     for flat_index in flat_indices:
-        iy, ix = np.unravel_index(flat_index, iv_voltage_grid.shape[:2])
-        voltage_curve = iv_voltage_grid[iy, ix]
-        current_curve = iv_current_grid[iy, ix]
+        curve_index = np.unravel_index(flat_index, curve_shape)
+        iy, ix = curve_index[:2]
+        voltage_curve = iv_voltage_grid[curve_index]
+        current_curve = iv_current_grid[curve_index]
         good = np.isfinite(voltage_curve) & np.isfinite(current_curve)
         if np.count_nonzero(good) < 2:
             continue
@@ -1823,7 +2033,7 @@ def render_xy_all_iv_curves_plot(x_coord, y_coord, iv_voltage_grid, iv_current_g
             voltage_curve[good],
             current_curve[good],
             color=cmap(frac),
-            alpha=0.9,
+            alpha=0.9 if len(curve_shape) == 2 else 0.55,
             lw=1.2,
         )
 
@@ -3030,9 +3240,26 @@ def run_xy_analysis():
     )
     print(f"Current data reshaped to (y, x, shots, time): {isweep_full.shape}")
 
-    print("Extracting sweep regions")
-    vsweep = vsweep_full[..., sweep_start_index:sweep_end_index + 1]
-    isweep = isweep_full[..., sweep_start_index:sweep_end_index + 1]
+    print(f"Extracting {nramps} evenly spaced ramp(s)")
+    ramp_start_indices = (
+        sweep_start_index
+        + np.arange(nramps, dtype=np.int64) * ramp_start_spacing_samples
+    )
+    ramp_end_indices = ramp_start_indices + nt - 1
+    vsweep = extract_evenly_spaced_ramps(
+        vsweep_full,
+        sweep_start_index,
+        sweep_end_index,
+        nramps,
+        ramp_start_spacing_samples,
+    )
+    isweep = extract_evenly_spaced_ramps(
+        isweep_full,
+        sweep_start_index,
+        sweep_end_index,
+        nramps,
+        ramp_start_spacing_samples,
+    )
 
     if subtract_dc:
         if isweep_dc_offset_start_index is None or isweep_dc_offset_end_index is None:
@@ -3046,15 +3273,21 @@ def run_xy_analysis():
             < nt_full
         ):
             raise ValueError("the electronics-offset interval is outside the trace")
-        if not (
-            isweep_dc_offset_end_index < sweep_start_index
-            or isweep_dc_offset_start_index > sweep_end_index
-        ):
-            raise ValueError("the electronics-offset interval must not overlap the I-V sweep")
+        for ramp_start, ramp_end in zip(ramp_start_indices, ramp_end_indices):
+            if not (
+                isweep_dc_offset_end_index < ramp_start
+                or isweep_dc_offset_start_index > ramp_end
+            ):
+                raise ValueError(
+                    "the electronics-offset interval must not overlap any I-V ramp"
+                )
         print("Subtracting current DC offsets")
         isweep_dc_offset_portion = isweep_full[..., isweep_dc_offset_start_index:isweep_dc_offset_end_index + 1]
         isweep_dc_offsets = np.mean(isweep_dc_offset_portion, axis=-1)
-        isweep = isweep - isweep_dc_offsets[..., np.newaxis]
+        offset_shape = isweep_dc_offsets.shape + (1,) * (
+            isweep.ndim - isweep_dc_offsets.ndim
+        )
+        isweep = isweep - isweep_dc_offsets.reshape(offset_shape)
 
     file.close()
     print("Finished reading and reshaping data.")
@@ -3064,6 +3297,8 @@ def run_xy_analysis():
     # uses unsmoothed samples and performs averaging in voltage bins.
 
     time = np.arange(nt) * dt
+    ramp_start_time_s = ramp_start_indices * dt
+    ramp_center_time_s = (ramp_start_indices + 0.5 * (nt - 1)) * dt
 
     vsweep_shot = vsweep * u.V
     isweep_shot = isweep * u.A
@@ -3071,7 +3306,10 @@ def run_xy_analysis():
     isweep_mean = np.mean(isweep_shot, axis=2)
 
     isat = np.mean(isweep[..., isat_start_index:isat_end_index + 1], axis=-1)
-    isat_mean_values, isat_std_values, isat_count = shot_mean_and_std(isat)
+    isat_mean_values, isat_std_values, isat_count = shot_mean_and_std(
+        isat,
+        axis=2,
+    )
     isat_mean = isat_mean_values * u.A
     isat_std = isat_std_values * u.A
 
@@ -3097,7 +3335,15 @@ def run_xy_analysis():
     # Prepare output arrays
 
     spatial_shape = (ny, nx)
-    trace_shape = analysis_trace_shape(spatial_shape, nshots, shot_analysis_mode)
+    ramp_shape = (nramps,) if nramps > 1 else ()
+    profile_shape = spatial_shape + ramp_shape
+    xline_profile_shape = (nx,) + ramp_shape
+    trace_shape = analysis_trace_shape(
+        spatial_shape,
+        nshots,
+        shot_analysis_mode,
+        ramp_shape,
+    )
     n_traces = int(np.prod(trace_shape))
 
     te_shot = np.full(trace_shape, np.nan)
@@ -3137,6 +3383,7 @@ def run_xy_analysis():
             idx,
             shot_analysis_mode,
             voltage_bin_width,
+            shot_axis=2,
         )
         include_diagnostic_data = (
             diagnostic_plot_every is not None
@@ -3176,7 +3423,8 @@ def run_xy_analysis():
                 completed += 1
                 result = future.result()
                 idx = result["idx"]
-                iy, ix, ishot = idx
+                iy, ix, ishot = idx[:3]
+                iramp = idx[3] if nramps > 1 else 0
                 print(f"Finished trace {result['flat_index'] + 1}/{n_traces} at index {idx} ({completed}/{n_traces} complete)")
 
                 for warning in result["warnings"]:
@@ -3233,16 +3481,23 @@ def run_xy_analysis():
                         if shot_analysis_mode == "average"
                         else f"shot{ishot:03d}"
                     )
+                    ramp_title = (
+                        ""
+                        if nramps == 1
+                        else f", ramp {iramp + 1} at {ramp_center_time_s[iramp]:.4g} s"
+                    )
+                    ramp_file = "" if nramps == 1 else f"_ramp{iramp + 1:03d}"
                     fig = render_analysis_iv_diagnostic_plot(
                         result,
                         f"Diagnostic IV analysis at (y, x) index ({iy}, {ix}), "
-                        f"{fit_label} (x = {x[ix]:.2f} cm, y = {y[iy]:.2f} cm)",
+                        f"{fit_label}{ramp_title} "
+                        f"(x = {x[ix]:.2f} cm, y = {y[iy]:.2f} cm)",
                     )
                     save_diagnostic_figure(
                         fig,
                         diagnostic_plot_output_dir,
                         f"{Path(filename).stem}_iv_diagnostic_iy{iy:03d}_ix{ix:03d}_"
-                        f"{file_label}_y_{y[iy]:+.2f}cm_x_{x[ix]:+.2f}cm",
+                        f"{file_label}{ramp_file}_y_{y[iy]:+.2f}cm_x_{x[ix]:+.2f}cm",
                     )
                     plt.show(block=False)
                     plt.pause(example_pause_seconds)
@@ -3252,7 +3507,8 @@ def run_xy_analysis():
         for task in analysis_tasks:
             flat_index = task[0]
             idx = task[1]
-            iy, ix, ishot = idx
+            iy, ix, ishot = idx[:3]
+            iramp = idx[3] if nramps > 1 else 0
             print(f"Processing trace {flat_index + 1}/{n_traces} at index {idx}...")
             result = analyze_trace_worker(task)
 
@@ -3310,16 +3566,23 @@ def run_xy_analysis():
                     if shot_analysis_mode == "average"
                     else f"shot{ishot:03d}"
                 )
+                ramp_title = (
+                    ""
+                    if nramps == 1
+                    else f", ramp {iramp + 1} at {ramp_center_time_s[iramp]:.4g} s"
+                )
+                ramp_file = "" if nramps == 1 else f"_ramp{iramp + 1:03d}"
                 fig = render_analysis_iv_diagnostic_plot(
                     result,
                     f"Diagnostic IV analysis at (y, x) index ({iy}, {ix}), "
-                    f"{fit_label} (x = {x[ix]:.2f} cm, y = {y[iy]:.2f} cm)",
+                    f"{fit_label}{ramp_title} "
+                    f"(x = {x[ix]:.2f} cm, y = {y[iy]:.2f} cm)",
                 )
                 save_diagnostic_figure(
                     fig,
                     diagnostic_plot_output_dir,
                     f"{Path(filename).stem}_iv_diagnostic_iy{iy:03d}_ix{ix:03d}_"
-                    f"{file_label}_y_{y[iy]:+.2f}cm_x_{x[ix]:+.2f}cm",
+                    f"{file_label}{ramp_file}_y_{y[iy]:+.2f}cm_x_{x[ix]:+.2f}cm",
                 )
                 plt.show(block=False)
                 plt.pause(example_pause_seconds)
@@ -3327,12 +3590,12 @@ def run_xy_analysis():
     # Compatibility export: this mask identifies locations with a reported Te fit.
     # Consult analysis_ok_shot to distinguish quality-accepted and rejected fits.
     statistics_fit_mask = np.isfinite(te_shot)
-    te_values, te_std_values, fit_count = shot_mean_and_std(te_shot)
-    vp_values, vp_std_values, _ = shot_mean_and_std(vp_shot)
-    vf_values, vf_std_values, _ = shot_mean_and_std(vf_shot)
-    ies_values, ies_std_values, _ = shot_mean_and_std(ies_shot)
-    iis_values, iis_std_values, _ = shot_mean_and_std(iis_shot)
-    n_e_values, n_e_std_values, _ = shot_mean_and_std(n_e_shot)
+    te_values, te_std_values, fit_count = shot_mean_and_std(te_shot, axis=2)
+    vp_values, vp_std_values, _ = shot_mean_and_std(vp_shot, axis=2)
+    vf_values, vf_std_values, _ = shot_mean_and_std(vf_shot, axis=2)
+    ies_values, ies_std_values, _ = shot_mean_and_std(ies_shot, axis=2)
+    iis_values, iis_std_values, _ = shot_mean_and_std(iis_shot, axis=2)
+    n_e_values, n_e_std_values, _ = shot_mean_and_std(n_e_shot, axis=2)
 
     te = te_values * u.eV
     vp = vp_values * u.V
@@ -3347,17 +3610,44 @@ def run_xy_analysis():
     iis_std = iis_std_values * u.A
     n_e_std = n_e_std_values * u.m**-3
 
-    te_fit_r2, te_fit_r2_std, te_fit_count = shot_mean_and_std(te_fit_r2_shot)
-    te_fit_rmse, te_fit_rmse_std, _ = shot_mean_and_std(te_fit_rmse_shot)
-    te_fit_npts, te_fit_npts_std, _ = shot_mean_and_std(te_fit_npts_shot)
-    te_fit_vstart, te_fit_vstart_std, _ = shot_mean_and_std(te_fit_vstart_shot)
-    te_fit_vstop, te_fit_vstop_std, _ = shot_mean_and_std(te_fit_vstop_shot)
-    te_fit_slope, te_fit_slope_std, _ = shot_mean_and_std(te_fit_slope_shot)
-    te_fit_intercept, te_fit_intercept_std, _ = shot_mean_and_std(te_fit_intercept_shot)
-    te_fit_i0, te_fit_i0_std, _ = shot_mean_and_std(te_fit_i0_shot)
-    te_fit_passed_r2 = np.any(te_fit_passed_r2_shot.astype(bool), axis=-1).astype(np.uint8)
-    te_fit_candidate_count = np.sum(te_fit_candidate_count_shot, axis=-1)
-    analysis_valid_count = np.sum(analysis_ok_shot, axis=-1)
+    te_fit_r2, te_fit_r2_std, te_fit_count = shot_mean_and_std(
+        te_fit_r2_shot,
+        axis=2,
+    )
+    te_fit_rmse, te_fit_rmse_std, _ = shot_mean_and_std(
+        te_fit_rmse_shot,
+        axis=2,
+    )
+    te_fit_npts, te_fit_npts_std, _ = shot_mean_and_std(
+        te_fit_npts_shot,
+        axis=2,
+    )
+    te_fit_vstart, te_fit_vstart_std, _ = shot_mean_and_std(
+        te_fit_vstart_shot,
+        axis=2,
+    )
+    te_fit_vstop, te_fit_vstop_std, _ = shot_mean_and_std(
+        te_fit_vstop_shot,
+        axis=2,
+    )
+    te_fit_slope, te_fit_slope_std, _ = shot_mean_and_std(
+        te_fit_slope_shot,
+        axis=2,
+    )
+    te_fit_intercept, te_fit_intercept_std, _ = shot_mean_and_std(
+        te_fit_intercept_shot,
+        axis=2,
+    )
+    te_fit_i0, te_fit_i0_std, _ = shot_mean_and_std(
+        te_fit_i0_shot,
+        axis=2,
+    )
+    te_fit_passed_r2 = np.any(
+        te_fit_passed_r2_shot.astype(bool),
+        axis=2,
+    ).astype(np.uint8)
+    te_fit_candidate_count = np.sum(te_fit_candidate_count_shot, axis=2)
+    analysis_valid_count = np.sum(analysis_ok_shot, axis=2)
     analysis_ok = (analysis_valid_count > 0).astype(np.uint8)
     accepted_trace_count = int(np.sum(analysis_ok_shot))
     reported_trace_count = int(np.count_nonzero(np.isfinite(te_shot)))
@@ -3378,21 +3668,25 @@ def run_xy_analysis():
     # Representative I-V products are visualization-only shot means.  They are
     # not used for physics, because individual sweep endpoints need not coincide.
     # Full per-shot grids are exported separately below.
-    iv_voltage_grid = np.nanmean(iv_voltage_grid_shot, axis=-2)
-    iv_current_grid = np.nanmean(iv_current_grid_shot, axis=-2)
-    iv_didv_grid = np.nanmean(iv_didv_grid_shot, axis=-2)
-    iv_fit_mask_grid = np.any(iv_fit_mask_grid_shot.astype(bool), axis=-2).astype(np.uint8)
+    iv_voltage_grid = np.nanmean(iv_voltage_grid_shot, axis=2)
+    iv_current_grid = np.nanmean(iv_current_grid_shot, axis=2)
+    iv_didv_grid = np.nanmean(iv_didv_grid_shot, axis=2)
+    iv_fit_mask_grid = np.any(
+        iv_fit_mask_grid_shot.astype(bool),
+        axis=2,
+    ).astype(np.uint8)
 
     shot_statistics_available, shot_statistics_stage = shot_statistics_metadata(
         shot_analysis_mode,
         nshots,
     )
     if shot_analysis_mode == "average":
-        isat_std = np.full(spatial_shape, np.nan) * u.A
+        isat_std = np.full(profile_shape, np.nan) * u.A
         unavailable = unavailable_per_shot_fit_products(
             spatial_shape,
             nshots,
             iv_npts,
+            ramp_shape,
         )
         te_shot = unavailable["te_shot"]
         vp_shot = unavailable["vp_shot"]
@@ -3429,7 +3723,7 @@ def run_xy_analysis():
     # %%
     # Optional post-processing on XY maps
 
-    post = apply_optional_xy_postprocessing(
+    post = apply_optional_xy_ramp_postprocessing(
         te=te.value,
         vp=vp.value,
         vf=vf.value,
@@ -3468,24 +3762,24 @@ def run_xy_analysis():
     iis_plot = iis_processed if enable_neighbor_smoothing else iis_raw
     n_e_plot = n_e_processed if enable_neighbor_smoothing else n_e_raw
 
-    # Calibrate the xy density map using the same normalized-profile spatial
-    # integral as the x-line pipeline.  One measured x-line determines a
-    # single scale factor, which is applied uniformly to the full map.
+    # Calibrate each ramp's XY density map using the same normalized-profile
+    # spatial integral as the x-line pipeline. The selected y row determines
+    # one scale factor per ramp, applied uniformly to that ramp's full XY map.
     shape_factor = None
-    density_scale = np.nan
+    density_scale = np.full(nramps, np.nan) if nramps > 1 else np.nan
     electron_density_normalized_xline = None
     electron_density_scaled_xline = None
     (
         interferometer_profile_y_index,
         interferometer_profile_y_selected_cm,
         electron_density_xline,
-    ) = select_xline_from_xy_map(
+    ) = select_xline_from_xy_ramps(
         y,
         n_e_plot,
         requested_y_cm=interferometer_profile_y_cm,
     )
     if calculate_shape_factor:
-        interferometer_result = scale_xy_density_map_to_interferometer(
+        interferometer_result = scale_xy_density_ramps_to_interferometer(
             x,
             y,
             n_e_plot,
@@ -3500,33 +3794,38 @@ def run_xy_analysis():
         electron_density_scaled_xline = interferometer_result["scaled_xline"]
         n_e_plot = interferometer_result["scaled_density_map"]
 
-        if np.isfinite(density_scale):
+        finite_density_scales = np.isfinite(density_scale)
+        if np.any(finite_density_scales):
             n_e_std = n_e_std * density_scale
             print(
-                "Scaled the xy electron-density map using the x-line at "
+                "Scaled each valid xy electron-density ramp using the x-line at "
                 f"y={interferometer_profile_y_selected_cm:g} cm; "
                 f"peak n_e = {np.nanmax(n_e_plot):.4g}."
             )
-        else:
+        if not np.all(finite_density_scales):
             print(
-                "Warning: the xy electron-density map could not be normalized "
-                "and scaled because the selected x-line maximum, shape factor, "
-                "or interferometer scaling is not finite and positive."
+                "Warning: one or more xy electron-density ramps could not be "
+                "normalized and scaled because the selected x-line maximum, "
+                "shape factor, or interferometer scaling is not finite and positive."
             )
-            n_e_std = np.full(n_e_std.shape, np.nan) * u.m**-3
+            if nramps == 1:
+                n_e_std = np.full(n_e_std.shape, np.nan) * u.m**-3
 
     # %%
     # Plot results
 
     plot_png_bytes = None
+    plot_png_bytes_by_ramp = []
     all_iv_plot_png_bytes = None
     summary_plot_path = None
+    summary_plot_paths = []
     all_iv_plot_path = None
 
-    if plot_results:
-        fig = render_xy_summary_plot(
+    def _render_configured_xy_summaries():
+        return render_xy_ramp_summary_plots(
             X,
             Y,
+            ramp_center_time_s,
             te_plot,
             vp_plot,
             vf_plot,
@@ -3544,16 +3843,25 @@ def run_xy_analysis():
             title=f"{Path(filename).stem} - Langmuir XY-plane Summary",
         )
 
-        plot_buffer = io.BytesIO()
-        fig.savefig(plot_buffer, format="png", dpi=600)
-        plot_png_bytes = plot_buffer.getvalue()
-        plot_buffer.close()
+    if plot_results:
+        figures = _render_configured_xy_summaries()
+        for ramp_index, fig in enumerate(figures):
+            plot_buffer = io.BytesIO()
+            fig.savefig(plot_buffer, format="png", dpi=600)
+            plot_png_bytes_by_ramp.append(plot_buffer.getvalue())
+            plot_buffer.close()
 
-        summary_plot_path = save_diagnostic_figure(
-            fig,
-            diagnostic_plot_output_dir,
-            f"{Path(filename).stem}_langmuir_xy_summary",
-        )
+            ramp_suffix = "" if nramps == 1 else f"_ramp{ramp_index + 1:03d}"
+            summary_plot_paths.append(
+                save_diagnostic_figure(
+                    fig,
+                    diagnostic_plot_output_dir,
+                    f"{Path(filename).stem}_langmuir_xy_summary{ramp_suffix}",
+                )
+            )
+            plt.show(block=False)
+        plot_png_bytes = plot_png_bytes_by_ramp[0]
+        summary_plot_path = summary_plot_paths[0]
         plt.show()
 
     if make_all_iv_diagnostic_plot:
@@ -3589,6 +3897,11 @@ def run_xy_analysis():
             grp.create_dataset("X_cm", data=X)
             grp.create_dataset("Y_cm", data=Y)
             grp.create_dataset("time_s", data=time)
+            grp.create_dataset("ramp_index", data=np.arange(nramps, dtype=np.int64))
+            grp.create_dataset("ramp_start_index", data=ramp_start_indices)
+            grp.create_dataset("ramp_end_index", data=ramp_end_indices)
+            grp.create_dataset("ramp_start_time_s", data=ramp_start_time_s)
+            grp.create_dataset("ramp_center_time_s", data=ramp_center_time_s)
 
             # Primary exported profiles reflect current optional processing choices
             grp.create_dataset("te_eV", data=te_plot.value)
@@ -3640,7 +3953,7 @@ def run_xy_analysis():
             grp.create_dataset("vf_raw_V", data=vf_raw.value)
             grp.create_dataset("ies_raw_A", data=ies_raw.value)
             grp.create_dataset("iis_raw_A", data=iis_raw.value)
-            grp.create_dataset("n_e_raw_m3", data=n_e_raw.value if n_e_raw is not None else np.full(spatial_shape, np.nan))
+            grp.create_dataset("n_e_raw_m3", data=n_e_raw.value if n_e_raw is not None else np.full(profile_shape, np.nan))
 
             # Post-processed profiles
             grp.create_dataset("te_processed_eV", data=te_processed.value)
@@ -3648,7 +3961,7 @@ def run_xy_analysis():
             grp.create_dataset("vf_processed_V", data=vf_processed.value)
             grp.create_dataset("ies_processed_A", data=ies_processed.value)
             grp.create_dataset("iis_processed_A", data=iis_processed.value)
-            grp.create_dataset("n_e_processed_m3", data=n_e_processed.value if n_e_processed is not None else np.full(spatial_shape, np.nan))
+            grp.create_dataset("n_e_processed_m3", data=n_e_processed.value if n_e_processed is not None else np.full(profile_shape, np.nan))
 
             # Spike diagnostics
             grp.create_dataset("vp_spike_mask", data=vp_spike_mask.astype(np.uint8))
@@ -3705,34 +4018,24 @@ def run_xy_analysis():
             if subtract_dc:
                 grp.create_dataset("isweep_dc_offsets_A", data=isweep_dc_offsets)
             grp.create_dataset("xy_shape_info", data=np.array([ny, nx, nshots, nt_full, nt, iv_npts], dtype=np.int64))
+            grp.create_dataset(
+                "xy_ramp_shape_info",
+                data=np.array(
+                    [ny, nx, nshots, nramps, nt, iv_npts],
+                    dtype=np.int64,
+                ),
+            )
             grp.create_dataset("trace_spatial_shape", data=np.array(spatial_shape, dtype=np.int64))
 
             if plot_results and plot_png_bytes is None:
-                fig = render_xy_summary_plot(
-                    X,
-                    Y,
-                    te_plot,
-                    vp_plot,
-                    vf_plot,
-                    ies_plot,
-                    iis_plot,
-                    n_e_plot,
-                    vp_spike_mask=vp_spike_mask,
-                    vp_raw=vp_raw,
-                    te_fit_r2=te_fit_r2,
-                    te_poor_fit_r2=te_min_r2,
-                    analysis_ok=analysis_ok,
-                    analysis_status=analysis_status,
-                    shape_factor=shape_factor,
-                    interferometer_profile_y_cm=(
-                        interferometer_profile_y_selected_cm
-                    ),
-                )
-                plot_buffer = io.BytesIO()
-                fig.savefig(plot_buffer, format="png", dpi=600)
-                plot_png_bytes = plot_buffer.getvalue()
-                plot_buffer.close()
-                plt.close(fig)
+                figures = _render_configured_xy_summaries()
+                for fig in figures:
+                    plot_buffer = io.BytesIO()
+                    fig.savefig(plot_buffer, format="png", dpi=600)
+                    plot_png_bytes_by_ramp.append(plot_buffer.getvalue())
+                    plot_buffer.close()
+                    plt.close(fig)
+                plot_png_bytes = plot_png_bytes_by_ramp[0]
 
             if plot_png_bytes is not None:
                 grp.create_dataset(
@@ -3741,6 +4044,28 @@ def run_xy_analysis():
                 )
                 grp["summary_plot_png"].attrs["mime_type"] = "image/png"
                 grp["summary_plot_png"].attrs["description"] = "Rendered Langmuir XY-plane summary plot."
+                if nramps > 1:
+                    ramp_plots = grp.create_group("summary_plot_png_by_ramp")
+                    for ramp_index, png_bytes in enumerate(
+                        plot_png_bytes_by_ramp
+                    ):
+                        dataset = ramp_plots.create_dataset(
+                            f"ramp_{ramp_index:03d}",
+                            data=np.frombuffer(png_bytes, dtype=np.uint8),
+                        )
+                        dataset.attrs["mime_type"] = "image/png"
+                        dataset.attrs["ramp_index"] = ramp_index
+                        dataset.attrs["ramp_center_time_s"] = (
+                            ramp_center_time_s[ramp_index]
+                        )
+            if summary_plot_paths:
+                grp.create_dataset(
+                    "summary_plot_paths",
+                    data=np.asarray(
+                        [str(path) for path in summary_plot_paths],
+                        dtype=h5py.string_dtype(encoding="utf-8"),
+                    ),
+                )
 
             if all_iv_plot_png_bytes is not None:
                 grp.create_dataset(
@@ -3762,6 +4087,7 @@ def run_xy_analysis():
             grp.attrs["n_acquired_traces"] = ny * nx * nshots
             grp.attrs["trace_spatial_ndim"] = len(spatial_shape)
             grp.attrs["nshots"] = nshots
+            grp.attrs["nramps"] = nramps
             grp.attrs["shot_analysis_mode"] = shot_analysis_mode
             grp.attrs["nt_full"] = nt_full
             grp.attrs["nt_sweep"] = nt
@@ -3796,6 +4122,7 @@ def run_xy_analysis():
 
             grp.attrs["sweep_start_index"] = sweep_start_index
             grp.attrs["sweep_end_index"] = sweep_end_index
+            grp.attrs["ramp_start_spacing_samples"] = ramp_start_spacing_samples
             grp.attrs["isat_start_index"] = isat_start_index
             grp.attrs["isat_end_index"] = isat_end_index
 
@@ -3841,7 +4168,15 @@ def run_xy_analysis():
             grp.attrs["shot_statistics_available"] = int(
                 shot_statistics_available
             )
-            grp.attrs["per_shot_axis_order"] = "y,x,shot"
+            grp.attrs["per_shot_axis_order"] = (
+                "y,x,shot,ramp" if nramps > 1 else "y,x,shot"
+            )
+            grp.attrs["profile_axis_order"] = (
+                "y,x,ramp" if nramps > 1 else "y,x"
+            )
+            grp.attrs["ramp_time_reference"] = (
+                "seconds from acquired trace start; ramp center"
+            )
             grp.attrs["shot_statistics_stage"] = shot_statistics_stage
             grp.attrs["profile_value_policy"] = (
                 "finite estimates retained; analysis_ok records fit acceptance"
@@ -3877,6 +4212,8 @@ def run_xy_analysis():
             ),
             "n_analysis_traces": np.array(n_traces),
             "n_acquired_traces": np.array(ny * nx * nshots),
+            "nramps": np.array(nramps),
+            "ramp_start_spacing_samples": np.array(ramp_start_spacing_samples),
             "calculate_shape_factor": np.array(int(calculate_shape_factor)),
             "shape_factor_m": np.array(
                 np.nan if shape_factor is None else shape_factor.to_value(u.m)
@@ -3898,12 +4235,12 @@ def run_xy_analysis():
                 electron_density_xline
             ).to_value(u.m**-3),
             "interferometer_xline_n_e_normalized": (
-                np.full(nx, np.nan)
+                np.full(xline_profile_shape, np.nan)
                 if electron_density_normalized_xline is None
                 else electron_density_normalized_xline
             ),
             "interferometer_xline_n_e_m3": (
-                np.full(nx, np.nan)
+                np.full(xline_profile_shape, np.nan)
                 if electron_density_scaled_xline is None
                 else electron_density_scaled_xline.to_value(u.m**-3)
             ),
@@ -3912,6 +4249,11 @@ def run_xy_analysis():
             "X_cm": X,
             "Y_cm": Y,
             "time_s": time,
+            "ramp_index": np.arange(nramps, dtype=np.int64),
+            "ramp_start_index": ramp_start_indices,
+            "ramp_end_index": ramp_end_indices,
+            "ramp_start_time_s": ramp_start_time_s,
+            "ramp_center_time_s": ramp_center_time_s,
             "te_eV": te_plot.value,
             "vp_V": vp_plot.value,
             "vf_V": vf_plot.value,
@@ -3943,13 +4285,13 @@ def run_xy_analysis():
             "vf_raw_V": vf_raw.value,
             "ies_raw_A": ies_raw.value,
             "iis_raw_A": iis_raw.value,
-            "n_e_raw_m3": n_e_raw.value if n_e_raw is not None else np.full(spatial_shape, np.nan),
+            "n_e_raw_m3": n_e_raw.value if n_e_raw is not None else np.full(profile_shape, np.nan),
             "te_processed_eV": te_processed.value,
             "vp_processed_V": vp_processed.value,
             "vf_processed_V": vf_processed.value,
             "ies_processed_A": ies_processed.value,
             "iis_processed_A": iis_processed.value,
-            "n_e_processed_m3": n_e_processed.value if n_e_processed is not None else np.full(spatial_shape, np.nan),
+            "n_e_processed_m3": n_e_processed.value if n_e_processed is not None else np.full(profile_shape, np.nan),
             "vp_spike_mask": vp_spike_mask.astype(np.uint8),
             "vsweep_mean_V": vsweep_mean.value,
             "isweep_mean_A": isweep_mean.value,
@@ -3996,12 +4338,24 @@ def run_xy_analysis():
             "te_fit_passed_r2_shot": te_fit_passed_r2_shot,
             "te_fit_candidate_count_shot": te_fit_candidate_count_shot,
             "shot_standard_deviation_ddof": np.array(1),
-            "per_shot_axis_order": np.array("y,x,shot"),
+            "per_shot_axis_order": np.array(
+                "y,x,shot,ramp" if nramps > 1 else "y,x,shot"
+            ),
+            "profile_axis_order": np.array(
+                "y,x,ramp" if nramps > 1 else "y,x"
+            ),
+            "ramp_time_reference": np.array(
+                "seconds from acquired trace start; ramp center"
+            ),
             "shot_statistics_stage": np.array(shot_statistics_stage),
             "profile_value_policy": np.array(
                 "finite estimates retained; analysis_ok records fit acceptance"
             ),
             "xy_shape_info": np.array([ny, nx, nshots, nt_full, nt, iv_npts], dtype=np.int64),
+            "xy_ramp_shape_info": np.array(
+                [ny, nx, nshots, nramps, nt, iv_npts],
+                dtype=np.int64,
+            ),
             "trace_spatial_shape": np.array(spatial_shape, dtype=np.int64),
             "dt_s": np.array(dt),
             "te_min_r2": np.array(te_min_r2),
@@ -4019,12 +4373,20 @@ def run_xy_analysis():
             "enforce_ideal_model_checks": np.array(int(enforce_ideal_model_checks)),
             "subtract_dc": np.array(int(subtract_dc)),
             "summary_plot_path": np.array("" if summary_plot_path is None else str(summary_plot_path)),
+            "summary_plot_paths": np.asarray(
+                [str(path) for path in summary_plot_paths],
+                dtype=str,
+            ),
             "all_iv_plot_path": np.array("" if all_iv_plot_path is None else str(all_iv_plot_path)),
         }
         if subtract_dc:
             xy_npz_data["isweep_dc_offsets_A"] = isweep_dc_offsets
         if plot_png_bytes is not None:
             xy_npz_data["summary_plot_png"] = np.frombuffer(plot_png_bytes, dtype=np.uint8)
+            for ramp_index, png_bytes in enumerate(plot_png_bytes_by_ramp):
+                xy_npz_data[f"summary_plot_png_ramp_{ramp_index:03d}"] = (
+                    np.frombuffer(png_bytes, dtype=np.uint8)
+                )
         if all_iv_plot_png_bytes is not None:
             xy_npz_data["all_iv_curves_plot_png"] = np.frombuffer(all_iv_plot_png_bytes, dtype=np.uint8)
 

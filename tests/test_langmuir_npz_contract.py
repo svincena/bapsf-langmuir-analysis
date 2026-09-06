@@ -113,3 +113,32 @@ def test_xline_reader_plots_multi_ramp_results(display_mode):
 
     assert len(figure.axes) >= 6
     plt.close(figure)
+
+
+def test_xy_reader_plots_one_summary_per_ramp():
+    import matplotlib.pyplot as plt
+
+    x = np.array([-1.0, 0.0, 1.0])
+    y = np.array([-1.0, 1.0])
+    x_mesh, y_mesh = np.meshgrid(x, y, indexing="xy")
+    values = np.arange(12, dtype=float).reshape(2, 3, 2) + 1.0
+    data = {
+        "geometry": np.array("xy_plane"),
+        "source_file": np.array("synthetic.hdf5"),
+        "x_cm": x,
+        "y_cm": y,
+        "X_cm": x_mesh,
+        "Y_cm": y_mesh,
+        "ramp_center_time_s": np.array([0.01, 0.02]),
+        "analysis_ok": np.ones((2, 3, 2), dtype=np.uint8),
+        "shape_factor_m": np.array([0.1, 0.2]),
+    }
+    for key in ("te_eV", "vp_V", "vf_V", "ies_A", "iis_A", "n_e_m3"):
+        data[key] = values
+
+    figures = combined_reader.plot_xy_summary(data)
+
+    assert len(figures) == 2
+    for figure in figures:
+        assert len(figure.axes) >= 6
+        plt.close(figure)

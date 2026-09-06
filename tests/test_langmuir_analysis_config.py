@@ -128,13 +128,14 @@ def test_shot_analysis_mode_is_selectable_and_validated(geometry):
         validate_parameters(geometry, values)
 
 
-def test_repeated_ramp_controls_are_xline_only_and_validated():
+def test_repeated_ramp_controls_are_available_for_both_geometries():
     xline = default_parameters("x_line")
     xy = default_parameters("xy_plane")
 
     assert xline["nramps"] == 1
+    assert xy["nramps"] == 1
+    assert "ramp_start_spacing_samples" in xy
     assert xline["ramp_display_mode"] == "separate_profiles"
-    assert "nramps" not in xy
     assert "ramp_display_mode" not in xy
 
     xline.update(
@@ -154,6 +155,17 @@ def test_repeated_ramp_controls_are_xline_only_and_validated():
     xline["ramp_start_spacing_samples"] = 9
     with pytest.raises(ValueError, match="at least the extracted ramp length"):
         validate_parameters("x_line", xline)
+
+    xy.update(
+        nt_full=100,
+        sweep_start_index=10,
+        sweep_end_index=19,
+        nramps=3,
+        ramp_start_spacing_samples=30,
+        isat_end_index=5,
+        sg_smooth_bins=7,
+    )
+    assert validate_parameters("xy_plane", xy)["nramps"] == 3
 
 
 def test_repeated_ramps_must_fit_inside_trace_and_avoid_dc_window():

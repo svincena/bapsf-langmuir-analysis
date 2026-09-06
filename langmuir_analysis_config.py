@@ -385,27 +385,29 @@ def _sections_for_geometry(geometry):
                         maximum=100_000_000,
                     ),
                 ]
+                + [
+                    _p(
+                        "nramps",
+                        "Number of ramps",
+                        "int",
+                        1,
+                        "Number of equal-length voltage ramps analyzed in each discharge.",
+                        minimum=1,
+                        maximum=100_000,
+                    ),
+                    _p(
+                        "ramp_start_spacing_samples",
+                        "Ramp start spacing",
+                        "int",
+                        sweep_end - sweep_start + 1,
+                        "Sample spacing between the starts of consecutive ramps.",
+                        unit="samples",
+                        minimum=1,
+                        maximum=100_000_000,
+                    ),
+                ]
                 + (
                     [
-                        _p(
-                            "nramps",
-                            "Number of ramps",
-                            "int",
-                            1,
-                            "Number of equal-length voltage ramps analyzed in each discharge.",
-                            minimum=1,
-                            maximum=100_000,
-                        ),
-                        _p(
-                            "ramp_start_spacing_samples",
-                            "Ramp start spacing",
-                            "int",
-                            sweep_end - sweep_start + 1,
-                            "Sample spacing between the starts of consecutive ramps.",
-                            unit="samples",
-                            minimum=1,
-                            maximum=100_000_000,
-                        ),
                         _p(
                             "ramp_display_mode",
                             "Multiple-ramp display",
@@ -959,21 +961,18 @@ def validate_parameters(geometry, values, *, require_input_file=False):
     if normalized["sweep_end_index"] >= normalized["nt_full"]:
         raise ValueError("Sweep end must be smaller than samples per trace.")
     sweep_points = normalized["sweep_end_index"] - normalized["sweep_start_index"] + 1
-    if geometry == "x_line":
-        if (
-            normalized["nramps"] > 1
-            and normalized["ramp_start_spacing_samples"] < sweep_points
-        ):
-            raise ValueError(
-                "Ramp start spacing must be at least the extracted ramp length."
-            )
-        last_sweep_end = (
-            normalized["sweep_end_index"]
-            + (normalized["nramps"] - 1)
-            * normalized["ramp_start_spacing_samples"]
+    if (
+        normalized["nramps"] > 1
+        and normalized["ramp_start_spacing_samples"] < sweep_points
+    ):
+        raise ValueError(
+            "Ramp start spacing must be at least the extracted ramp length."
         )
-    else:
-        last_sweep_end = normalized["sweep_end_index"]
+    last_sweep_end = (
+        normalized["sweep_end_index"]
+        + (normalized["nramps"] - 1)
+        * normalized["ramp_start_spacing_samples"]
+    )
     if last_sweep_end >= normalized["nt_full"]:
         raise ValueError(
             "Every extracted ramp must end before samples per trace."

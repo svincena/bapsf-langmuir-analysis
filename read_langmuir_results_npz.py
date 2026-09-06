@@ -534,6 +534,9 @@ def plot_xy_summary(data):
     """Make the six-panel spatial-map summary for xy-plane results."""
     import matplotlib.pyplot as plt
 
+    if np.asarray(data["te_eV"]).ndim == 3:
+        return plot_xy_multi_ramp_summaries(data)
+
     x_mesh = np.asarray(data["X_cm"], dtype=float)
     y_mesh = np.asarray(data["Y_cm"], dtype=float)
     panels = [
@@ -653,8 +656,42 @@ def plot_xy_summary(data):
     return fig
 
 
+def plot_xy_multi_ramp_summaries(data):
+    """Return one stored-result XY summary figure per temporal ramp."""
+    te_shape = np.asarray(data["te_eV"]).shape
+    if len(te_shape) != 3:
+        raise ValueError(
+            "Multi-ramp XY results must have shape (ny, nx, nramps); "
+            f"got {te_shape}."
+        )
+    nramps = te_shape[-1]
+    ramp_times = np.asarray(
+        data.get("ramp_center_time_s", np.arange(nramps)),
+        dtype=float,
+    )
+    figures = []
+    for ramp_index in range(nramps):
+        ramp_data = dict(data)
+        for key, value in data.items():
+            array = np.asarray(value)
+            if array.shape == te_shape:
+                ramp_data[key] = array[..., ramp_index]
+            elif key in {"shape_factor_m", "density_scale"} and array.shape == (
+                nramps,
+            ):
+                ramp_data[key] = array[ramp_index]
+        figure = plot_xy_summary(ramp_data)
+        base_title = figure._suptitle.get_text() if figure._suptitle else ""
+        figure.suptitle(
+            f"{base_title} - Ramp {ramp_index + 1} "
+            f"(center {ramp_times[ramp_index]:.6g} s)"
+        )
+        figures.append(figure)
+    return figures
+
+
 def plot_summary(data):
-    """Dispatch to the summary plot matching the stored result geometry."""
+    """Dispatch to the stored geometry's summary plot or per-ramp plots."""
     geometry = get_langmuir_result_geometry(data)
     if geometry == "x_line":
         return plot_xline_summary(data)

@@ -44,9 +44,9 @@ starting a run, or **Restore this tab's defaults** to reset one geometry.
 The program performs the full dataset workflow:
 
 1. Reads voltage and current channels from a LAPD HDF5 file using `bapsflib`.
-2. Reshapes the shots as `(x, shot, time)` or `(y, x, shot, time)`. An x-line
-   run can then extract multiple equal-length, evenly spaced ramps as
-   `(x, shot, ramp, ramp_time)`.
+2. Reshapes the shots as `(x, shot, time)` or `(y, x, shot, time)`, then can
+   extract multiple equal-length, evenly spaced ramps as
+   `(x, shot, ramp, ramp_time)` or `(y, x, shot, ramp, ramp_time)`.
 3. Applies the configured electrical scaling, polarity, baseline treatment,
    and time-domain smoothing.
 4. Analyzes every shot and ramp independently through
@@ -127,19 +127,21 @@ between sweeps. In averaged mode, fit-derived shot standard deviations and
 per-shot fit products are stored as unavailable (`NaN`); the result metadata
 records `shot_analysis_mode` and `shot_statistics_available`.
 
-For an x-line discharge containing repeated sweeps, **Sweep start** and
-**Sweep end** define the first ramp. **Number of ramps** enables repeated-ramp
-analysis, and **Ramp start spacing** gives the start-to-start separation in
-samples. Ramps must not overlap and every ramp must fit within the acquired
-trace. Each ramp is fitted and spatially post-processed independently. With
-per-shot fitting, fit products have shape `(nx, nshots, nramps)`; averaging
-shots before fitting produces `(nx, nramps)`. A single-ramp run retains the
-legacy shapes without a singleton ramp axis.
+For a discharge containing repeated sweeps, **Sweep start** and **Sweep end**
+define the first ramp. **Number of ramps** enables repeated-ramp analysis, and
+**Ramp start spacing** gives the start-to-start separation in samples. Ramps
+must not overlap and every ramp must fit within the acquired trace. Each ramp
+is fitted and spatially post-processed independently. With per-shot fitting,
+x-line products have shape `(nx, nshots, nramps)` and XY products have shape
+`(ny, nx, nshots, nramps)`. Averaging shots before fitting produces
+`(nx, nramps)` or `(ny, nx, nramps)`, respectively. A single-ramp run retains
+the legacy shapes without a singleton ramp axis.
 
 The **Multiple-ramp display** control selects either distinct ramp profiles or
 six x-versus-ramp-center-time maps. The display choice does not combine ramps
-or change their fitted values. Interferometer density calibration is also
-calculated independently for every ramp.
+or change their fitted values. Multi-ramp XY runs produce a separate six-panel
+spatial-map summary for each ramp. Interferometer density calibration is also
+calculated independently for every ramp in either geometry.
 
 The solver records fit quality, uncertainties, model-consistency notes, and
 rejection reasons. Finite estimates may be retained for diagnosis even when a
@@ -167,9 +169,9 @@ Both storage formats record the result geometry. Primary quantities include
 `te_eV`, `vp_V`, `vf_V`, `ies_A`, `iis_A`, and `n_e_m3`. The files also contain
 raw and processed spatial results, shot statistics, fit-quality fields,
 interpolated I–V products, calibration settings, and optional embedded plot
-images. Multi-ramp x-line files additionally record ramp indices, start and
-center times, start spacing, display mode, and the `x,shot,ramp` axis-order
-metadata.
+images. Multi-ramp files additionally record ramp indices, start and center
+times, start spacing, and explicit axis-order metadata. XY output uses
+`y,x,shot,ramp` for per-shot products and `y,x,ramp` for aggregate maps.
 
 ## Reading HDF5 results
 
@@ -291,6 +293,9 @@ data = load_langmuir_results_npz("path/to/results.npz")
 figure = plot_summary(data)
 plt.show()
 ```
+
+For multi-ramp XY results, `plot_summary` creates every per-ramp figure and
+returns them as a list; single-ramp and x-line calls return one figure.
 
 Geometry-specific compatibility loaders remain available:
 

@@ -356,6 +356,192 @@ def test_xline_pipeline_exports_repeated_ramp_shapes(
         assert group.attrs["n_analysis_traces"] == expected_analysis_traces
 
 
+def test_xy_postprocessing_and_calibration_do_not_mix_ramps():
+    first = np.ones((3, 3))
+    first[1, 1] = 20.0
+    second = np.full((3, 3), 100.0)
+    values = np.stack((first, second), axis=-1)
+    processed = analysis.apply_optional_xy_ramp_postprocessing(
+        values,
+        values,
+        values,
+        values,
+        values,
+        enable_vp_spike_rejection=True,
+        vp_spike_half_window=(1, 1),
+        vp_spike_threshold_V=5.0,
+        vp_replace_flagged_with_local_median=True,
+        enable_neighbor_smoothing=False,
+    )
+    assert processed["vp_spike_mask"].shape == (3, 3, 2)
+    assert processed["vp_spike_mask"][1, 1, 0]
+    assert not np.any(processed["vp_spike_mask"][..., 1])
+    assert np.all(processed["vp_processed"][..., 1] == 100.0)
+
+    x = np.array([-10.0, 0.0, 10.0])
+    y = np.array([-1.0, 0.0, 1.0])
+    density = np.stack(
+        (
+            np.tile(np.array([1.0, 2.0, 1.0]), (3, 1)),
+            np.tile(np.array([1.0, 4.0, 1.0]), (3, 1)),
+        ),
+        axis=-1,
+    ) * u.m**-3
+    calibrated = analysis.scale_xy_density_ramps_to_interferometer(
+        x,
+        y,
+        density,
+        4.0e17 * u.m**-2,
+    )
+    assert calibrated["shape_factor"].shape == (2,)
+    assert calibrated["density_scale"].shape == (2,)
+    assert calibrated["normalized_xline"].shape == (3, 2)
+    assert calibrated["scaled_density_map"].shape == (3, 3, 2)
+    assert calibrated["density_scale"][0] != pytest.approx(
+        calibrated["density_scale"][1]
+    )
+
+
+def test_multi_ramp_xy_summary_rendering():
+    import matplotlib.pyplot as plt
+
+    x = np.array([-1.0, 0.0, 1.0])
+    y = np.array([-1.0, 1.0])
+    x_mesh, y_mesh = np.meshgrid(x, y, indexing="xy")
+    values = np.arange(12, dtype=float).reshape(2, 3, 2) + 1.0
+    figures = analysis.render_xy_ramp_summary_plots(
+        x_mesh,
+        y_mesh,
+        np.array([0.01, 0.02]),
+        values * u.eV,
+        values * u.V,
+        values * u.V,
+        values * u.A,
+        values * u.A,
+        values * u.m**-3,
+        analysis_ok=np.ones_like(values, dtype=np.uint8),
+        shape_factor=np.array([0.1, 0.2]) * u.m,
+    )
+    assert len(figures) == 2
+    for figure in figures:
+        figure.canvas.draw()
+        assert len(figure.axes) >= 6
+        plt.close(figure)
+
+
+@pytest.mark.parametrize(
+    ("shot_mode", "expected_analysis_traces"),
+    (("individual", 24), ("average", 12)),
+)
+def test_xy_pipeline_exports_repeated_ramp_shapes(
+    monkeypatch,
+    tmp_path,
+    shot_mode,
+    expected_analysis_traces,
+):
+    source_path = tmp_path / f"xy_multi_ramp_{shot_mode}.hdf5"
+    with h5py.File(source_path, "w"):
+        pass
+
+    values = default_parameters("xy_plane")
+    values.update(
+        filename=str(source_path),
+        ny=2,
+        nx=3,
+        nshots=2,
+        nt_full=30,
+        sweep_start_index=2,
+        sweep_end_index=5,
+        nramps=2,
+        ramp_start_spacing_samples=10,
+        isat_start_index=0,
+        isat_end_index=1,
+        sg_smooth_bins=3,
+        sg_smooth_order=1,
+        iv_npts=8,
+        shot_analysis_mode=shot_mode,
+        calculate_shape_factor=False,
+        enable_vp_spike_rejection=False,
+        enable_neighbor_smoothing=False,
+        parallel_analysis=False,
+        diagnostic_plot_every=0,
+        make_all_iv_diagnostic_plot=False,
+        plot_results=False,
+        save_results=True,
+    )
+
+    class FakeLapdFile:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(analysis.lapd, "File", lambda *_args, **_kwargs: FakeLapdFile())
+
+    def fake_read_channel(**kwargs):
+        shape = (
+            kwargs["ny"],
+            kwargs["nx"],
+            kwargs["nshots"],
+            kwargs["nt_full"],
+        )
+        signal = np.arange(np.prod(shape), dtype=float).reshape(shape)
+        return signal, 1.0e-6
+
+    monkeypatch.setattr(analysis, "read_channel_xy", fake_read_channel)
+
+    def fake_analyze(task):
+        flat_index, idx, *_rest = task
+        grid = np.linspace(-2.0, 2.0, values["iv_npts"])
+        return {
+            "flat_index": flat_index,
+            "idx": idx,
+            "warnings": [],
+            "ok": True,
+            "te_eV": 2.0 + idx[-1],
+            "vp_V": 1.0,
+            "vf_V": -1.0,
+            "ies_A": 0.02,
+            "iis_A": 0.01,
+            "n_e_m3": 1.0e17,
+            "te_fit_r2": 0.999,
+            "te_fit_rmse": 0.01,
+            "te_fit_npts": 8,
+            "te_fit_vstart": -1.0,
+            "te_fit_vstop": 1.0,
+            "te_fit_slope": 0.5,
+            "te_fit_intercept": -2.0,
+            "te_fit_i0": 0.0,
+            "te_fit_passed_r2": True,
+            "te_fit_candidate_count": 1,
+            "iv_voltage_grid": grid,
+            "iv_current_grid": grid * 0.01,
+            "iv_didv_grid": np.full(grid.shape, 0.01),
+            "iv_fit_mask": np.ones(grid.shape, dtype=np.uint8),
+            "diagnostic_data": None,
+        }
+
+    monkeypatch.setattr(analysis, "analyze_trace_worker", fake_analyze)
+    analysis.run_analysis("xy_plane", values)
+
+    with h5py.File(source_path, "r") as h5_file:
+        group = h5_file["langmuir_xy"]
+        assert group["te_eV"].shape == (2, 3, 2)
+        assert group["te_shot_eV"].shape == (2, 3, 2, 2)
+        assert group["iv_voltage_grid_V"].shape == (2, 3, 2, 8)
+        assert group["vsweep_mean_V"].shape == (2, 3, 2, 4)
+        assert group["interferometer_xline_n_e_raw_m3"].shape == (3, 2)
+        assert group["ramp_center_time_s"].shape == (2,)
+        assert group.attrs["per_shot_axis_order"] == "y,x,shot,ramp"
+        assert group.attrs["profile_axis_order"] == "y,x,ramp"
+        assert group.attrs["n_analysis_traces"] == expected_analysis_traces
+
+    npz_path = source_path.with_name(f"{source_path.stem}_langmuir_xy.npz")
+    with np.load(npz_path, allow_pickle=False) as result:
+        assert result["te_eV"].shape == (2, 3, 2)
+        assert result["te_shot_eV"].shape == (2, 3, 2, 2)
+        assert result["xy_ramp_shape_info"].tolist() == [2, 3, 2, 2, 4, 8]
+        assert result["profile_axis_order"].item() == "y,x,ramp"
+
+
 def test_select_xline_from_xy_map_uses_nearest_y_coordinate():
     y = np.array([-4.0, -1.0, 2.0, 5.0])
     density = np.arange(12, dtype=float).reshape(4, 3) * u.m**-3
