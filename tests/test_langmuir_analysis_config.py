@@ -76,6 +76,25 @@ def test_spatial_and_acquisition_geometry_are_separate_adjacent_sections(
 
 
 @pytest.mark.parametrize("geometry", SUPPORTED_GEOMETRIES)
+def test_channel_routing_is_grouped_with_data_source(geometry):
+    sections = {
+        section.title: tuple(parameter.key for parameter in section.parameters)
+        for section in PARAMETER_SECTIONS[geometry]
+    }
+
+    assert sections["Data source"][-3:] == (
+        "board",
+        "vsweep_channel",
+        "isweep_channel",
+    )
+    assert not {
+        "board",
+        "vsweep_channel",
+        "isweep_channel",
+    }.intersection(sections["Digitizer and probe"])
+
+
+@pytest.mark.parametrize("geometry", SUPPORTED_GEOMETRIES)
 def test_bmotion_geometry_source_requires_a_configuration(geometry):
     values = default_parameters(geometry)
     values["spatial_geometry_source"] = "bmotion"

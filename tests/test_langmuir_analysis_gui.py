@@ -1,9 +1,9 @@
 import pytest
-from PySide6 import QtCore, QtTest, QtWidgets
 
 from langmuir_analysis_config import SUPPORTED_GEOMETRIES
 import langmuir_analysis_gui as gui
 from langmuir_analysis_gui import LangmuirAnalysisWindow
+from PySide6 import QtCore, QtTest, QtWidgets
 
 
 @pytest.fixture(scope="module")
@@ -203,6 +203,29 @@ def test_infer_bmotion_geometry_from_target_positions():
         "xy_plane",
     )
     assert ascending_result["xy_y_acquisition_order"] == "ascending"
+
+
+def test_bmotion_dependency_import_failure_becomes_parameter_error(
+    monkeypatch, tmp_path
+):
+    import builtins
+
+    hdf5_path = tmp_path / "experiment.hdf5"
+    hdf5_path.touch()
+    original_import = builtins.__import__
+
+    def fail_bapsflib_import(name, *args, **kwargs):
+        if name == "bapsflib":
+            raise AttributeError("incompatible NumPy")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_bapsflib_import)
+
+    with pytest.raises(
+        ValueError,
+        match="Could not inspect bmotion configurations.*incompatible NumPy",
+    ):
+        gui.discover_bmotion_configurations(hdf5_path)
 
 
 def test_infer_bmotion_geometry_rejects_incompatible_ordering():

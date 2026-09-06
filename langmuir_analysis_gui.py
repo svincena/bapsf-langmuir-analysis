@@ -6,6 +6,12 @@ from pathlib import Path
 import math
 import sys
 
+# PySide6's feature-import hook cannot inspect the virtual ``six.moves``
+# modules that python-dateutil initializes while bapsf-motion imports pandas.
+# Initialize timezone support before Qt installs that hook so bmotion remains
+# available when it is imported lazily from the running GUI.
+import dateutil.rrule as _dateutil_rrule  # noqa: F401
+import dateutil.tz as _dateutil_tz  # noqa: F401
 from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 
 from langmuir_analysis_config import (
@@ -591,11 +597,12 @@ def discover_bmotion_configurations(filename):
     if not filename.is_file():
         raise ValueError(f"Experiment HDF5 file does not exist: {filename}")
 
-    # Keep bapsflib and its scientific dependencies out of splash startup.
-    from bapsflib import lapd
-
     file_obj = None
     try:
+        # Keep bapsflib and its scientific dependencies out of splash startup,
+        # and turn an unusable optional dependency into a parameter error.
+        from bapsflib import lapd
+
         file_obj = lapd.File(filename)
         if "bmotion" not in file_obj.controls:
             raise ValueError(f"HDF5 file {filename} has no mapped bmotion control.")
@@ -778,12 +785,12 @@ def read_bmotion_geometry(filename, config_name, geometry):
     if not config_name:
         raise ValueError("bmotion configuration cannot be empty.")
 
-    import astropy.units as u
-    import numpy as np
-    from bapsflib import lapd
-
     file_obj = None
     try:
+        import astropy.units as u
+        import numpy as np
+        from bapsflib import lapd
+
         file_obj = lapd.File(filename)
         if "bmotion" not in file_obj.controls:
             raise ValueError(f"HDF5 file {filename} has no mapped bmotion control.")

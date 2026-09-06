@@ -127,7 +127,7 @@ def _sections_for_geometry(geometry):
     sections = [
         SectionSpec(
             "Data source",
-            "Experiment file and bapsflib digitizer identifiers.",
+            "Experiment file, bapsflib digitizer identifiers, and channel routing.",
             (
                 _p(
                     "filename",
@@ -156,6 +156,33 @@ def _sections_for_geometry(geometry):
                     "str",
                     sis_config_name,
                     "Digitizer configuration name stored in the HDF5 metadata.",
+                ),
+                _p(
+                    "board",
+                    "Board",
+                    "int",
+                    board,
+                    "Digitizer board number.",
+                    minimum=0,
+                    maximum=10_000,
+                ),
+                _p(
+                    "vsweep_channel",
+                    "Voltage channel",
+                    "int",
+                    vsweep_channel,
+                    "Swept-bias channel number.",
+                    minimum=0,
+                    maximum=10_000,
+                ),
+                _p(
+                    "isweep_channel",
+                    "Current channel",
+                    "int",
+                    isweep_channel,
+                    "Probe-current channel number.",
+                    minimum=0,
+                    maximum=10_000,
                 ),
             ),
         ),
@@ -306,35 +333,8 @@ def _sections_for_geometry(geometry):
         ),
         SectionSpec(
             "Digitizer and probe",
-            "Channel routing and conversion from digitizer signal to probe voltage and current.",
+            "Conversion from digitizer signal to probe voltage and current.",
             (
-                _p(
-                    "board",
-                    "Board",
-                    "int",
-                    board,
-                    "Digitizer board number.",
-                    minimum=0,
-                    maximum=10_000,
-                ),
-                _p(
-                    "vsweep_channel",
-                    "Voltage channel",
-                    "int",
-                    vsweep_channel,
-                    "Swept-bias channel number.",
-                    minimum=0,
-                    maximum=10_000,
-                ),
-                _p(
-                    "isweep_channel",
-                    "Current channel",
-                    "int",
-                    isweep_channel,
-                    "Probe-current channel number.",
-                    minimum=0,
-                    maximum=10_000,
-                ),
                 _p(
                     "vsweep_attenuation",
                     "Voltage attenuation",
