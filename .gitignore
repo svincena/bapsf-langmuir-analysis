@@ -1,4 +1,3 @@
-/output_diagnostic_plots/
 /legacy/
 /last_parameters.json
 /last_parameters.json.tmp
@@ -7,4 +6,4 @@
 __pycache__/
 *.py[cod]
 .DS_Store
-.DS_Store
+
