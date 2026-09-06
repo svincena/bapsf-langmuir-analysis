@@ -66,6 +66,9 @@ filename: Any = _RUNTIME_UNCONFIGURED
 digitizer: Any = _RUNTIME_UNCONFIGURED
 adc: Any = _RUNTIME_UNCONFIGURED
 sis_config_name: Any = _RUNTIME_UNCONFIGURED
+spatial_geometry_source: Any = _RUNTIME_UNCONFIGURED
+bmotion_config_name: Any = _RUNTIME_UNCONFIGURED
+xy_y_acquisition_order: Any = _RUNTIME_UNCONFIGURED
 nx: Any = _RUNTIME_UNCONFIGURED
 ny: Any = _RUNTIME_UNCONFIGURED
 nshots: Any = _RUNTIME_UNCONFIGURED
@@ -2897,6 +2900,8 @@ def run_xline_analysis():
 
             grp.attrs["source_file"] = str(filename)
             grp.attrs["geometry"] = "x_line"
+            grp.attrs["spatial_geometry_source"] = spatial_geometry_source
+            grp.attrs["bmotion_config_name"] = bmotion_config_name
             grp.attrs["fixed_y_cm"] = 0.0
 
             grp.attrs["nx"] = nx
@@ -3021,6 +3026,8 @@ def run_xline_analysis():
         xline_npz_data = {
             "source_file": np.array(str(filename)),
             "geometry": np.array("x_line"),
+            "spatial_geometry_source": np.array(spatial_geometry_source),
+            "bmotion_config_name": np.array(bmotion_config_name),
             "shot_analysis_mode": np.array(shot_analysis_mode),
             "shot_statistics_available": np.array(
                 int(shot_statistics_available)
@@ -3215,7 +3222,7 @@ def run_xy_analysis():
         adc=adc,
         config_name=sis_config_name,
         scale_factor=vsweep_attenuation,
-        flipup=True,
+        flipup=xy_y_acquisition_order == "descending",
         negate=False,
     )
     print(f"Voltage data reshaped to (y, x, shots, time): {vsweep_full.shape}")
@@ -3235,7 +3242,7 @@ def run_xy_analysis():
         adc=adc,
         config_name=sis_config_name,
         scale_factor=isweep_attenuation / isweep_resistance,
-        flipup=True,
+        flipup=xy_y_acquisition_order == "descending",
         negate=negate_Isweep_current,
     )
     print(f"Current data reshaped to (y, x, shots, time): {isweep_full.shape}")
@@ -4079,6 +4086,9 @@ def run_xy_analysis():
 
             grp.attrs["source_file"] = str(filename)
             grp.attrs["geometry"] = "xy_plane"
+            grp.attrs["spatial_geometry_source"] = spatial_geometry_source
+            grp.attrs["bmotion_config_name"] = bmotion_config_name
+            grp.attrs["y_acquisition_order"] = xy_y_acquisition_order
 
             grp.attrs["ny"] = ny
             grp.attrs["nx"] = nx
@@ -4206,6 +4216,9 @@ def run_xy_analysis():
         xy_npz_data = {
             "source_file": np.array(str(filename)),
             "geometry": np.array("xy_plane"),
+            "spatial_geometry_source": np.array(spatial_geometry_source),
+            "bmotion_config_name": np.array(bmotion_config_name),
+            "y_acquisition_order": np.array(xy_y_acquisition_order),
             "shot_analysis_mode": np.array(shot_analysis_mode),
             "shot_statistics_available": np.array(
                 int(shot_statistics_available)

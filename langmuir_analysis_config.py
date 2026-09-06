@@ -17,6 +17,8 @@ from typing import Any
 PARAMETER_FILE_VERSION = 1
 LAST_PARAMETERS_PATH = Path(__file__).with_name("last_parameters.json")
 SUPPORTED_GEOMETRIES = ("x_line", "xy_plane")
+SUPPORTED_SPATIAL_GEOMETRY_SOURCES = ("manual", "bmotion")
+SUPPORTED_XY_Y_ACQUISITION_ORDERS = ("descending", "ascending")
 SUPPORTED_SHOT_ANALYSIS_MODES = ("individual", "average")
 SUPPORTED_RAMP_DISPLAY_MODES = ("separate_profiles", "ramp_time_map")
 
@@ -159,9 +161,24 @@ def _sections_for_geometry(geometry):
         ),
         SectionSpec(
             "Spatial geometry",
-            "Spatial coordinates sampled by the probe scan.",
+            "Spatial coordinates sampled by the probe scan, entered manually or read from bmotion.",
             tuple(
                 [
+                    _p(
+                        "spatial_geometry_source",
+                        "Geometry source",
+                        "choice",
+                        "manual",
+                        "Use manually entered geometry or load authoritative target positions from the HDF5 bmotion control.",
+                        choices=SUPPORTED_SPATIAL_GEOMETRY_SOURCES,
+                    ),
+                    _p(
+                        "bmotion_config_name",
+                        "bmotion configuration",
+                        "optional_str",
+                        "",
+                        "Motion-group configuration used to obtain geometry, repeated shots, and the shot offset.",
+                    ),
                     _p(
                         "nx",
                         "X positions",
@@ -232,6 +249,14 @@ def _sections_for_geometry(geometry):
                             maximum=100_000,
                             decimals=3,
                             step=0.5,
+                        ),
+                        _p(
+                            "xy_y_acquisition_order",
+                            "Y acquisition order",
+                            "choice",
+                            "descending",
+                            "Order in which XY rows were acquired before they are normalized to ascending Y.",
+                            choices=SUPPORTED_XY_Y_ACQUISITION_ORDERS,
                         ),
                     ]
                 )
@@ -893,9 +918,9 @@ def _coerce_parameter(spec, value):
         if not isinstance(value, bool):
             raise ValueError(f"{spec.label} must be true or false.")
         return value
-    if spec.kind in {"str", "file", "directory"}:
+    if spec.kind in {"str", "file", "directory", "optional_str"}:
         value = str(value).strip()
-        if not value:
+        if not value and spec.kind != "optional_str":
             raise ValueError(f"{spec.label} cannot be empty.")
         return value
     if spec.kind in {"int", "optional_int"}:
@@ -947,6 +972,14 @@ def validate_parameters(geometry, values, *, require_input_file=False):
     normalized = {
         key: _coerce_parameter(spec, merged[key]) for key, spec in specs.items()
     }
+
+    if (
+        normalized["spatial_geometry_source"] == "bmotion"
+        and not normalized["bmotion_config_name"]
+    ):
+        raise ValueError(
+            "bmotion configuration cannot be empty when geometry comes from HDF5."
+        )
 
     if require_input_file and not Path(normalized["filename"]).is_file():
         raise ValueError(

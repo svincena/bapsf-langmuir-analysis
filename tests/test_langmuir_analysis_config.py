@@ -30,10 +30,29 @@ def test_defaults_are_complete_and_valid(geometry):
 @pytest.mark.parametrize(
     ("geometry", "spatial_keys"),
     (
-        ("x_line", ("nx", "x_min_cm", "x_max_cm")),
+        (
+            "x_line",
+            (
+                "spatial_geometry_source",
+                "bmotion_config_name",
+                "nx",
+                "x_min_cm",
+                "x_max_cm",
+            ),
+        ),
         (
             "xy_plane",
-            ("nx", "x_min_cm", "x_max_cm", "ny", "y_min_cm", "y_max_cm"),
+            (
+                "spatial_geometry_source",
+                "bmotion_config_name",
+                "nx",
+                "x_min_cm",
+                "x_max_cm",
+                "ny",
+                "y_min_cm",
+                "y_max_cm",
+                "xy_y_acquisition_order",
+            ),
         ),
     ),
 )
@@ -54,6 +73,18 @@ def test_spatial_and_acquisition_geometry_are_separate_adjacent_sections(
         parameter.key for parameter in sections[acquisition_index].parameters
     ) == ("nshots", "shot_analysis_mode", "nt_full", "data_offset")
     assert sections[acquisition_index].stack_with_previous
+
+
+@pytest.mark.parametrize("geometry", SUPPORTED_GEOMETRIES)
+def test_bmotion_geometry_source_requires_a_configuration(geometry):
+    values = default_parameters(geometry)
+    values["spatial_geometry_source"] = "bmotion"
+
+    with pytest.raises(ValueError, match="bmotion configuration cannot be empty"):
+        validate_parameters(geometry, values)
+
+    values["bmotion_config_name"] = "motion group"
+    assert validate_parameters(geometry, values)["spatial_geometry_source"] == "bmotion"
 
 
 def test_parameter_file_round_trip_preserves_both_tabs(tmp_path):

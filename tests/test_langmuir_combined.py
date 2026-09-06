@@ -66,6 +66,38 @@ def test_diagnostic_plot_directory_is_named_for_and_beside_source_file(tmp_path)
     )
 
 
+def test_xy_reader_flips_descending_acquisition_y_to_ascending_coordinates():
+    class FakeReadResult(dict):
+        def __init__(self, signal):
+            super().__init__(signal=signal)
+            self.dt = type("TimeStep", (), {"value": 1.0e-6})()
+
+    class FakeFile:
+        def read_data(self, *_args, **_kwargs):
+            # Acquisition order is (+y, x0), (+y, x1), (-y, x0), (-y, x1).
+            signal = np.repeat(np.arange(4, dtype=float)[:, np.newaxis], 2, axis=1)
+            return FakeReadResult(signal)
+
+    signal, _dt = analysis.read_channel_xy(
+        FakeFile(),
+        board=1,
+        channel=1,
+        shotnum_start=1,
+        shotnum_end=5,
+        ny=2,
+        nx=2,
+        nshots=1,
+        nt_full=2,
+        digitizer="SIS crate",
+        adc="SIS 3302",
+        config_name="config",
+        flipup=True,
+    )
+
+    # The result's first row is now -y and its last row is +y.
+    assert signal[:, :, 0, 0].tolist() == [[2.0, 3.0], [0.0, 1.0]]
+
+
 def test_prepare_trace_for_analysis_selects_one_individual_shot():
     voltage = np.array([[[0.0, 1.0, 2.0], [0.1, 1.1, 2.1]]])
     current = 2.0 * voltage - 1.0
@@ -354,6 +386,8 @@ def test_xline_pipeline_exports_repeated_ramp_shapes(
         assert group.attrs["per_shot_axis_order"] == "x,shot,ramp"
         assert group.attrs["profile_axis_order"] == "x,ramp"
         assert group.attrs["n_analysis_traces"] == expected_analysis_traces
+        assert group.attrs["spatial_geometry_source"] == "manual"
+        assert group.attrs["bmotion_config_name"] == ""
 
 
 def test_xy_postprocessing_and_calibration_do_not_mix_ramps():
@@ -533,6 +567,9 @@ def test_xy_pipeline_exports_repeated_ramp_shapes(
         assert group.attrs["per_shot_axis_order"] == "y,x,shot,ramp"
         assert group.attrs["profile_axis_order"] == "y,x,ramp"
         assert group.attrs["n_analysis_traces"] == expected_analysis_traces
+        assert group.attrs["spatial_geometry_source"] == "manual"
+        assert group.attrs["bmotion_config_name"] == ""
+        assert group.attrs["y_acquisition_order"] == "descending"
 
     npz_path = source_path.with_name(f"{source_path.stem}_langmuir_xy.npz")
     with np.load(npz_path, allow_pickle=False) as result:
@@ -540,6 +577,9 @@ def test_xy_pipeline_exports_repeated_ramp_shapes(
         assert result["te_shot_eV"].shape == (2, 3, 2, 2)
         assert result["xy_ramp_shape_info"].tolist() == [2, 3, 2, 2, 4, 8]
         assert result["profile_axis_order"].item() == "y,x,ramp"
+        assert result["spatial_geometry_source"].item() == "manual"
+        assert result["bmotion_config_name"].item() == ""
+        assert result["y_acquisition_order"].item() == "descending"
 
 
 def test_select_xline_from_xy_map_uses_nearest_y_coordinate():

@@ -25,6 +25,10 @@ GEOMETRY_TITLES = {
 }
 
 CHOICE_LABELS = {
+    "manual": "Manual entry",
+    "bmotion": "From HDF5 (bmotion)",
+    "descending": "Positive Y to negative Y",
+    "ascending": "Negative Y to positive Y",
     "high_bias_median": "High-bias regional median",
     "at_vp": "At plasma potential (ion-subtracted)",
     "individual": "Fit each shot separately",
@@ -581,6 +585,259 @@ def discover_sis_configurations(filename, digitizer):
         raise ValueError(f"Could not open HDF5 file {filename}: {error}") from error
 
 
+def discover_bmotion_configurations(filename):
+    """Return bmotion configuration names mapped by bapsflib."""
+    filename = Path(filename).expanduser()
+    if not filename.is_file():
+        raise ValueError(f"Experiment HDF5 file does not exist: {filename}")
+
+    # Keep bapsflib and its scientific dependencies out of splash startup.
+    from bapsflib import lapd
+
+    file_obj = None
+    try:
+        file_obj = lapd.File(filename)
+        if "bmotion" not in file_obj.controls:
+            raise ValueError(f"HDF5 file {filename} has no mapped bmotion control.")
+        return tuple(
+            sorted(
+                (str(name) for name in file_obj.controls["bmotion"].configs),
+                key=str.casefold,
+            )
+        )
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError(
+            f"Could not inspect bmotion configurations in {filename}: {error}"
+        ) from error
+    finally:
+        if file_obj is not None:
+            file_obj.close()
+
+
+def infer_bmotion_geometry(shot_numbers, target_positions_cm, geometry):
+    """Infer one supported regular scan geometry from bmotion target data."""
+    import numpy as np
+
+    if geometry not in {"x_line", "xy_plane"}:
+        raise ValueError(f"Unsupported analysis geometry {geometry!r}.")
+
+    shot_numbers = np.asarray(shot_numbers)
+    target_positions_cm = np.asarray(target_positions_cm, dtype=float)
+    if shot_numbers.ndim != 1:
+        raise ValueError("bmotion shot numbers must be one-dimensional.")
+    if (
+        target_positions_cm.ndim != 2
+        or target_positions_cm.shape[0] != shot_numbers.size
+        or target_positions_cm.shape[1] < 2
+    ):
+        raise ValueError(
+            "bmotion target positions must have shape (number of shots, 2 or more)."
+        )
+    if shot_numbers.size < 2:
+        raise ValueError("bmotion must contain at least two scan shots.")
+    if np.any(~np.isfinite(shot_numbers)) or np.any(
+        shot_numbers != shot_numbers.astype(np.int64)
+    ):
+        raise ValueError("bmotion shot numbers must be finite integers.")
+    shot_numbers = shot_numbers.astype(np.int64)
+    if np.any(shot_numbers <= 0) or np.any(np.diff(shot_numbers) != 1):
+        raise ValueError(
+            "bmotion shots for the selected configuration must be positive and contiguous."
+        )
+
+    tolerance_cm = 1e-8
+    x_values = target_positions_cm[:, 0]
+    y_values = target_positions_cm[:, 1]
+    if not np.all(np.isfinite(x_values)):
+        raise ValueError("bmotion X target positions must be finite.")
+    if geometry == "x_line":
+        finite_y = y_values[np.isfinite(y_values)]
+        if finite_y.size and np.ptp(finite_y) > tolerance_cm:
+            raise ValueError(
+                "The selected bmotion configuration varies in Y and is not an X-line scan."
+            )
+        run_coordinates = x_values[:, np.newaxis]
+    else:
+        if not np.all(np.isfinite(y_values)):
+            raise ValueError("bmotion Y target positions must be finite for an XY scan.")
+        run_coordinates = target_positions_cm[:, :2]
+
+    # Every spatial position must occupy one contiguous run of repeated shots;
+    # this is the acquisition ordering expected by the analysis reshapes.
+    same_as_previous = np.all(
+        np.isclose(
+            run_coordinates[1:],
+            run_coordinates[:-1],
+            rtol=0.0,
+            atol=tolerance_cm,
+        ),
+        axis=1,
+    )
+    run_starts = np.concatenate(([0], np.flatnonzero(~same_as_previous) + 1))
+    run_stops = np.concatenate((run_starts[1:], [shot_numbers.size]))
+    run_lengths = run_stops - run_starts
+    if np.any(run_lengths != run_lengths[0]):
+        raise ValueError(
+            "bmotion does not contain a constant number of repeated shots per position."
+        )
+    ordered_positions = run_coordinates[run_starts]
+    rounded_positions = np.round(ordered_positions, decimals=8)
+    if np.unique(rounded_positions, axis=0).shape[0] != ordered_positions.shape[0]:
+        raise ValueError(
+            "bmotion revisits a target position in separate shot blocks; this ordering is unsupported."
+        )
+
+    result = {
+        "nshots": int(run_lengths[0]),
+        "data_offset": int(shot_numbers[0] - 1),
+    }
+    if geometry == "x_line":
+        ordered_x = ordered_positions[:, 0]
+        x_steps = np.diff(ordered_x)
+        if ordered_x.size < 2 or np.any(x_steps <= tolerance_cm):
+            raise ValueError(
+                "X-line bmotion targets must be ordered at strictly increasing X positions."
+            )
+        if not np.allclose(
+            x_steps,
+            x_steps[0],
+            rtol=0.0,
+            atol=tolerance_cm,
+        ):
+            raise ValueError("X-line bmotion targets must be evenly spaced.")
+        result.update(
+            nx=int(ordered_x.size),
+            x_min_cm=float(ordered_x[0]),
+            x_max_cm=float(ordered_x[-1]),
+        )
+        return result
+
+    unique_x = np.unique(rounded_positions[:, 0])
+    unique_y = np.unique(rounded_positions[:, 1])
+    if unique_x.size < 2 or unique_y.size < 2:
+        raise ValueError(
+            "XY bmotion targets must contain at least two distinct X and Y positions."
+        )
+    if not np.allclose(
+        np.diff(unique_x),
+        np.diff(unique_x)[0],
+        rtol=0.0,
+        atol=tolerance_cm,
+    ) or not np.allclose(
+        np.diff(unique_y),
+        np.diff(unique_y)[0],
+        rtol=0.0,
+        atol=tolerance_cm,
+    ):
+        raise ValueError("XY bmotion targets must be evenly spaced along each axis.")
+    descending_positions = np.asarray(
+        [(x_value, y_value) for y_value in unique_y[::-1] for x_value in unique_x]
+    )
+    ascending_positions = np.asarray(
+        [(x_value, y_value) for y_value in unique_y for x_value in unique_x]
+    )
+    if ordered_positions.shape == descending_positions.shape and np.allclose(
+        ordered_positions,
+        descending_positions,
+        rtol=0.0,
+        atol=tolerance_cm,
+    ):
+        y_acquisition_order = "descending"
+    elif ordered_positions.shape == ascending_positions.shape and np.allclose(
+        ordered_positions,
+        ascending_positions,
+        rtol=0.0,
+        atol=tolerance_cm,
+    ):
+        y_acquisition_order = "ascending"
+    else:
+        raise ValueError(
+            "XY bmotion targets must form a complete rectangular grid ordered "
+            "with X increasing within each row and monotonic Y between rows."
+        )
+    result.update(
+        nx=int(unique_x.size),
+        x_min_cm=float(unique_x[0]),
+        x_max_cm=float(unique_x[-1]),
+        ny=int(unique_y.size),
+        y_min_cm=float(unique_y[0]),
+        y_max_cm=float(unique_y[-1]),
+        xy_y_acquisition_order=y_acquisition_order,
+    )
+    return result
+
+
+def read_bmotion_geometry(filename, config_name, geometry):
+    """Read target positions through bapsflib and infer geometry in cm."""
+    filename = Path(filename).expanduser()
+    config_name = str(config_name).strip()
+    if not filename.is_file():
+        raise ValueError(f"Experiment HDF5 file does not exist: {filename}")
+    if not config_name:
+        raise ValueError("bmotion configuration cannot be empty.")
+
+    import astropy.units as u
+    import numpy as np
+    from bapsflib import lapd
+
+    file_obj = None
+    try:
+        file_obj = lapd.File(filename)
+        if "bmotion" not in file_obj.controls:
+            raise ValueError(f"HDF5 file {filename} has no mapped bmotion control.")
+        control_map = file_obj.controls["bmotion"]
+        if config_name not in control_map.configs:
+            raise ValueError(
+                f'bmotion configuration "{config_name}" is not present in {filename}.'
+            )
+        control_data = file_obj.read_controls(
+            [("bmotion", config_name)],
+            silent=True,
+        )
+        if "xyz_target" not in (control_data.dtype.names or ()):
+            raise ValueError(
+                f'bmotion configuration "{config_name}" has no xyz_target data.'
+            )
+        shot_numbers = np.asarray(control_data["shotnum"]).copy()
+        target_positions = np.asarray(
+            control_data["xyz_target"], dtype=float
+        ).copy()
+
+        config = control_map.configs[config_name]
+        motion_config = config["meta"][0]["MG_CONFIG"]
+        axes = motion_config["drive"]["axes"].values()
+        axis_units = {
+            str(axis["name"]).casefold(): str(axis["units"]) for axis in axes
+        }
+        required_axes = ("x",) if geometry == "x_line" else ("x", "y")
+        for axis_index, axis_name in enumerate(required_axes):
+            if axis_name not in axis_units:
+                raise ValueError(
+                    f'bmotion configuration "{config_name}" has no {axis_name.upper()} axis.'
+                )
+            try:
+                scale_to_cm = (1.0 * u.Unit(axis_units[axis_name])).to_value(u.cm)
+            except (ValueError, u.UnitConversionError) as error:
+                raise ValueError(
+                    f'bmotion {axis_name.upper()} units '
+                    f'"{axis_units[axis_name]}" are not a length.'
+                ) from error
+            target_positions[:, axis_index] *= scale_to_cm
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError(
+            f"Could not read bmotion geometry from {filename}: {error}"
+        ) from error
+    finally:
+        if file_obj is not None:
+            file_obj.close()
+
+    return infer_bmotion_geometry(shot_numbers, target_positions, geometry)
+
+
 def discover_sis_sample_count(filename, digitizer, config_name):
     """Return the common trace length for a digitizer configuration."""
     filename = Path(filename).expanduser()
@@ -642,6 +899,8 @@ def discover_sis_sample_count(filename, digitizer, config_name):
 class PathEditor(QtWidgets.QWidget):
     """Line editor with a native file or directory picker."""
 
+    path_selected = QtCore.Signal(str)
+
     def __init__(self, value, *, directory=False, parent=None):
         super().__init__(parent)
         self.directory = directory
@@ -676,6 +935,7 @@ class PathEditor(QtWidgets.QWidget):
             )
         if selected:
             self.line_edit.setText(selected)
+            self.path_selected.emit(selected)
 
     def value(self):
         return self.line_edit.text().strip()
@@ -739,6 +999,71 @@ class SisConfigurationEditor(QtWidgets.QWidget):
         )
         if accepted:
             self.set_value(selected)
+
+    def value(self):
+        return self.line_edit.text().strip()
+
+    def set_value(self, value):
+        self.line_edit.setText(str(value))
+
+
+class BMotionConfigurationEditor(QtWidgets.QWidget):
+    """Editable bmotion configuration with an HDF5-backed picker."""
+
+    configuration_selected = QtCore.Signal(str)
+
+    def __init__(self, value, source_filename, parent=None):
+        super().__init__(parent)
+        self.source_filename = source_filename
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.line_edit = QtWidgets.QLineEdit(str(value))
+        self.line_edit.setToolTip(str(value))
+        self.line_edit.textChanged.connect(self.line_edit.setToolTip)
+        self.browse_button = QtWidgets.QPushButton("…")
+        self.browse_button.setObjectName("browseButton")
+        self.browse_button.setToolTip(
+            "Choose a bmotion configuration found in the selected HDF5 file"
+        )
+        self.browse_button.clicked.connect(self._browse)
+        layout.addWidget(self.line_edit, 1)
+        layout.addWidget(self.browse_button)
+
+    def _browse(self):
+        try:
+            candidates = discover_bmotion_configurations(self.source_filename())
+        except ValueError as error:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Could not find bmotion configurations",
+                str(error),
+            )
+            return
+
+        if not candidates:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No bmotion configurations found",
+                "The selected HDF5 file contains no mapped bmotion configurations.",
+            )
+            return
+
+        current_value = self.value()
+        current_index = (
+            candidates.index(current_value) if current_value in candidates else 0
+        )
+        selected, accepted = QtWidgets.QInputDialog.getItem(
+            self,
+            "Choose bmotion configuration",
+            "Available motion configurations:",
+            candidates,
+            current_index,
+            False,
+        )
+        if accepted:
+            self.set_value(selected)
+            self.configuration_selected.emit(selected)
 
     def value(self):
         return self.line_edit.text().strip()
@@ -838,9 +1163,19 @@ class IntegerPairEditor(QtWidgets.QWidget):
         self.x_value.set_value(value[1])
 
 
-def _make_editor(spec, *, sis_source_values=None):
+def _make_editor(
+    spec,
+    *,
+    sis_source_values=None,
+    bmotion_source_filename=None,
+):
     if spec.key == "sis_config_name":
         editor = SisConfigurationEditor(spec.default, sis_source_values)
+    elif spec.key == "bmotion_config_name":
+        editor = BMotionConfigurationEditor(
+            spec.default,
+            bmotion_source_filename,
+        )
     elif spec.kind == "bool":
         editor = QtWidgets.QCheckBox("Enabled")
         editor.setChecked(bool(spec.default))
@@ -881,7 +1216,15 @@ def _make_editor(spec, *, sis_source_values=None):
 
 
 def _editor_value(editor, spec):
-    if isinstance(editor, (PathEditor, SisConfigurationEditor, IntegerPairEditor)):
+    if isinstance(
+        editor,
+        (
+            PathEditor,
+            SisConfigurationEditor,
+            BMotionConfigurationEditor,
+            IntegerPairEditor,
+        ),
+    ):
         return editor.value()
     if spec.kind == "bool":
         return editor.isChecked()
@@ -897,7 +1240,13 @@ def _editor_value(editor, spec):
 def _set_editor_value(editor, spec, value):
     if isinstance(
         editor,
-        (PathEditor, SisConfigurationEditor, IntegerPairEditor, DirectNumericInput),
+        (
+            PathEditor,
+            SisConfigurationEditor,
+            BMotionConfigurationEditor,
+            IntegerPairEditor,
+            DirectNumericInput,
+        ),
     ):
         editor.set_value(value)
     elif spec.kind == "bool":
@@ -919,6 +1268,7 @@ class ParameterTab(QtWidgets.QWidget):
         self.editors = {}
         self.specs = {}
         self.section_cards = {}
+        self._setting_values = False
 
         root_layout = QtWidgets.QVBoxLayout(self)
         root_layout.setContentsMargins(0, 12, 0, 0)
@@ -1007,6 +1357,11 @@ class ParameterTab(QtWidgets.QWidget):
                     if spec.key == "sis_config_name"
                     else None
                 ),
+                bmotion_source_filename=(
+                    self._source_filename
+                    if spec.key == "bmotion_config_name"
+                    else None
+                ),
             )
             self.editors[spec.key] = editor
             self.specs[spec.key] = spec
@@ -1020,6 +1375,104 @@ class ParameterTab(QtWidgets.QWidget):
             _editor_value(self.editors[key], self.specs[key])
             for key in ("filename", "digitizer")
         )
+
+    def _source_filename(self):
+        """Return the experiment filename currently displayed by this tab."""
+        return _editor_value(self.editors["filename"], self.specs["filename"])
+
+    def reconcile_bmotion_geometry(self):
+        """Replace file-backed geometry and shot grouping from bmotion."""
+        source = _editor_value(
+            self.editors["spatial_geometry_source"],
+            self.specs["spatial_geometry_source"],
+        )
+        if source == "manual":
+            return ()
+
+        filename = self._source_filename()
+        config_editor = self.editors["bmotion_config_name"]
+        config_name = config_editor.value()
+        candidates = discover_bmotion_configurations(filename)
+        if not candidates:
+            raise ValueError(
+                f"No mapped bmotion configurations were found in "
+                f"{Path(filename).expanduser()}."
+            )
+
+        adjustments = []
+        if config_name not in candidates:
+            if len(candidates) != 1:
+                valid_names = ", ".join(repr(name) for name in candidates)
+                raise ValueError(
+                    f'bmotion configuration "{config_name}" is not present in '
+                    f"the selected HDF5 file. Choose one of: {valid_names}."
+                )
+            selected_name = candidates[0]
+            config_editor.set_value(selected_name)
+            adjustments.append(
+                f'bmotion configuration: "{config_name}" → "{selected_name}"'
+            )
+            config_name = selected_name
+
+        geometry_values = read_bmotion_geometry(
+            filename,
+            config_name,
+            self.geometry,
+        )
+        geometry_keys = ["nx", "x_min_cm", "x_max_cm"]
+        if self.geometry == "xy_plane":
+            geometry_keys.extend(
+                ("ny", "y_min_cm", "y_max_cm", "xy_y_acquisition_order")
+            )
+        geometry_keys.extend(("nshots", "data_offset"))
+        for key in geometry_keys:
+            detected_value = geometry_values[key]
+            current_value = _editor_value(self.editors[key], self.specs[key])
+            if current_value == detected_value:
+                continue
+            _set_editor_value(self.editors[key], self.specs[key], detected_value)
+            adjustments.append(
+                f"{self.specs[key].label}: {current_value} → {detected_value} "
+                "(from bmotion)"
+            )
+        return tuple(adjustments)
+
+    def _refresh_bmotion_geometry(self, *, show_errors=False):
+        """Refresh file-backed fields after a relevant GUI selection."""
+        if not self._geometry_source_is_bmotion():
+            return ()
+        try:
+            return self.reconcile_bmotion_geometry()
+        except ValueError as error:
+            if show_errors:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Could not load bmotion geometry",
+                    str(error),
+                )
+            return ()
+
+    def _geometry_source_is_bmotion(self):
+        return (
+            self.editors["spatial_geometry_source"].currentData() == "bmotion"
+        )
+
+    def _update_geometry_source_controls(self, *_args):
+        """Enable manual fields only when manual geometry is selected."""
+        if self._setting_values:
+            return
+        file_backed = self._geometry_source_is_bmotion()
+        self.editors["bmotion_config_name"].setEnabled(file_backed)
+        geometry_keys = ["nx", "x_min_cm", "x_max_cm"]
+        if self.geometry == "xy_plane":
+            geometry_keys.extend(
+                ("ny", "y_min_cm", "y_max_cm", "xy_y_acquisition_order")
+            )
+        geometry_keys.extend(("nshots", "data_offset"))
+        for key in geometry_keys:
+            self.editors[key].setEnabled(not file_backed)
+        if file_backed:
+            self._refresh_bmotion_geometry()
 
     def reconcile_sis_acquisition_metadata(self):
         """Synchronize unambiguous SIS metadata with the selected HDF5 file."""
@@ -1104,6 +1557,26 @@ class ParameterTab(QtWidgets.QWidget):
             toggle.toggled.connect(update)
             update(toggle.isChecked())
 
+        geometry_source = self.editors["spatial_geometry_source"]
+        geometry_source.currentIndexChanged.connect(
+            self._update_geometry_source_controls
+        )
+        bmotion_editor = self.editors["bmotion_config_name"]
+        bmotion_editor.configuration_selected.connect(
+            lambda _name: self._refresh_bmotion_geometry(show_errors=True)
+        )
+        bmotion_editor.line_edit.editingFinished.connect(
+            lambda: self._refresh_bmotion_geometry(show_errors=True)
+        )
+        filename_editor = self.editors["filename"]
+        filename_editor.line_edit.editingFinished.connect(
+            self._refresh_bmotion_geometry
+        )
+        filename_editor.path_selected.connect(
+            lambda _path: self._refresh_bmotion_geometry()
+        )
+        self._update_geometry_source_controls()
+
     def values(self):
         return {
             key: _editor_value(self.editors[key], spec)
@@ -1111,9 +1584,14 @@ class ParameterTab(QtWidgets.QWidget):
         }
 
     def set_values(self, values):
-        for key, value in values.items():
-            if key in self.editors:
-                _set_editor_value(self.editors[key], self.specs[key], value)
+        self._setting_values = True
+        try:
+            for key, value in values.items():
+                if key in self.editors:
+                    _set_editor_value(self.editors[key], self.specs[key], value)
+        finally:
+            self._setting_values = False
+        self._update_geometry_source_controls()
 
     def restore_defaults(self):
         self.set_values(default_parameters(self.geometry))
@@ -1244,6 +1722,12 @@ class LangmuirAnalysisWindow(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def save_parameters(self):
         try:
+            geometry_adjustments = []
+            for geometry, tab in self.parameter_tabs.items():
+                geometry_adjustments.extend(
+                    (geometry, adjustment)
+                    for adjustment in tab.reconcile_bmotion_geometry()
+                )
             save_last_parameters(
                 self._all_values(), self._active_geometry(), LAST_PARAMETERS_PATH
             )
@@ -1252,6 +1736,10 @@ class LangmuirAnalysisWindow(QtWidgets.QMainWindow):
                 self, "Could not save parameters", str(error)
             )
             return False
+        for geometry, adjustment in geometry_adjustments:
+            self._append_console(
+                f"Adjusted {GEOMETRY_TITLES[geometry]} {adjustment}"
+            )
         self._append_console(f"Saved both tabs to {LAST_PARAMETERS_PATH.name}.")
         return True
 
@@ -1264,7 +1752,10 @@ class LangmuirAnalysisWindow(QtWidgets.QMainWindow):
         active_geometry = self._active_geometry()
         tab = self.parameter_tabs[active_geometry]
         try:
-            metadata_adjustments = tab.reconcile_sis_acquisition_metadata()
+            metadata_adjustments = (
+                tab.reconcile_bmotion_geometry()
+                + tab.reconcile_sis_acquisition_metadata()
+            )
             validate_parameters(
                 active_geometry,
                 tab.values(),

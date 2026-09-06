@@ -32,6 +32,17 @@ cross-field combinations are rejected before a run starts. Analysis runs in a
 separate process, leaving the interface responsive while its output appears in
 the live console. **Stop analysis** terminates that worker if necessary.
 
+The **Geometry source** control supports manual spatial entries or authoritative
+geometry from the selected file's `bmotion` control. In HDF5 mode, choose the
+motion configuration when a file contains more than one. The GUI reads its
+target positions through `bapsflib`, then replaces and locks the spatial point
+counts and bounds, shots per position, and shot offset. File-backed scans must
+have constant repetitions and the regular X-line or rectangular XY acquisition
+ordering expected by the analysis. XY rows may run in either Y direction; the
+direction is detected and normalized so result coordinates increase from
+negative to positive Y. Incompatible motion lists are rejected before
+digitizer data are read.
+
 Both tabs are saved automatically in `last_parameters.json`, along with the
 last active tab. The file is local run state and is intentionally ignored by
 Git. If it is absent, all controls use the documented defaults in

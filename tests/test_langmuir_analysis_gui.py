@@ -150,6 +150,208 @@ def test_sis_configuration_picker_reads_immediate_digitizer_groups(
     window.close()
 
 
+def test_infer_bmotion_geometry_from_target_positions():
+    import numpy as np
+
+    xline_targets = np.repeat(
+        [[-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        2,
+        axis=0,
+    )
+    assert gui.infer_bmotion_geometry(
+        np.arange(11, 17),
+        xline_targets,
+        "x_line",
+    ) == {
+        "nx": 3,
+        "x_min_cm": -1.0,
+        "x_max_cm": 1.0,
+        "nshots": 2,
+        "data_offset": 10,
+    }
+
+    ordered_xy = [
+        (x_value, y_value, 0.0)
+        for y_value in (1.0, -1.0)
+        for x_value in (-1.0, 0.0, 1.0)
+    ]
+    xy_targets = np.repeat(ordered_xy, 3, axis=0)
+    assert gui.infer_bmotion_geometry(
+        np.arange(21, 39),
+        xy_targets,
+        "xy_plane",
+    ) == {
+        "nx": 3,
+        "x_min_cm": -1.0,
+        "x_max_cm": 1.0,
+        "ny": 2,
+        "y_min_cm": -1.0,
+        "y_max_cm": 1.0,
+        "xy_y_acquisition_order": "descending",
+        "nshots": 3,
+        "data_offset": 20,
+    }
+
+    ascending_xy = [
+        (x_value, y_value, 0.0)
+        for y_value in (-1.0, 1.0)
+        for x_value in (-1.0, 0.0, 1.0)
+    ]
+    ascending_result = gui.infer_bmotion_geometry(
+        np.arange(1, 13),
+        np.repeat(ascending_xy, 2, axis=0),
+        "xy_plane",
+    )
+    assert ascending_result["xy_y_acquisition_order"] == "ascending"
+
+
+def test_infer_bmotion_geometry_rejects_incompatible_ordering():
+    import numpy as np
+
+    unequal_repeats = np.asarray(
+        [[-1.0, 0.0], [-1.0, 0.0], [0.0, 0.0]]
+    )
+    with pytest.raises(ValueError, match="constant number of repeated shots"):
+        gui.infer_bmotion_geometry(
+            np.arange(1, 4),
+            unequal_repeats,
+            "x_line",
+        )
+
+    with pytest.raises(ValueError, match="evenly spaced"):
+        gui.infer_bmotion_geometry(
+            np.arange(1, 4),
+            [[-1.0, 0.0], [-0.25, 0.0], [1.0, 0.0]],
+            "x_line",
+        )
+
+    wrong_xy_order = np.asarray(
+        [
+            [-1.0, -1.0],
+            [1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, 1.0],
+        ]
+    )
+    with pytest.raises(ValueError, match="X increasing.*monotonic Y"):
+        gui.infer_bmotion_geometry(
+            np.arange(1, 5),
+            wrong_xy_order,
+            "xy_plane",
+        )
+
+
+def test_gui_bmotion_mode_replaces_and_locks_geometry_fields(
+    application, monkeypatch, tmp_path
+):
+    hdf5_path = tmp_path / "experiment.hdf5"
+    hdf5_path.touch()
+    monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", tmp_path / "parameters.json")
+    monkeypatch.setattr(
+        gui,
+        "discover_bmotion_configurations",
+        lambda _filename: ("Only motion group",),
+    )
+    monkeypatch.setattr(
+        gui,
+        "read_bmotion_geometry",
+        lambda _filename, _config, geometry: {
+            "nx": 91,
+            "x_min_cm": -22.5,
+            "x_max_cm": 22.5,
+            "nshots": 5,
+            "data_offset": 10,
+            **(
+                {
+                    "ny": 31,
+                    "y_min_cm": -15.0,
+                    "y_max_cm": 15.0,
+                    "xy_y_acquisition_order": "descending",
+                }
+                if geometry == "xy_plane"
+                else {}
+            ),
+        },
+    )
+    window = LangmuirAnalysisWindow()
+    tab = window.parameter_tabs["x_line"]
+
+    tab.set_values(
+        {
+            "filename": str(hdf5_path),
+            "spatial_geometry_source": "bmotion",
+        }
+    )
+
+    values = tab.values()
+    assert values["bmotion_config_name"] == "Only motion group"
+    assert values["nx"] == 91
+    assert values["x_min_cm"] == -22.5
+    assert values["x_max_cm"] == 22.5
+    assert values["nshots"] == 5
+    assert values["data_offset"] == 10
+    assert tab.editors["bmotion_config_name"].isEnabled()
+    for key in ("nx", "x_min_cm", "x_max_cm", "nshots", "data_offset"):
+        assert not tab.editors[key].isEnabled()
+
+    tab.set_values({"spatial_geometry_source": "manual"})
+    assert not tab.editors["bmotion_config_name"].isEnabled()
+    assert all(
+        tab.editors[key].isEnabled()
+        for key in ("nx", "x_min_cm", "x_max_cm", "nshots", "data_offset")
+    )
+    window.close()
+
+
+def test_gui_bmotion_mode_requires_selection_for_multiple_configurations(
+    application, monkeypatch, tmp_path
+):
+    hdf5_path = tmp_path / "experiment.hdf5"
+    hdf5_path.touch()
+    monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", tmp_path / "parameters.json")
+    monkeypatch.setattr(
+        gui,
+        "discover_bmotion_configurations",
+        lambda _filename: ("Motion A", "Motion B"),
+    )
+    monkeypatch.setattr(
+        gui,
+        "read_bmotion_geometry",
+        lambda _filename, config, _geometry: {
+            "nx": 3,
+            "x_min_cm": -1.0,
+            "x_max_cm": 1.0,
+            "nshots": 4,
+            "data_offset": 12 if config == "Motion B" else 0,
+        },
+    )
+    window = LangmuirAnalysisWindow()
+    tab = window.parameter_tabs["x_line"]
+    tab.set_values(
+        {
+            "filename": str(hdf5_path),
+            "spatial_geometry_source": "bmotion",
+        }
+    )
+
+    with pytest.raises(ValueError, match="Choose one of.*Motion A.*Motion B"):
+        tab.reconcile_bmotion_geometry()
+
+    monkeypatch.setattr(
+        QtWidgets.QInputDialog,
+        "getItem",
+        lambda *_args: ("Motion B", True),
+    )
+    editor = tab.editors["bmotion_config_name"]
+    editor.browse_button.click()
+    assert editor.value() == "Motion B"
+    assert tab.values()["nx"] == 3
+    assert tab.values()["nshots"] == 4
+    assert tab.values()["data_offset"] == 12
+
+    window.close()
+
+
 def test_sis_metadata_reconciles_single_configuration_and_trace_length(
     application, monkeypatch, tmp_path
 ):
