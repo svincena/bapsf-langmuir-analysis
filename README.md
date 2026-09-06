@@ -20,8 +20,8 @@ that is open when **Start Analysis** is pressed defines the geometry; there is
 no geometry flag to edit in the source code. Each tab groups its settings into
 titled cards for:
 
-- data source and scan geometry;
-- digitizer/probe conversion and sweep windows;
+- data source and spatial/acquisition geometry;
+- probe conversion and sweep windows;
 - I–V physics and time/spatial processing;
 - interferometer calibration; and
 - execution, plots, diagnostics, and result output.
@@ -42,6 +42,16 @@ ordering expected by the analysis. XY rows may run in either Y direction; the
 direction is detected and normalized so result coordinates increase from
 negative to positive Y. Incompatible motion lists are rejected before
 digitizer data are read.
+
+The **Temporal information source** control similarly selects manual timing or
+authoritative digitizer metadata from the HDF5 file. In HDF5 mode, the GUI uses
+`bapsflib` with the selected digitizer, ADC, configuration, board, voltage
+channel, and current channel to replace and lock **Samples per trace**
+(`nt_full`) and **Sample interval** (`dt`). The two channels must report the
+same trace length and sample interval. A stored time array is accepted only
+when it is evenly spaced, because the analysis uses one scalar `dt`. Manual
+mode leaves both fields editable and uses the entered sample interval even when
+the file reports a different value.
 
 Both tabs are saved automatically in `last_parameters.json`, along with the
 last active tab. The file is local run state and is intentionally ignored by

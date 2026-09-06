@@ -11,6 +11,18 @@ def application():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+@pytest.fixture(autouse=True)
+def avoid_real_temporal_metadata_reads(monkeypatch):
+    def unavailable_metadata(*_args, **_kwargs):
+        raise ValueError("No test digitizer metadata configured.")
+
+    monkeypatch.setattr(
+        gui,
+        "read_digitizer_temporal_metadata",
+        unavailable_metadata,
+    )
+
+
 def test_gui_has_one_fully_populated_tab_per_geometry(
     application, monkeypatch, tmp_path
 ):
@@ -47,6 +59,15 @@ def test_gui_has_one_fully_populated_tab_per_geometry(
     xline_tab.set_values({"shot_analysis_mode": "average"})
     assert xline_tab.values()["shot_analysis_mode"] == "average"
     assert "Average shots" in xline_tab.editors["shot_analysis_mode"].currentText()
+    assert xline_tab.values()["temporal_metadata_source"] == "hdf5"
+    assert not xline_tab.editors["nt_full"].isEnabled()
+    assert not xline_tab.editors["dt_s"].isEnabled()
+    xline_tab.set_values(
+        {"temporal_metadata_source": "manual", "dt_s": 2.5e-8}
+    )
+    assert xline_tab.editors["nt_full"].isEnabled()
+    assert xline_tab.editors["dt_s"].isEnabled()
+    assert xline_tab.values()["dt_s"] == 2.5e-8
     assert xline_tab.values()["nramps"] == 1
     xline_tab.set_values(
         {"nramps": 3, "ramp_display_mode": "ramp_time_map"}
@@ -139,6 +160,7 @@ def test_sis_configuration_picker_reads_immediate_digitizer_groups(
                 "digitizer": "SIS crate",
                 "adc": "This value is deliberately ignored by the picker",
                 "sis_config_name": "previous value",
+                "temporal_metadata_source": "manual",
             }
         )
         editor = tab.editors["sis_config_name"]
@@ -375,11 +397,10 @@ def test_gui_bmotion_mode_requires_selection_for_multiple_configurations(
     window.close()
 
 
-def test_sis_metadata_reconciles_single_configuration_and_trace_length(
+def test_sis_metadata_reconciles_configuration_trace_length_and_interval(
     application, monkeypatch, tmp_path
 ):
     import h5py
-    import numpy as np
 
     hdf5_path = tmp_path / "experiment.hdf5"
     with h5py.File(hdf5_path, "w") as h5_file:
@@ -387,39 +408,49 @@ def test_sis_metadata_reconciles_single_configuration_and_trace_length(
             "Raw data + config"
         ).create_group("SIS crate")
         digitizer_group.create_group("Only config")
-        digitizer_group.create_dataset(
-            "Only config [Slot 2: SIS 3302 ch 3]",
-            data=np.zeros((7, 128)),
-        )
-        digitizer_group.create_dataset(
-            "Only config [Slot 2: SIS 3302 ch 3] headers",
-            data=np.zeros(7),
-        )
-
-    assert gui.discover_sis_sample_count(
-        hdf5_path, "SIS crate", "Only config"
-    ) == 128
 
     monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", tmp_path / "parameters.json")
+    metadata_calls = []
+
+    def temporal_metadata(filename, **kwargs):
+        metadata_calls.append((filename, kwargs))
+        return {"nt_full": 128, "dt_s": 2e-8}
+
+    monkeypatch.setattr(
+        gui,
+        "read_digitizer_temporal_metadata",
+        temporal_metadata,
+    )
     window = LangmuirAnalysisWindow()
     tab = window.parameter_tabs["x_line"]
     tab.set_values(
         {
             "filename": str(hdf5_path),
             "digitizer": "SIS crate",
-            "sis_config_name": "Stale config",
-            "nt_full": 256,
         }
     )
+    tab.editors["sis_config_name"].set_value("Stale config")
+    tab.editors["nt_full"].set_value(256)
+    tab.editors["dt_s"].set_value(1e-6)
 
     adjustments = tab.reconcile_sis_acquisition_metadata()
 
     assert tab.values()["sis_config_name"] == "Only config"
     assert tab.values()["nt_full"] == 128
+    assert tab.values()["dt_s"] == 2e-8
     assert adjustments == (
         'SIS configuration: "Stale config" → "Only config"',
         "Samples per trace: 256 → 128 (from HDF5)",
+        "Sample interval: 1e-06 → 2e-08 (from HDF5)",
     )
+    assert metadata_calls[-1][1] == {
+        "digitizer": "SIS crate",
+        "adc": tab.values()["adc"],
+        "config_name": "Only config",
+        "board": tab.values()["board"],
+        "voltage_channel": tab.values()["vsweep_channel"],
+        "current_channel": tab.values()["isweep_channel"],
+    }
     window.close()
 
 

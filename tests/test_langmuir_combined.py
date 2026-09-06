@@ -21,7 +21,9 @@ def test_run_analysis_dispatches_selected_geometry(monkeypatch):
     )
 
     for geometry in ("x_line", "xy_plane"):
-        analysis.run_analysis(geometry, default_parameters(geometry))
+        values = default_parameters(geometry)
+        values["temporal_metadata_source"] = "manual"
+        analysis.run_analysis(geometry, values)
 
     assert called == ["x_line", "xy_plane"]
 
@@ -29,6 +31,36 @@ def test_run_analysis_dispatches_selected_geometry(monkeypatch):
 def test_run_analysis_rejects_unknown_geometry():
     with pytest.raises(ValueError, match="analysis_geometry"):
         analysis.run_analysis("radial", {})
+
+
+def test_run_analysis_refreshes_hdf5_temporal_metadata(monkeypatch):
+    values = default_parameters("x_line")
+    values.update(nt_full=10, dt_s=1e-6)
+    monkeypatch.setattr(
+        analysis,
+        "read_digitizer_temporal_metadata",
+        lambda *_args, **_kwargs: {"nt_full": 20_000, "dt_s": 2e-8},
+    )
+    observed = []
+    monkeypatch.setattr(
+        analysis,
+        "run_xline_analysis",
+        lambda: observed.append((analysis.nt_full, analysis.dt_s)),
+    )
+
+    analysis.run_analysis("x_line", values)
+
+    assert observed == [(20_000, 2e-8)]
+
+
+def test_sample_interval_selection_honors_manual_mode_and_checks_hdf5_mode():
+    assert analysis.resolve_sample_interval(2e-6, "manual", 1e-6, 1e-6) == 2e-6
+    assert analysis.resolve_sample_interval(1e-6, "hdf5", 1e-6, 1e-6) == 1e-6
+
+    with pytest.raises(ValueError, match="different sample intervals"):
+        analysis.resolve_sample_interval(1e-6, "manual", 1e-6, 2e-6)
+    with pytest.raises(ValueError, match="changed after HDF5"):
+        analysis.resolve_sample_interval(2e-6, "hdf5", 1e-6, 1e-6)
 
 
 def test_configure_xy_analysis_derives_spatial_and_shot_shapes():
@@ -306,6 +338,8 @@ def test_xline_pipeline_exports_repeated_ramp_shapes(
     values = default_parameters("x_line")
     values.update(
         filename=str(source_path),
+        temporal_metadata_source="manual",
+        dt_s=2.0e-6,
         nx=2,
         nshots=3,
         nt_full=30,
@@ -388,6 +422,8 @@ def test_xline_pipeline_exports_repeated_ramp_shapes(
         assert group.attrs["n_analysis_traces"] == expected_analysis_traces
         assert group.attrs["spatial_geometry_source"] == "manual"
         assert group.attrs["bmotion_config_name"] == ""
+        assert group.attrs["temporal_metadata_source"] == "manual"
+        assert group.attrs["dt_s"] == 2.0e-6
 
 
 def test_xy_postprocessing_and_calibration_do_not_mix_ramps():
@@ -480,6 +516,8 @@ def test_xy_pipeline_exports_repeated_ramp_shapes(
     values = default_parameters("xy_plane")
     values.update(
         filename=str(source_path),
+        temporal_metadata_source="manual",
+        dt_s=2.0e-6,
         ny=2,
         nx=3,
         nshots=2,
@@ -569,6 +607,8 @@ def test_xy_pipeline_exports_repeated_ramp_shapes(
         assert group.attrs["n_analysis_traces"] == expected_analysis_traces
         assert group.attrs["spatial_geometry_source"] == "manual"
         assert group.attrs["bmotion_config_name"] == ""
+        assert group.attrs["temporal_metadata_source"] == "manual"
+        assert group.attrs["dt_s"] == 2.0e-6
         assert group.attrs["y_acquisition_order"] == "descending"
 
     npz_path = source_path.with_name(f"{source_path.stem}_langmuir_xy.npz")
@@ -579,6 +619,7 @@ def test_xy_pipeline_exports_repeated_ramp_shapes(
         assert result["profile_axis_order"].item() == "y,x,ramp"
         assert result["spatial_geometry_source"].item() == "manual"
         assert result["bmotion_config_name"].item() == ""
+        assert result["temporal_metadata_source"].item() == "manual"
         assert result["y_acquisition_order"].item() == "descending"
 
 

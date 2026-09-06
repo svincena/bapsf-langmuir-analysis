@@ -23,6 +23,7 @@ from langmuir_analysis_config import (
     save_last_parameters,
     validate_parameters,
 )
+from langmuir_analysis_metadata import read_digitizer_temporal_metadata
 
 
 GEOMETRY_TITLES = {
@@ -33,6 +34,7 @@ GEOMETRY_TITLES = {
 CHOICE_LABELS = {
     "manual": "Manual entry",
     "bmotion": "From HDF5 (bmotion)",
+    "hdf5": "From HDF5 (bapsflib)",
     "descending": "Positive Y to negative Y",
     "ascending": "Negative Y to positive Y",
     "high_bias_median": "High-bias regional median",
@@ -845,64 +847,6 @@ def read_bmotion_geometry(filename, config_name, geometry):
     return infer_bmotion_geometry(shot_numbers, target_positions, geometry)
 
 
-def discover_sis_sample_count(filename, digitizer, config_name):
-    """Return the common trace length for a digitizer configuration."""
-    filename = Path(filename).expanduser()
-    digitizer = str(digitizer).strip()
-    config_name = str(config_name).strip()
-    if not filename.is_file():
-        raise ValueError(f"Experiment HDF5 file does not exist: {filename}")
-    if not digitizer:
-        raise ValueError("Digitizer group cannot be empty.")
-    if not config_name:
-        raise ValueError("SIS configuration cannot be empty.")
-
-    # SIS channel datasets are siblings of the configuration group and have
-    # names such as "<configuration> [Slot 2: SIS 3302 ch 3]".
-    import h5py
-
-    digitizer_path = f"/Raw data + config/{digitizer}"
-    try:
-        with h5py.File(filename, "r") as h5_file:
-            if digitizer_path not in h5_file:
-                raise ValueError(f'HDF5 group "{digitizer_path}" was not found.')
-            group = h5_file[digitizer_path]
-            if not isinstance(group, h5py.Group):
-                raise ValueError(f'HDF5 object "{digitizer_path}" is not a group.')
-            if config_name not in group or not isinstance(
-                group[config_name], h5py.Group
-            ):
-                raise ValueError(
-                    f'SIS configuration "{config_name}" was not found in '
-                    f'"{digitizer_path}".'
-                )
-
-            dataset_prefix = f"{config_name} ["
-            sample_counts = {
-                int(item.shape[-1])
-                for name, item in group.items()
-                if name.startswith(dataset_prefix)
-                and isinstance(item, h5py.Dataset)
-                and item.ndim >= 2
-            }
-            if not sample_counts:
-                raise ValueError(
-                    f'No SIS channel datasets were found for configuration '
-                    f'"{config_name}".'
-                )
-            if len(sample_counts) != 1:
-                formatted_counts = ", ".join(
-                    str(count) for count in sorted(sample_counts)
-                )
-                raise ValueError(
-                    f'SIS channel datasets for configuration "{config_name}" '
-                    f"have inconsistent trace lengths: {formatted_counts}."
-                )
-            return sample_counts.pop()
-    except OSError as error:
-        raise ValueError(f"Could not open HDF5 file {filename}: {error}") from error
-
-
 class PathEditor(QtWidgets.QWidget):
     """Line editor with a native file or directory picker."""
 
@@ -953,6 +897,8 @@ class PathEditor(QtWidgets.QWidget):
 
 class SisConfigurationEditor(QtWidgets.QWidget):
     """Editable SIS configuration name with HDF5-backed candidate selection."""
+
+    configuration_selected = QtCore.Signal(str)
 
     def __init__(self, value, source_values, parent=None):
         super().__init__(parent)
@@ -1006,6 +952,7 @@ class SisConfigurationEditor(QtWidgets.QWidget):
         )
         if accepted:
             self.set_value(selected)
+            self.configuration_selected.emit(selected)
 
     def value(self):
         return self.line_edit.text().strip()
@@ -1387,6 +1334,9 @@ class ParameterTab(QtWidgets.QWidget):
         """Return the experiment filename currently displayed by this tab."""
         return _editor_value(self.editors["filename"], self.specs["filename"])
 
+    def _temporal_source_is_hdf5(self):
+        return self.editors["temporal_metadata_source"].currentData() == "hdf5"
+
     def reconcile_bmotion_geometry(self):
         """Replace file-backed geometry and shot grouping from bmotion."""
         source = _editor_value(
@@ -1482,7 +1432,7 @@ class ParameterTab(QtWidgets.QWidget):
             self._refresh_bmotion_geometry()
 
     def reconcile_sis_acquisition_metadata(self):
-        """Synchronize unambiguous SIS metadata with the selected HDF5 file."""
+        """Validate the SIS selection and synchronize file-backed timing."""
         filename, digitizer = self._sis_source_values()
         config_editor = self.editors["sis_config_name"]
         config_name = config_editor.value()
@@ -1508,18 +1458,68 @@ class ParameterTab(QtWidgets.QWidget):
             )
             config_name = selected_name
 
-        sample_count = discover_sis_sample_count(
-            filename, digitizer, config_name
+        if not self._temporal_source_is_hdf5():
+            return tuple(adjustments)
+
+        metadata = read_digitizer_temporal_metadata(
+            filename,
+            digitizer=digitizer,
+            adc=_editor_value(self.editors["adc"], self.specs["adc"]),
+            config_name=config_name,
+            board=_editor_value(self.editors["board"], self.specs["board"]),
+            voltage_channel=_editor_value(
+                self.editors["vsweep_channel"], self.specs["vsweep_channel"]
+            ),
+            current_channel=_editor_value(
+                self.editors["isweep_channel"], self.specs["isweep_channel"]
+            ),
         )
-        nt_editor = self.editors["nt_full"]
-        configured_sample_count = _editor_value(nt_editor, self.specs["nt_full"])
-        if configured_sample_count != sample_count:
-            nt_editor.set_value(sample_count)
+        for key in ("nt_full", "dt_s"):
+            editor = self.editors[key]
+            configured_value = _editor_value(editor, self.specs[key])
+            detected_value = metadata[key]
+            if key == "dt_s":
+                values_match = math.isclose(
+                    configured_value,
+                    detected_value,
+                    rel_tol=1e-12,
+                    abs_tol=0.0,
+                )
+            else:
+                values_match = configured_value == detected_value
+            if values_match:
+                continue
+            _set_editor_value(editor, self.specs[key], detected_value)
             adjustments.append(
-                "Samples per trace: "
-                f"{configured_sample_count} → {sample_count} (from HDF5)"
+                f"{self.specs[key].label}: {configured_value:.15g} → "
+                f"{detected_value:.15g} (from HDF5)"
             )
         return tuple(adjustments)
+
+    def _refresh_temporal_metadata(self, *, show_errors=False):
+        """Refresh file-backed trace length and sample interval."""
+        if not self._temporal_source_is_hdf5():
+            return ()
+        try:
+            return self.reconcile_sis_acquisition_metadata()
+        except ValueError as error:
+            if show_errors:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Could not load temporal information",
+                    str(error),
+                )
+            return ()
+
+    def _update_temporal_source_controls(self, *_args, refresh=True):
+        """Enable manual timing fields only for manual temporal input."""
+        if self._setting_values:
+            return
+        file_backed = self._temporal_source_is_hdf5()
+        for key in ("nt_full", "dt_s"):
+            self.editors[key].setEnabled(not file_backed)
+        if file_backed and refresh:
+            self._refresh_temporal_metadata()
 
     def _wire_dependencies(self):
         """Dim controls that have no effect while their feature is disabled."""
@@ -1582,7 +1582,35 @@ class ParameterTab(QtWidgets.QWidget):
         filename_editor.path_selected.connect(
             lambda _path: self._refresh_bmotion_geometry()
         )
+        temporal_source = self.editors["temporal_metadata_source"]
+        temporal_source.currentIndexChanged.connect(
+            self._update_temporal_source_controls
+        )
+        sis_editor = self.editors["sis_config_name"]
+        sis_editor.configuration_selected.connect(
+            lambda _name: self._refresh_temporal_metadata(show_errors=True)
+        )
+        sis_editor.line_edit.editingFinished.connect(
+            lambda: self._refresh_temporal_metadata(show_errors=True)
+        )
+        filename_editor.line_edit.editingFinished.connect(
+            self._refresh_temporal_metadata
+        )
+        filename_editor.path_selected.connect(
+            lambda _path: self._refresh_temporal_metadata()
+        )
+        for key in (
+            "digitizer",
+            "adc",
+            "board",
+            "vsweep_channel",
+            "isweep_channel",
+        ):
+            self.editors[key].editingFinished.connect(
+                self._refresh_temporal_metadata
+            )
         self._update_geometry_source_controls()
+        self._update_temporal_source_controls(refresh=False)
 
     def values(self):
         return {
@@ -1599,6 +1627,7 @@ class ParameterTab(QtWidgets.QWidget):
         finally:
             self._setting_values = False
         self._update_geometry_source_controls()
+        self._update_temporal_source_controls()
 
     def restore_defaults(self):
         self.set_values(default_parameters(self.geometry))
@@ -1729,11 +1758,14 @@ class LangmuirAnalysisWindow(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def save_parameters(self):
         try:
-            geometry_adjustments = []
+            metadata_adjustments = []
             for geometry, tab in self.parameter_tabs.items():
-                geometry_adjustments.extend(
+                adjustments = tab.reconcile_bmotion_geometry()
+                if tab._temporal_source_is_hdf5():
+                    adjustments += tab.reconcile_sis_acquisition_metadata()
+                metadata_adjustments.extend(
                     (geometry, adjustment)
-                    for adjustment in tab.reconcile_bmotion_geometry()
+                    for adjustment in adjustments
                 )
             save_last_parameters(
                 self._all_values(), self._active_geometry(), LAST_PARAMETERS_PATH
@@ -1743,7 +1775,7 @@ class LangmuirAnalysisWindow(QtWidgets.QMainWindow):
                 self, "Could not save parameters", str(error)
             )
             return False
-        for geometry, adjustment in geometry_adjustments:
+        for geometry, adjustment in metadata_adjustments:
             self._append_console(
                 f"Adjusted {GEOMETRY_TITLES[geometry]} {adjustment}"
             )

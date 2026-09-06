@@ -41,10 +41,12 @@ import matplotlib.pyplot as plt
 
 from langmuir_analysis_config import (
     SUPPORTED_GEOMETRIES,
+    default_parameters,
     load_last_parameters,
     validate_parameters,
 )
 from langmuir_analysis_core import analyze_iv_trace, bin_average_by_voltage
+from langmuir_analysis_metadata import read_digitizer_temporal_metadata
 from langmuir_diagnostics import (
     render_iv_diagnostic_plot as render_analysis_iv_diagnostic_plot,
 )
@@ -68,6 +70,8 @@ adc: Any = _RUNTIME_UNCONFIGURED
 sis_config_name: Any = _RUNTIME_UNCONFIGURED
 spatial_geometry_source: Any = _RUNTIME_UNCONFIGURED
 bmotion_config_name: Any = _RUNTIME_UNCONFIGURED
+temporal_metadata_source: Any = _RUNTIME_UNCONFIGURED
+dt_s: Any = _RUNTIME_UNCONFIGURED
 xy_y_acquisition_order: Any = _RUNTIME_UNCONFIGURED
 nx: Any = _RUNTIME_UNCONFIGURED
 ny: Any = _RUNTIME_UNCONFIGURED
@@ -175,6 +179,8 @@ def configure_analysis(geometry, parameter_values):
         nx=values["nx"],
         nshots=values["nshots"],
         nt_full=values["nt_full"],
+        temporal_metadata_source=values["temporal_metadata_source"],
+        dt_s=values["dt_s"],
         x_min=values["x_min_cm"],
         x_max=values["x_max_cm"],
         x=np.linspace(values["x_min_cm"], values["x_max_cm"], values["nx"]),
@@ -257,7 +263,31 @@ def configure_analysis(geometry, parameter_values):
 
 def run_analysis(geometry, parameter_values):
     """Configure and run exactly one geometry-specific analysis pipeline."""
-    configure_analysis(geometry, parameter_values)
+    if geometry not in _SUPPORTED_ANALYSIS_GEOMETRIES:
+        choices = ", ".join(sorted(_SUPPORTED_ANALYSIS_GEOMETRIES))
+        raise ValueError(
+            f"analysis_geometry must be one of {{{choices}}}; got {geometry!r}."
+        )
+    if not isinstance(parameter_values, dict):
+        raise TypeError("Parameter values must be a dictionary.")
+
+    resolved_parameters = dict(parameter_values)
+    merged_parameters = default_parameters(geometry)
+    merged_parameters.update(parameter_values)
+    if merged_parameters["temporal_metadata_source"] == "hdf5":
+        resolved_parameters.update(
+            read_digitizer_temporal_metadata(
+                merged_parameters["filename"],
+                digitizer=merged_parameters["digitizer"],
+                adc=merged_parameters["adc"],
+                config_name=merged_parameters["sis_config_name"],
+                board=merged_parameters["board"],
+                voltage_channel=merged_parameters["vsweep_channel"],
+                current_channel=merged_parameters["isweep_channel"],
+            )
+        )
+
+    configure_analysis(geometry, resolved_parameters)
     if geometry == "x_line":
         return run_xline_analysis()
     if geometry == "xy_plane":
@@ -653,7 +683,7 @@ def read_channel_xline(
     )
 
     signal = raw["signal"]
-    dt = raw.dt.value
+    channel_dt_s = _read_result_sample_interval(raw, channel)
 
     if signal.ndim != 2:
         raise ValueError(
@@ -688,7 +718,73 @@ def read_channel_xline(
 
     signal = signal.reshape(expected_shape)
     signal = signal * scale_factor
-    return signal, dt
+    return signal, channel_dt_s
+
+
+def _read_result_sample_interval(raw, channel):
+    """Return bapsflib's sample interval in seconds, if it is available."""
+    raw_dt = raw.dt
+    if raw_dt is None:
+        return None
+    try:
+        if hasattr(raw_dt, "to_value"):
+            channel_dt_s = float(raw_dt.to_value(u.s))
+        else:
+            channel_dt_s = float(raw_dt.value)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"Channel {channel}: bapsflib returned an invalid sample interval."
+        ) from error
+    if not np.isfinite(channel_dt_s) or channel_dt_s <= 0:
+        raise ValueError(
+            f"Channel {channel}: bapsflib returned invalid sample interval "
+            f"{channel_dt_s!r} s."
+        )
+    return channel_dt_s
+
+
+def resolve_sample_interval(
+    configured_dt_s,
+    temporal_source,
+    voltage_dt_s,
+    current_dt_s,
+):
+    """Validate channel timing and select the configured scalar interval."""
+    configured_dt_s = float(configured_dt_s)
+    if not np.isfinite(configured_dt_s) or configured_dt_s <= 0:
+        raise ValueError("Configured sample interval must be positive and finite.")
+    if temporal_source not in {"manual", "hdf5"}:
+        raise ValueError(f"Unsupported temporal information source {temporal_source!r}.")
+
+    available_intervals = [
+        ("voltage", voltage_dt_s),
+        ("current", current_dt_s),
+    ]
+    if voltage_dt_s is not None and current_dt_s is not None and not np.isclose(
+        voltage_dt_s,
+        current_dt_s,
+        rtol=1e-9,
+        atol=1e-15,
+    ):
+        raise ValueError(
+            "Voltage and current channels report different sample intervals: "
+            f"{voltage_dt_s:.15g} s and {current_dt_s:.15g} s."
+        )
+
+    if temporal_source == "hdf5":
+        for role, observed_dt_s in available_intervals:
+            if observed_dt_s is not None and not np.isclose(
+                configured_dt_s,
+                observed_dt_s,
+                rtol=1e-9,
+                atol=1e-15,
+            ):
+                raise ValueError(
+                    f"The {role} channel sample interval changed after HDF5 "
+                    f"metadata reconciliation: expected {configured_dt_s:.15g} s, "
+                    f"found {observed_dt_s:.15g} s."
+                )
+    return configured_dt_s
 
 
 def extract_evenly_spaced_ramps(
@@ -1494,7 +1590,7 @@ def read_channel_xy(
     )
 
     signal = raw["signal"]
-    dt = raw.dt.value
+    channel_dt_s = _read_result_sample_interval(raw, channel)
 
     if signal.ndim != 2:
         raise ValueError(
@@ -1531,7 +1627,7 @@ def read_channel_xy(
     signal = signal * scale_factor
     if flipup:
         signal = np.flipud(signal)
-    return signal, dt
+    return signal, channel_dt_s
 
 
 def _as_yx_half_window(half_window):
@@ -2064,7 +2160,7 @@ def run_xline_analysis():
     file = lapd.File(filename, silent=True)
 
     print("Reading voltage data..")
-    vsweep_full, dt = read_channel_xline(
+    vsweep_full, voltage_dt_s = read_channel_xline(
         file_obj=file,
         board=board,
         channel=vsweep_channel,
@@ -2082,7 +2178,7 @@ def run_xline_analysis():
     print(f"Voltage data reshaped to (x, shots, time): {vsweep_full.shape}")
 
     print("Reading current data..")
-    isweep_full, _ = read_channel_xline(
+    isweep_full, current_dt_s = read_channel_xline(
         file_obj=file,
         board=board,
         channel=isweep_channel,
@@ -2098,6 +2194,13 @@ def run_xline_analysis():
         negate=negate_Isweep_current,
     )
     print(f"Current data reshaped to (x, shots, time): {isweep_full.shape}")
+
+    dt = resolve_sample_interval(
+        dt_s,
+        temporal_metadata_source,
+        voltage_dt_s,
+        current_dt_s,
+    )
 
     print(f"Extracting {nramps} evenly spaced ramp(s)")
     ramp_start_indices = (
@@ -2912,6 +3015,7 @@ def run_xline_analysis():
             grp.attrs["nshots"] = nshots
             grp.attrs["nramps"] = nramps
             grp.attrs["shot_analysis_mode"] = shot_analysis_mode
+            grp.attrs["temporal_metadata_source"] = temporal_metadata_source
             grp.attrs["nt_full"] = nt_full
             grp.attrs["nt_sweep"] = nt
             grp.attrs["dt_s"] = dt
@@ -3029,6 +3133,7 @@ def run_xline_analysis():
             "spatial_geometry_source": np.array(spatial_geometry_source),
             "bmotion_config_name": np.array(bmotion_config_name),
             "shot_analysis_mode": np.array(shot_analysis_mode),
+            "temporal_metadata_source": np.array(temporal_metadata_source),
             "shot_statistics_available": np.array(
                 int(shot_statistics_available)
             ),
@@ -3208,7 +3313,7 @@ def run_xy_analysis():
     file = lapd.File(filename, silent=True)
 
     print("Reading voltage data..")
-    vsweep_full, dt = read_channel_xy(
+    vsweep_full, voltage_dt_s = read_channel_xy(
         file_obj=file,
         board=board,
         channel=vsweep_channel,
@@ -3228,7 +3333,7 @@ def run_xy_analysis():
     print(f"Voltage data reshaped to (y, x, shots, time): {vsweep_full.shape}")
 
     print("Reading current data..")
-    isweep_full, _ = read_channel_xy(
+    isweep_full, current_dt_s = read_channel_xy(
         file_obj=file,
         board=board,
         channel=isweep_channel,
@@ -3246,6 +3351,13 @@ def run_xy_analysis():
         negate=negate_Isweep_current,
     )
     print(f"Current data reshaped to (y, x, shots, time): {isweep_full.shape}")
+
+    dt = resolve_sample_interval(
+        dt_s,
+        temporal_metadata_source,
+        voltage_dt_s,
+        current_dt_s,
+    )
 
     print(f"Extracting {nramps} evenly spaced ramp(s)")
     ramp_start_indices = (
@@ -4099,6 +4211,7 @@ def run_xy_analysis():
             grp.attrs["nshots"] = nshots
             grp.attrs["nramps"] = nramps
             grp.attrs["shot_analysis_mode"] = shot_analysis_mode
+            grp.attrs["temporal_metadata_source"] = temporal_metadata_source
             grp.attrs["nt_full"] = nt_full
             grp.attrs["nt_sweep"] = nt
             grp.attrs["dt_s"] = dt
@@ -4220,6 +4333,7 @@ def run_xy_analysis():
             "bmotion_config_name": np.array(bmotion_config_name),
             "y_acquisition_order": np.array(xy_y_acquisition_order),
             "shot_analysis_mode": np.array(shot_analysis_mode),
+            "temporal_metadata_source": np.array(temporal_metadata_source),
             "shot_statistics_available": np.array(
                 int(shot_statistics_available)
             ),

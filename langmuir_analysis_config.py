@@ -18,6 +18,7 @@ PARAMETER_FILE_VERSION = 1
 LAST_PARAMETERS_PATH = Path(__file__).with_name("last_parameters.json")
 SUPPORTED_GEOMETRIES = ("x_line", "xy_plane")
 SUPPORTED_SPATIAL_GEOMETRY_SOURCES = ("manual", "bmotion")
+SUPPORTED_TEMPORAL_METADATA_SOURCES = ("manual", "hdf5")
 SUPPORTED_XY_Y_ACQUISITION_ORDERS = ("descending", "ascending")
 SUPPORTED_SHOT_ANALYSIS_MODES = ("individual", "average")
 SUPPORTED_RAMP_DISPLAY_MODES = ("separate_profiles", "ramp_time_map")
@@ -86,7 +87,7 @@ def _sections_for_geometry(geometry):
         adc = "SIS 3302"
         sis_config_name = "Isat_Isweep_Vsweep_282624S_50MHz"
         current_zero_calibrated = True
-        nshots, nt_full, nx = 5, 282_624, 81
+        nshots, nt_full, dt_s, nx = 5, 282_624, 20e-9, 81
         board, vsweep_channel, isweep_channel = 2, 3, 2
         isweep_attenuation, isweep_resistance = 1.0, 3.1
         data_offset = 0
@@ -109,7 +110,7 @@ def _sections_for_geometry(geometry):
         adc = "SIS 3302"
         sis_config_name = "64kS_100MHz_div_32__Lang_longtime"
         current_zero_calibrated = False
-        nshots, nt_full, nx = 8, 65_536, 31
+        nshots, nt_full, dt_s, nx = 8, 65_536, 320e-9, 31
         board, vsweep_channel, isweep_channel = 4, 4, 5
         isweep_attenuation, isweep_resistance = 4.0, 1.0
         data_offset = 31 * 31 * 8
@@ -291,7 +292,7 @@ def _sections_for_geometry(geometry):
         ),
         SectionSpec(
             "Acquisition geometry",
-            "Repeated shots, trace length, and acquisition offset.",
+            "Repeated shots, temporal sampling, and acquisition offset.",
             (
                 _p(
                     "nshots",
@@ -311,6 +312,14 @@ def _sections_for_geometry(geometry):
                     choices=SUPPORTED_SHOT_ANALYSIS_MODES,
                 ),
                 _p(
+                    "temporal_metadata_source",
+                    "Temporal information source",
+                    "choice",
+                    "hdf5",
+                    "Enter trace timing manually or obtain it from the selected HDF5 digitizer channels through bapsflib.",
+                    choices=SUPPORTED_TEMPORAL_METADATA_SOURCES,
+                ),
+                _p(
                     "nt_full",
                     "Samples per trace",
                     "int",
@@ -318,6 +327,17 @@ def _sections_for_geometry(geometry):
                     "Full digitizer trace length.",
                     minimum=2,
                     maximum=100_000_000,
+                ),
+                _p(
+                    "dt_s",
+                    "Sample interval",
+                    "float",
+                    dt_s,
+                    "Elapsed time between consecutive digitizer samples.",
+                    unit="s",
+                    minimum=1e-15,
+                    maximum=1e3,
+                    decimals=15,
                 ),
                 _p(
                     "data_offset",

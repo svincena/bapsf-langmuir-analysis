@@ -71,7 +71,14 @@ def test_spatial_and_acquisition_geometry_are_separate_adjacent_sections(
     ) == spatial_keys
     assert tuple(
         parameter.key for parameter in sections[acquisition_index].parameters
-    ) == ("nshots", "shot_analysis_mode", "nt_full", "data_offset")
+    ) == (
+        "nshots",
+        "shot_analysis_mode",
+        "temporal_metadata_source",
+        "nt_full",
+        "dt_s",
+        "data_offset",
+    )
     assert sections[acquisition_index].stack_with_previous
 
 
@@ -175,6 +182,23 @@ def test_shot_analysis_mode_is_selectable_and_validated(geometry):
 
     values["shot_analysis_mode"] = "unsupported"
     with pytest.raises(ValueError, match="Shot fitting mode"):
+        validate_parameters(geometry, values)
+
+
+@pytest.mark.parametrize("geometry", SUPPORTED_GEOMETRIES)
+def test_temporal_metadata_source_and_manual_interval_are_validated(geometry):
+    values = default_parameters(geometry)
+    assert values["temporal_metadata_source"] == "hdf5"
+    assert values["dt_s"] > 0
+
+    values["temporal_metadata_source"] = "manual"
+    values["dt_s"] = 2.5e-8
+    validated = validate_parameters(geometry, values)
+    assert validated["temporal_metadata_source"] == "manual"
+    assert validated["dt_s"] == 2.5e-8
+
+    values["temporal_metadata_source"] = "unsupported"
+    with pytest.raises(ValueError, match="Temporal information source"):
         validate_parameters(geometry, values)
 
 
