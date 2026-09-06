@@ -90,3 +90,26 @@ def test_plot_summary_dispatches_by_stored_geometry(
     )
 
     assert combined_reader.plot_summary(_minimal_schema(geometry)) == expected
+
+
+@pytest.mark.parametrize("display_mode", ["separate_profiles", "ramp_time_map"])
+def test_xline_reader_plots_multi_ramp_results(display_mode):
+    import matplotlib.pyplot as plt
+
+    x = np.array([-1.0, 0.0, 1.0])
+    values = np.arange(6, dtype=float).reshape(3, 2) + 1.0
+    data = {
+        "geometry": np.array("x_line"),
+        "source_file": np.array("synthetic.hdf5"),
+        "x_cm": x,
+        "ramp_center_time_s": np.array([0.01, 0.02]),
+        "ramp_display_mode": np.array(display_mode),
+        "analysis_ok": np.ones((3, 2), dtype=np.uint8),
+    }
+    for key in ("te_eV", "vp_V", "vf_V", "ies_A", "iis_A", "n_e_m3"):
+        data[key] = values
+
+    figure = combined_reader.plot_xline_summary(data)
+
+    assert len(figure.axes) >= 6
+    plt.close(figure)

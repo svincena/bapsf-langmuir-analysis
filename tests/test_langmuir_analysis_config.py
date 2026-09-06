@@ -126,3 +126,55 @@ def test_shot_analysis_mode_is_selectable_and_validated(geometry):
     values["shot_analysis_mode"] = "unsupported"
     with pytest.raises(ValueError, match="Shot fitting mode"):
         validate_parameters(geometry, values)
+
+
+def test_repeated_ramp_controls_are_xline_only_and_validated():
+    xline = default_parameters("x_line")
+    xy = default_parameters("xy_plane")
+
+    assert xline["nramps"] == 1
+    assert xline["ramp_display_mode"] == "separate_profiles"
+    assert "nramps" not in xy
+    assert "ramp_display_mode" not in xy
+
+    xline.update(
+        nt_full=100,
+        sweep_start_index=10,
+        sweep_end_index=19,
+        nramps=3,
+        ramp_start_spacing_samples=30,
+        ramp_display_mode="ramp_time_map",
+        isat_end_index=5,
+        sg_smooth_bins=7,
+    )
+    validated = validate_parameters("x_line", xline)
+    assert validated["nramps"] == 3
+    assert validated["ramp_display_mode"] == "ramp_time_map"
+
+    xline["ramp_start_spacing_samples"] = 9
+    with pytest.raises(ValueError, match="at least the extracted ramp length"):
+        validate_parameters("x_line", xline)
+
+
+def test_repeated_ramps_must_fit_inside_trace_and_avoid_dc_window():
+    values = default_parameters("x_line")
+    values.update(
+        nt_full=100,
+        sweep_start_index=10,
+        sweep_end_index=19,
+        nramps=3,
+        ramp_start_spacing_samples=41,
+        isat_end_index=5,
+        sg_smooth_bins=7,
+    )
+    with pytest.raises(ValueError, match="Every extracted ramp"):
+        validate_parameters("x_line", values)
+
+    values.update(
+        ramp_start_spacing_samples=30,
+        subtract_dc=True,
+        isweep_dc_offset_start_index=42,
+        isweep_dc_offset_end_index=45,
+    )
+    with pytest.raises(ValueError, match="must not overlap any I–V ramp"):
+        validate_parameters("x_line", values)

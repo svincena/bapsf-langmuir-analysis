@@ -70,6 +70,9 @@ nx: Any = _RUNTIME_UNCONFIGURED
 ny: Any = _RUNTIME_UNCONFIGURED
 nshots: Any = _RUNTIME_UNCONFIGURED
 shot_analysis_mode: Any = _RUNTIME_UNCONFIGURED
+nramps: Any = _RUNTIME_UNCONFIGURED
+ramp_start_spacing_samples: Any = _RUNTIME_UNCONFIGURED
+ramp_display_mode: Any = _RUNTIME_UNCONFIGURED
 nt_full: Any = _RUNTIME_UNCONFIGURED
 x_min: Any = _RUNTIME_UNCONFIGURED
 x_max: Any = _RUNTIME_UNCONFIGURED
@@ -194,6 +197,18 @@ def configure_analysis(geometry, parameter_values):
         N_passes=values["N_passes"],
         interferometer_phase=values["interferometer_phase_rad"] * u.rad,
     )
+    if geometry == "x_line":
+        runtime.update(
+            nramps=values["nramps"],
+            ramp_start_spacing_samples=values["ramp_start_spacing_samples"],
+            ramp_display_mode=values["ramp_display_mode"],
+        )
+    else:
+        runtime.update(
+            nramps=1,
+            ramp_start_spacing_samples=runtime["nt"],
+            ramp_display_mode="separate_profiles",
+        )
 
     n_spatial_positions = values["nx"]
     if geometry == "xy_plane":
@@ -266,22 +281,31 @@ def describe_ies_method(method):
     raise ValueError(f"Unknown Ies method {method!r}.")
 
 
-def shot_mean_and_std(values, valid_mask=None):
+def shot_mean_and_std(values, valid_mask=None, *, axis=-1):
     """Return nan-aware mean, sample standard deviation, and count over shots."""
     values = np.asarray(values, dtype=float)
     valid = np.isfinite(values)
     if valid_mask is not None:
         valid &= np.asarray(valid_mask, dtype=bool)
 
-    count = np.sum(valid, axis=-1)
-    total = np.sum(np.where(valid, values, 0.0), axis=-1)
+    axis = int(axis)
+    if axis < 0:
+        axis += values.ndim
+    if not 0 <= axis < values.ndim:
+        raise ValueError(f"shot axis {axis} is invalid for {values.ndim} dimensions.")
+    count = np.sum(valid, axis=axis)
+    total = np.sum(np.where(valid, values, 0.0), axis=axis)
     mean = np.full(count.shape, np.nan, dtype=float)
     np.divide(total, count, out=mean, where=count > 0)
 
-    squared_deviation = np.where(valid, (values - mean[..., np.newaxis]) ** 2, 0.0)
+    squared_deviation = np.where(
+        valid,
+        (values - np.expand_dims(mean, axis=axis)) ** 2,
+        0.0,
+    )
     std = np.full(count.shape, np.nan, dtype=float)
     np.divide(
-        np.sum(squared_deviation, axis=-1),
+        np.sum(squared_deviation, axis=axis),
         count - 1,
         out=std,
         where=count > 1,
@@ -380,6 +404,51 @@ def scale_density_profile_to_interferometer(
         u.dimensionless_unscaled
     )
     return normalized_density, scaled_density, density_scale
+
+
+def scale_xline_density_ramps_to_interferometer(
+    x_cm,
+    electron_density,
+    line_integrated_density,
+):
+    """Calibrate each x-line ramp independently to the interferometer."""
+    density = u.Quantity(electron_density).to(u.m**-3)
+    if density.ndim == 1:
+        shape_factor = electron_density_profile_shape_factor(x_cm, density)
+        normalized, scaled, scale = scale_density_profile_to_interferometer(
+            density,
+            line_integrated_density,
+            shape_factor,
+        )
+        return shape_factor, normalized, scaled, scale
+    if density.ndim != 2 or density.shape[0] != len(x_cm):
+        raise ValueError(
+            "Multi-ramp x-line density must have shape (nx, nramps); "
+            f"got {density.shape}."
+        )
+
+    n_ramps = density.shape[1]
+    shape_factors = np.full(n_ramps, np.nan) * u.m
+    normalized = np.full(density.shape, np.nan)
+    scaled = np.full(density.shape, np.nan) * u.m**-3
+    scales = np.full(n_ramps, np.nan)
+    for ramp_index in range(n_ramps):
+        shape_factor = electron_density_profile_shape_factor(
+            x_cm,
+            density[:, ramp_index],
+        )
+        ramp_normalized, ramp_scaled, ramp_scale = (
+            scale_density_profile_to_interferometer(
+                density[:, ramp_index],
+                line_integrated_density,
+                shape_factor,
+            )
+        )
+        shape_factors[ramp_index] = shape_factor
+        normalized[:, ramp_index] = ramp_normalized
+        scaled[:, ramp_index] = ramp_scaled
+        scales[ramp_index] = ramp_scale
+    return shape_factors, normalized, scaled, scales
 
 
 def select_xline_from_xy_map(y_cm, density_map, requested_y_cm=0.0):
@@ -534,6 +603,31 @@ def read_channel_xline(
     return signal, dt
 
 
+def extract_evenly_spaced_ramps(
+    signal,
+    sweep_start,
+    sweep_end,
+    ramp_count,
+    ramp_spacing,
+):
+    """Extract equal-length ramps, preserving legacy shape for one ramp."""
+    signal = np.asanyarray(signal)
+    ramp_length = int(sweep_end) - int(sweep_start) + 1
+    ramp_slices = []
+    for ramp_index in range(int(ramp_count)):
+        start = int(sweep_start) + ramp_index * int(ramp_spacing)
+        stop = start + ramp_length
+        ramp = signal[..., start:stop]
+        if ramp.shape[-1] != ramp_length:
+            raise ValueError(
+                f"Ramp {ramp_index + 1} extends beyond the acquired trace."
+            )
+        ramp_slices.append(ramp)
+    if len(ramp_slices) == 1:
+        return ramp_slices[0]
+    return np.stack(ramp_slices, axis=-2)
+
+
 def open_h5_for_update(path):
     try:
         return h5py.File(path, "r+")
@@ -559,12 +653,12 @@ def analyze_trace_worker(task):
     return result
 
 
-def analysis_trace_shape(spatial_shape, shot_count, mode):
+def analysis_trace_shape(spatial_shape, shot_count, mode, trailing_shape=()):
     """Return the fit-array shape for individual-shot or averaged analysis."""
     if mode == "individual":
-        return tuple(spatial_shape) + (int(shot_count),)
+        return tuple(spatial_shape) + (int(shot_count),) + tuple(trailing_shape)
     if mode == "average":
-        return tuple(spatial_shape) + (1,)
+        return tuple(spatial_shape) + (1,) + tuple(trailing_shape)
     raise ValueError(f"Unknown shot analysis mode {mode!r}.")
 
 
@@ -574,6 +668,8 @@ def prepare_trace_for_analysis(
     fit_index,
     mode,
     voltage_bin_width,
+    *,
+    shot_axis=-1,
 ):
     """Select one shot or form one voltage-binned mean across all shots."""
     voltage_by_shot = np.asarray(voltage_by_shot, dtype=float)
@@ -590,12 +686,26 @@ def prepare_trace_for_analysis(
     if mode != "average":
         raise ValueError(f"Unknown shot analysis mode {mode!r}.")
 
-    # The final fit-index entry is a singleton fit axis, not a physical shot.
+    # The fit-index entry on shot_axis is a singleton fit axis, not a physical
+    # shot. This remains true when temporal ramp indices follow the shot axis.
     # Pooling first and then binning by measured voltage tolerates small timing
     # and endpoint differences between otherwise repeated voltage sweeps.
-    spatial_index = fit_index[:-1]
-    voltage = voltage_by_shot[spatial_index].reshape(-1)
-    current = current_by_shot[spatial_index].reshape(-1)
+    fit_ndim = voltage_by_shot.ndim - 1
+    shot_axis = int(shot_axis)
+    if shot_axis < 0:
+        shot_axis += fit_ndim
+    if not 0 <= shot_axis < fit_ndim:
+        raise ValueError(
+            f"shot axis {shot_axis} is invalid for {fit_ndim} fit dimensions."
+        )
+    if len(fit_index) != fit_ndim:
+        raise ValueError(
+            f"fit_index must contain {fit_ndim} entries; got {len(fit_index)}."
+        )
+    selection = list(fit_index) + [slice(None)]
+    selection[shot_axis] = slice(None)
+    voltage = voltage_by_shot[tuple(selection)].reshape(-1)
+    current = current_by_shot[tuple(selection)].reshape(-1)
     voltage_mean, current_mean = bin_average_by_voltage(
         voltage,
         current,
@@ -606,9 +716,14 @@ def prepare_trace_for_analysis(
     return voltage_mean, current_mean
 
 
-def unavailable_per_shot_fit_products(spatial_shape, shot_count, diagnostic_points):
+def unavailable_per_shot_fit_products(
+    spatial_shape,
+    shot_count,
+    diagnostic_points,
+    trailing_shape=(),
+):
     """Return empty per-shot products when only an averaged fit was performed."""
-    shot_shape = tuple(spatial_shape) + (int(shot_count),)
+    shot_shape = tuple(spatial_shape) + (int(shot_count),) + tuple(trailing_shape)
     grid_shape = shot_shape + (int(diagnostic_points),)
     return {
         "te_shot": np.full(shot_shape, np.nan),
@@ -842,6 +957,47 @@ def apply_optional_x_postprocessing(
     return result
 
 
+def apply_optional_x_ramp_postprocessing(x_coord, te, vp, vf, **kwargs):
+    """Apply x-line processing independently to every temporal ramp."""
+    te_values = np.asarray(te, dtype=float)
+    if te_values.ndim == 1:
+        return apply_optional_x_postprocessing(
+            x_coord,
+            te,
+            vp,
+            vf,
+            **kwargs,
+        )
+    if te_values.ndim != 2 or te_values.shape[0] != len(x_coord):
+        raise ValueError(
+            "Multi-ramp x-line values must have shape (nx, nramps); "
+            f"got {te_values.shape}."
+        )
+
+    optional_names = ("ies", "iis", "n_e")
+    optional_values = {name: kwargs.pop(name, None) for name in optional_names}
+    ramp_results = []
+    for ramp_index in range(te_values.shape[1]):
+        ramp_kwargs = dict(kwargs)
+        for name, values in optional_values.items():
+            if values is not None:
+                ramp_kwargs[name] = np.asarray(values)[:, ramp_index]
+        ramp_results.append(
+            apply_optional_x_postprocessing(
+                x_coord,
+                te_values[:, ramp_index],
+                np.asarray(vp)[:, ramp_index],
+                np.asarray(vf)[:, ramp_index],
+                **ramp_kwargs,
+            )
+        )
+
+    return {
+        key: np.stack([result[key] for result in ramp_results], axis=1)
+        for key in ramp_results[0]
+    }
+
+
 def render_xline_summary_plot(
     x,
     te,
@@ -1038,6 +1194,140 @@ def render_xline_summary_plot(
     return fig
 
 
+def render_xline_multi_ramp_summary_plot(
+    x,
+    ramp_center_time_s,
+    te,
+    vp,
+    vf,
+    ies,
+    iis,
+    n_e,
+    *,
+    display_mode,
+    te_std=None,
+    vp_std=None,
+    vf_std=None,
+    ies_std=None,
+    iis_std=None,
+    n_e_std=None,
+    plot_stds=False,
+    analysis_ok=None,
+    analysis_status=None,
+    shape_factor=None,
+):
+    """Render multi-ramp x-line results as profiles or x/time maps."""
+    x = np.asarray(x, dtype=float)
+    ramp_times = np.asarray(ramp_center_time_s, dtype=float)
+    series = (
+        (te, te_std, "Electron Temperature", "T_e (eV)"),
+        (vp, vp_std, "Plasma Potential", "V_p (V)"),
+        (vf, vf_std, "Floating Potential", "V_f (V)"),
+        (ies, ies_std, "Electron Saturation Current", "I_es (A)"),
+        (iis, iis_std, "Ion Saturation Current", "I_is (A)"),
+        (n_e, n_e_std, "Electron Density", "n_e (m^-3)"),
+    )
+    first_values = np.asarray(series[0][0].value, dtype=float)
+    expected_shape = (x.size, ramp_times.size)
+    if first_values.shape != expected_shape:
+        raise ValueError(
+            "Multi-ramp profiles must have shape (nx, nramps); "
+            f"got {first_values.shape}, expected {expected_shape}."
+        )
+
+    fig, axs = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
+    fit_accepted = (
+        None if analysis_ok is None else np.asarray(analysis_ok, dtype=bool)
+    )
+    if display_mode == "separate_profiles":
+        colors = plt.get_cmap("viridis")(
+            np.linspace(0.05, 0.95, max(1, ramp_times.size))
+        )
+        for ax, (quantity, std, title, label) in zip(axs.flat, series):
+            values = np.asarray(quantity.value, dtype=float)
+            std_values = None if std is None else np.asarray(std.value, dtype=float)
+            any_values = False
+            for ramp_index, (ramp_time, color) in enumerate(
+                zip(ramp_times, colors)
+            ):
+                finite = np.isfinite(x) & np.isfinite(values[:, ramp_index])
+                if not np.any(finite):
+                    continue
+                any_values = True
+                ramp_label = f"ramp {ramp_index + 1}, t={ramp_time:.4g} s"
+                ax.plot(
+                    x[finite],
+                    values[finite, ramp_index],
+                    color=color,
+                    label=ramp_label,
+                )
+                if plot_stds and std_values is not None:
+                    finite_std = finite & np.isfinite(std_values[:, ramp_index])
+                    if np.any(finite_std):
+                        ax.errorbar(
+                            x[finite_std],
+                            values[finite_std, ramp_index],
+                            yerr=std_values[finite_std, ramp_index],
+                            fmt="none",
+                            ecolor=color,
+                            alpha=0.55,
+                            capsize=2,
+                        )
+                if fit_accepted is not None:
+                    rejected = finite & ~fit_accepted[:, ramp_index]
+                    if np.any(rejected):
+                        ax.plot(
+                            x[rejected],
+                            values[rejected, ramp_index],
+                            "x",
+                            color=color,
+                        )
+            if not any_values:
+                ax.text(0.5, 0.5, "No accepted values", ha="center", va="center")
+            ax.set_title(title)
+            ax.set_xlabel("X (cm)")
+            ax.set_ylabel(label)
+            ax.grid(True)
+            if any_values:
+                ax.legend(fontsize="small")
+    elif display_mode == "ramp_time_map":
+        x_mesh, time_mesh = np.meshgrid(x, ramp_times, indexing="xy")
+        for ax, (quantity, _std, title, label) in zip(axs.flat, series):
+            values = np.asarray(quantity.value, dtype=float)
+            image = ax.pcolormesh(
+                x_mesh,
+                time_mesh,
+                values.T,
+                shading="auto",
+            )
+            fig.colorbar(image, ax=ax, label=label)
+            ax.set_title(title)
+            ax.set_xlabel("X (cm)")
+            ax.set_ylabel("Ramp center time (s)")
+    else:
+        plt.close(fig)
+        raise ValueError(f"Unknown ramp display mode {display_mode!r}.")
+
+    if shape_factor is not None:
+        shape_factor_values = u.Quantity(shape_factor).to_value(u.m)
+        finite_shape_factors = shape_factor_values[np.isfinite(shape_factor_values)]
+        if finite_shape_factors.size:
+            axs[2, 1].text(
+                0.03,
+                0.95,
+                "Shape factors calibrated independently by ramp",
+                transform=axs[2, 1].transAxes,
+                ha="left",
+                va="top",
+                bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"},
+            )
+    title = "Langmuir X-Line Multi-Ramp Summary"
+    if analysis_status is not None:
+        title += f"\n{analysis_status}"
+    fig.suptitle(title, fontsize=16)
+    return fig
+
+
 def render_xline_all_iv_curves_plot(x, iv_voltage_grid, iv_current_grid):
     """Plot all interpolated I-V curves colored by x position."""
     fig, ax = plt.subplots(figsize=(9, 6), constrained_layout=True)
@@ -1046,21 +1336,26 @@ def render_xline_all_iv_curves_plot(x, iv_voltage_grid, iv_current_grid):
     x_min = np.nanmin(x)
     x_max = np.nanmax(x)
 
+    iv_voltage_grid = np.asarray(iv_voltage_grid)
+    iv_current_grid = np.asarray(iv_current_grid)
+    ramp_count = 1 if iv_voltage_grid.ndim == 2 else iv_voltage_grid.shape[1]
     for i in range(len(x)):
-        voltage_curve = iv_voltage_grid[i]
-        current_curve = iv_current_grid[i]
-        good = np.isfinite(voltage_curve) & np.isfinite(current_curve)
-        if np.count_nonzero(good) < 2:
-            continue
+        for ramp_index in range(ramp_count):
+            curve_index = (i,) if ramp_count == 1 else (i, ramp_index)
+            voltage_curve = iv_voltage_grid[curve_index]
+            current_curve = iv_current_grid[curve_index]
+            good = np.isfinite(voltage_curve) & np.isfinite(current_curve)
+            if np.count_nonzero(good) < 2:
+                continue
 
-        frac = 0.5 if x_max == x_min else (x[i] - x_min) / (x_max - x_min)
-        ax.plot(
-            voltage_curve[good],
-            current_curve[good],
-            color=cmap(frac),
-            alpha=0.9,
-            lw=1.2,
-        )
+            frac = 0.5 if x_max == x_min else (x[i] - x_min) / (x_max - x_min)
+            ax.plot(
+                voltage_curve[good],
+                current_curve[good],
+                color=cmap(frac),
+                alpha=0.9 if ramp_count == 1 else 0.55,
+                lw=1.2,
+            )
 
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=x_min, vmax=x_max))
     sm.set_array([])
@@ -1591,9 +1886,26 @@ def run_xline_analysis():
     )
     print(f"Current data reshaped to (x, shots, time): {isweep_full.shape}")
 
-    print("Extracting sweep regions")
-    vsweep = vsweep_full[..., sweep_start_index:sweep_end_index + 1]
-    isweep = isweep_full[..., sweep_start_index:sweep_end_index + 1]
+    print(f"Extracting {nramps} evenly spaced ramp(s)")
+    ramp_start_indices = (
+        sweep_start_index
+        + np.arange(nramps, dtype=np.int64) * ramp_start_spacing_samples
+    )
+    ramp_end_indices = ramp_start_indices + nt - 1
+    vsweep = extract_evenly_spaced_ramps(
+        vsweep_full,
+        sweep_start_index,
+        sweep_end_index,
+        nramps,
+        ramp_start_spacing_samples,
+    )
+    isweep = extract_evenly_spaced_ramps(
+        isweep_full,
+        sweep_start_index,
+        sweep_end_index,
+        nramps,
+        ramp_start_spacing_samples,
+    )
 
     if subtract_dc:
         if isweep_dc_offset_start_index is None or isweep_dc_offset_end_index is None:
@@ -1607,15 +1919,21 @@ def run_xline_analysis():
             < nt_full
         ):
             raise ValueError("the electronics-offset interval is outside the trace")
-        if not (
-            isweep_dc_offset_end_index < sweep_start_index
-            or isweep_dc_offset_start_index > sweep_end_index
-        ):
-            raise ValueError("the electronics-offset interval must not overlap the I-V sweep")
+        for ramp_start, ramp_end in zip(ramp_start_indices, ramp_end_indices):
+            if not (
+                isweep_dc_offset_end_index < ramp_start
+                or isweep_dc_offset_start_index > ramp_end
+            ):
+                raise ValueError(
+                    "the electronics-offset interval must not overlap any I-V ramp"
+                )
         print("Subtracting current DC offsets")
         isweep_dc_offset_portion = isweep_full[..., isweep_dc_offset_start_index:isweep_dc_offset_end_index + 1]
         isweep_dc_offsets = np.mean(isweep_dc_offset_portion, axis=-1)
-        isweep = isweep - isweep_dc_offsets[..., np.newaxis]
+        offset_shape = isweep_dc_offsets.shape + (1,) * (
+            isweep.ndim - isweep_dc_offsets.ndim
+        )
+        isweep = isweep - isweep_dc_offsets.reshape(offset_shape)
 
     file.close()
     print("Finished reading and reshaping data.")
@@ -1625,6 +1943,8 @@ def run_xline_analysis():
     # uses unsmoothed samples and performs averaging in voltage bins.
 
     time = np.arange(nt) * dt
+    ramp_start_time_s = ramp_start_indices * dt
+    ramp_center_time_s = (ramp_start_indices + 0.5 * (nt - 1)) * dt
 
     vsweep_shot = vsweep * u.V
     isweep_shot = isweep * u.A
@@ -1632,7 +1952,10 @@ def run_xline_analysis():
     isweep_mean = np.mean(isweep_shot, axis=1)
 
     isat = np.mean(isweep[..., isat_start_index:isat_end_index + 1], axis=-1)
-    isat_mean_values, isat_std_values, isat_count = shot_mean_and_std(isat)
+    isat_mean_values, isat_std_values, isat_count = shot_mean_and_std(
+        isat,
+        axis=1,
+    )
     isat_mean = isat_mean_values * u.A
     isat_std = isat_std_values * u.A
 
@@ -1658,7 +1981,14 @@ def run_xline_analysis():
     # Prepare output arrays
 
     spatial_shape = (nx,)
-    trace_shape = analysis_trace_shape(spatial_shape, nshots, shot_analysis_mode)
+    ramp_shape = (nramps,) if nramps > 1 else ()
+    profile_shape = spatial_shape + ramp_shape
+    trace_shape = analysis_trace_shape(
+        spatial_shape,
+        nshots,
+        shot_analysis_mode,
+        ramp_shape,
+    )
     n_traces = int(np.prod(trace_shape))
 
     te_shot = np.full(trace_shape, np.nan)
@@ -1692,13 +2022,14 @@ def run_xline_analysis():
     analysis_tasks = []
     for flat_index in range(n_traces):
         idx = np.unravel_index(flat_index, trace_shape)
-        ix, ishot = idx
+        ix, ishot = idx[:2]
         bias_values, current_values = prepare_trace_for_analysis(
             vsweep_shot.value,
             isweep_shot.value,
             idx,
             shot_analysis_mode,
             voltage_bin_width,
+            shot_axis=1,
         )
         include_diagnostic_data = (
             diagnostic_plot_every is not None
@@ -1739,7 +2070,8 @@ def run_xline_analysis():
                 completed += 1
                 result = future.result()
                 idx = result["idx"]
-                ix, ishot = idx
+                ix, ishot = idx[:2]
+                iramp = idx[2] if nramps > 1 else 0
                 print(f"Finished trace {result['flat_index'] + 1}/{n_traces} at index {idx} ({completed}/{n_traces} complete)")
 
                 for warning in result["warnings"]:
@@ -1796,16 +2128,22 @@ def run_xline_analysis():
                         if shot_analysis_mode == "average"
                         else f"shot{ishot:03d}"
                     )
+                    ramp_title = (
+                        ""
+                        if nramps == 1
+                        else f", ramp {iramp + 1} at {ramp_center_time_s[iramp]:.4g} s"
+                    )
+                    ramp_file = "" if nramps == 1 else f"_ramp{iramp + 1:03d}"
                     fig = render_analysis_iv_diagnostic_plot(
                         result,
-                        f"Diagnostic IV analysis at x index {ix}, {fit_label} "
+                        f"Diagnostic IV analysis at x index {ix}, {fit_label}{ramp_title} "
                         f"(x = {x[ix]:.2f} cm)",
                     )
                     save_diagnostic_figure(
                         fig,
                         diagnostic_plot_output_dir,
                         f"{Path(filename).stem}_iv_diagnostic_ix{ix:03d}_"
-                        f"{file_label}_x_{x[ix]:+.2f}cm",
+                        f"{file_label}{ramp_file}_x_{x[ix]:+.2f}cm",
                     )
                     plt.show(block=False)
                     plt.pause(example_pause_seconds)
@@ -1815,7 +2153,8 @@ def run_xline_analysis():
         for task in analysis_tasks:
             flat_index = task[0]
             idx = task[1]
-            ix, ishot = idx
+            ix, ishot = idx[:2]
+            iramp = idx[2] if nramps > 1 else 0
             print(f"Processing trace {flat_index + 1}/{n_traces} at index {idx}...")
             result = analyze_trace_worker(task)
 
@@ -1873,16 +2212,22 @@ def run_xline_analysis():
                     if shot_analysis_mode == "average"
                     else f"shot{ishot:03d}"
                 )
+                ramp_title = (
+                    ""
+                    if nramps == 1
+                    else f", ramp {iramp + 1} at {ramp_center_time_s[iramp]:.4g} s"
+                )
+                ramp_file = "" if nramps == 1 else f"_ramp{iramp + 1:03d}"
                 fig = render_analysis_iv_diagnostic_plot(
                     result,
-                    f"Diagnostic IV analysis at x index {ix}, {fit_label} "
+                    f"Diagnostic IV analysis at x index {ix}, {fit_label}{ramp_title} "
                     f"(x = {x[ix]:.2f} cm)",
                 )
                 save_diagnostic_figure(
                     fig,
                     diagnostic_plot_output_dir,
                     f"{Path(filename).stem}_iv_diagnostic_ix{ix:03d}_"
-                    f"{file_label}_x_{x[ix]:+.2f}cm",
+                    f"{file_label}{ramp_file}_x_{x[ix]:+.2f}cm",
                 )
                 plt.show(block=False)
                 plt.pause(example_pause_seconds)
@@ -1891,12 +2236,12 @@ def run_xline_analysis():
     # Compatibility export: this mask identifies locations with a reported Te fit.
     # Consult analysis_ok_shot to distinguish quality-accepted and rejected fits.
     statistics_fit_mask = np.isfinite(te_shot)
-    te_values, te_std_values, fit_count = shot_mean_and_std(te_shot)
-    vp_values, vp_std_values, _ = shot_mean_and_std(vp_shot)
-    vf_values, vf_std_values, _ = shot_mean_and_std(vf_shot)
-    ies_values, ies_std_values, _ = shot_mean_and_std(ies_shot)
-    iis_values, iis_std_values, _ = shot_mean_and_std(iis_shot)
-    n_e_values, n_e_std_values, _ = shot_mean_and_std(n_e_shot)
+    te_values, te_std_values, fit_count = shot_mean_and_std(te_shot, axis=1)
+    vp_values, vp_std_values, _ = shot_mean_and_std(vp_shot, axis=1)
+    vf_values, vf_std_values, _ = shot_mean_and_std(vf_shot, axis=1)
+    ies_values, ies_std_values, _ = shot_mean_and_std(ies_shot, axis=1)
+    iis_values, iis_std_values, _ = shot_mean_and_std(iis_shot, axis=1)
+    n_e_values, n_e_std_values, _ = shot_mean_and_std(n_e_shot, axis=1)
 
     te = te_values * u.eV
     vp = vp_values * u.V
@@ -1911,17 +2256,44 @@ def run_xline_analysis():
     iis_std = iis_std_values * u.A
     n_e_std = n_e_std_values * u.m**-3
 
-    te_fit_r2, te_fit_r2_std, te_fit_count = shot_mean_and_std(te_fit_r2_shot)
-    te_fit_rmse, te_fit_rmse_std, _ = shot_mean_and_std(te_fit_rmse_shot)
-    te_fit_npts, te_fit_npts_std, _ = shot_mean_and_std(te_fit_npts_shot)
-    te_fit_vstart, te_fit_vstart_std, _ = shot_mean_and_std(te_fit_vstart_shot)
-    te_fit_vstop, te_fit_vstop_std, _ = shot_mean_and_std(te_fit_vstop_shot)
-    te_fit_slope, te_fit_slope_std, _ = shot_mean_and_std(te_fit_slope_shot)
-    te_fit_intercept, te_fit_intercept_std, _ = shot_mean_and_std(te_fit_intercept_shot)
-    te_fit_i0, te_fit_i0_std, _ = shot_mean_and_std(te_fit_i0_shot)
-    te_fit_passed_r2 = np.any(te_fit_passed_r2_shot.astype(bool), axis=-1).astype(np.uint8)
-    te_fit_candidate_count = np.sum(te_fit_candidate_count_shot, axis=-1)
-    analysis_valid_count = np.sum(analysis_ok_shot, axis=-1)
+    te_fit_r2, te_fit_r2_std, te_fit_count = shot_mean_and_std(
+        te_fit_r2_shot,
+        axis=1,
+    )
+    te_fit_rmse, te_fit_rmse_std, _ = shot_mean_and_std(
+        te_fit_rmse_shot,
+        axis=1,
+    )
+    te_fit_npts, te_fit_npts_std, _ = shot_mean_and_std(
+        te_fit_npts_shot,
+        axis=1,
+    )
+    te_fit_vstart, te_fit_vstart_std, _ = shot_mean_and_std(
+        te_fit_vstart_shot,
+        axis=1,
+    )
+    te_fit_vstop, te_fit_vstop_std, _ = shot_mean_and_std(
+        te_fit_vstop_shot,
+        axis=1,
+    )
+    te_fit_slope, te_fit_slope_std, _ = shot_mean_and_std(
+        te_fit_slope_shot,
+        axis=1,
+    )
+    te_fit_intercept, te_fit_intercept_std, _ = shot_mean_and_std(
+        te_fit_intercept_shot,
+        axis=1,
+    )
+    te_fit_i0, te_fit_i0_std, _ = shot_mean_and_std(
+        te_fit_i0_shot,
+        axis=1,
+    )
+    te_fit_passed_r2 = np.any(
+        te_fit_passed_r2_shot.astype(bool),
+        axis=1,
+    ).astype(np.uint8)
+    te_fit_candidate_count = np.sum(te_fit_candidate_count_shot, axis=1)
+    analysis_valid_count = np.sum(analysis_ok_shot, axis=1)
     analysis_ok = (analysis_valid_count > 0).astype(np.uint8)
     accepted_trace_count = int(np.sum(analysis_ok_shot))
     reported_trace_count = int(np.count_nonzero(np.isfinite(te_shot)))
@@ -1942,21 +2314,25 @@ def run_xline_analysis():
     # Backward-compatible representative I-V products are visualization-only shot
     # means.  They are not used for physics, because individual sweep endpoints
     # need not coincide.  Full per-shot grids are exported separately below.
-    iv_voltage_grid = np.nanmean(iv_voltage_grid_shot, axis=-2)
-    iv_current_grid = np.nanmean(iv_current_grid_shot, axis=-2)
-    iv_didv_grid = np.nanmean(iv_didv_grid_shot, axis=-2)
-    iv_fit_mask_grid = np.any(iv_fit_mask_grid_shot.astype(bool), axis=-2).astype(np.uint8)
+    iv_voltage_grid = np.nanmean(iv_voltage_grid_shot, axis=1)
+    iv_current_grid = np.nanmean(iv_current_grid_shot, axis=1)
+    iv_didv_grid = np.nanmean(iv_didv_grid_shot, axis=1)
+    iv_fit_mask_grid = np.any(
+        iv_fit_mask_grid_shot.astype(bool),
+        axis=1,
+    ).astype(np.uint8)
 
     shot_statistics_available, shot_statistics_stage = shot_statistics_metadata(
         shot_analysis_mode,
         nshots,
     )
     if shot_analysis_mode == "average":
-        isat_std = np.full(spatial_shape, np.nan) * u.A
+        isat_std = np.full(profile_shape, np.nan) * u.A
         unavailable = unavailable_per_shot_fit_products(
             spatial_shape,
             nshots,
             iv_npts,
+            ramp_shape,
         )
         te_shot = unavailable["te_shot"]
         vp_shot = unavailable["vp_shot"]
@@ -1993,7 +2369,7 @@ def run_xline_analysis():
     # %%
     # Optional post-processing along x
 
-    post = apply_optional_x_postprocessing(
+    post = apply_optional_x_ramp_postprocessing(
         x_coord=x,
         te=te.value,
         vp=vp.value,
@@ -2036,32 +2412,36 @@ def run_xline_analysis():
     # Use the same raw or post-processed density profile displayed in the summary.
     shape_factor = None
     electron_density_normalized = None
+    density_scale = np.full(nramps, np.nan) if nramps > 1 else np.nan
     if calculate_shape_factor:
-        shape_factor = electron_density_profile_shape_factor(x, n_e_plot)
         (
+            shape_factor,
             electron_density_normalized,
             n_e_plot,
             density_scale,
-        ) = scale_density_profile_to_interferometer(
+        ) = scale_xline_density_ramps_to_interferometer(
+            x,
             n_e_plot,
             interferometer_scaling,
-            shape_factor,
         )
-        if np.isfinite(density_scale):
+        finite_density_scales = np.isfinite(density_scale)
+        if np.any(finite_density_scales):
             # Preserve consistency between the calibrated density and its
             # shot-to-shot uncertainty in the summary plot.
             n_e_std = n_e_std * density_scale
             print(
-                "Scaled normalized electron density to the interferometer "
-                f"line-integrated density; peak n_e = {np.nanmax(n_e_plot):.4g}."
+                "Scaled each valid normalized electron-density ramp to the "
+                "interferometer line-integrated density; "
+                f"peak n_e = {np.nanmax(n_e_plot):.4g}."
             )
-        else:
+        if not np.all(finite_density_scales):
             print(
-                "Warning: electron density could not be normalized and scaled "
-                "because its maximum, shape factor, or interferometer scaling "
-                "is not finite and positive."
+                "Warning: one or more electron-density ramps could not be "
+                "normalized and scaled because their maximum, shape factor, "
+                "or interferometer scaling is not finite and positive."
             )
-            n_e_std = np.full(n_e_std.shape, np.nan) * u.m**-3
+            if nramps == 1:
+                n_e_std = np.full(n_e_std.shape, np.nan) * u.m**-3
     # %%
     # Plot results
 
@@ -2070,8 +2450,33 @@ def run_xline_analysis():
     summary_plot_path = None
     all_iv_plot_path = None
 
-    if plot_results:
-        fig = render_xline_summary_plot(
+    def _render_configured_summary():
+        common_options = {
+            "te_std": te_std,
+            "vp_std": vp_std,
+            "vf_std": vf_std,
+            "ies_std": ies_std,
+            "iis_std": iis_std,
+            "n_e_std": n_e_std,
+            "plot_stds": plot_summary_stds and shot_statistics_available,
+            "analysis_ok": analysis_ok,
+            "analysis_status": analysis_status,
+            "shape_factor": shape_factor,
+        }
+        if nramps > 1:
+            return render_xline_multi_ramp_summary_plot(
+                x,
+                ramp_center_time_s,
+                te_plot,
+                vp_plot,
+                vf_plot,
+                ies_plot,
+                iis_plot,
+                n_e_plot,
+                display_mode=ramp_display_mode,
+                **common_options,
+            )
+        return render_xline_summary_plot(
             x,
             te_plot,
             vp_plot,
@@ -2079,21 +2484,15 @@ def run_xline_analysis():
             ies_plot,
             iis_plot,
             n_e_plot,
-            te_std=te_std,
-            vp_std=vp_std,
-            vf_std=vf_std,
-            ies_std=ies_std,
-            iis_std=iis_std,
-            n_e_std=n_e_std,
-            plot_stds=plot_summary_stds and shot_statistics_available,
             vp_spike_mask=vp_spike_mask,
             vp_raw=vp_raw,
             te_fit_r2=te_fit_r2,
             te_poor_fit_r2=te_min_r2,
-            analysis_ok=analysis_ok,
-            analysis_status=analysis_status,
-            shape_factor=shape_factor,
+            **common_options,
         )
+
+    if plot_results:
+        fig = _render_configured_summary()
 
         plot_buffer = io.BytesIO()
         fig.savefig(plot_buffer, format="png", dpi=600)
@@ -2137,6 +2536,11 @@ def run_xline_analysis():
 
             grp.create_dataset("x_cm", data=x)
             grp.create_dataset("time_s", data=time)
+            grp.create_dataset("ramp_index", data=np.arange(nramps, dtype=np.int64))
+            grp.create_dataset("ramp_start_index", data=ramp_start_indices)
+            grp.create_dataset("ramp_end_index", data=ramp_end_indices)
+            grp.create_dataset("ramp_start_time_s", data=ramp_start_time_s)
+            grp.create_dataset("ramp_center_time_s", data=ramp_center_time_s)
 
             # Primary exported profiles reflect current optional processing choices
             grp.create_dataset("te_eV", data=te_plot.value)
@@ -2182,17 +2586,17 @@ def run_xline_analysis():
             grp.create_dataset("te_raw_eV", data=te_raw.value)
             grp.create_dataset("vp_raw_V", data=vp_raw.value)
             grp.create_dataset("vf_raw_V", data=vf_raw.value)
-            grp.create_dataset("ies_raw_A", data=ies_raw.value if ies_raw is not None else np.full(spatial_shape, np.nan))
-            grp.create_dataset("iis_raw_A", data=iis_raw.value if iis_raw is not None else np.full(spatial_shape, np.nan))
-            grp.create_dataset("n_e_raw_m3", data=n_e_raw.value if n_e_raw is not None else np.full(spatial_shape, np.nan))
+            grp.create_dataset("ies_raw_A", data=ies_raw.value if ies_raw is not None else np.full(profile_shape, np.nan))
+            grp.create_dataset("iis_raw_A", data=iis_raw.value if iis_raw is not None else np.full(profile_shape, np.nan))
+            grp.create_dataset("n_e_raw_m3", data=n_e_raw.value if n_e_raw is not None else np.full(profile_shape, np.nan))
 
             # Post-processed profiles
             grp.create_dataset("te_processed_eV", data=te_processed.value)
             grp.create_dataset("vp_processed_V", data=vp_processed.value)
             grp.create_dataset("vf_processed_V", data=vf_processed.value)
-            grp.create_dataset("ies_processed_A", data=ies_processed.value if ies_processed is not None else np.full(spatial_shape, np.nan))
-            grp.create_dataset("iis_processed_A", data=iis_processed.value if iis_processed is not None else np.full(spatial_shape, np.nan))
-            grp.create_dataset("n_e_processed_m3", data=n_e_processed.value if n_e_processed is not None else np.full(spatial_shape, np.nan))
+            grp.create_dataset("ies_processed_A", data=ies_processed.value if ies_processed is not None else np.full(profile_shape, np.nan))
+            grp.create_dataset("iis_processed_A", data=iis_processed.value if iis_processed is not None else np.full(profile_shape, np.nan))
+            grp.create_dataset("n_e_processed_m3", data=n_e_processed.value if n_e_processed is not None else np.full(profile_shape, np.nan))
 
             # Spike diagnostics
             grp.create_dataset("vp_spike_mask", data=vp_spike_mask.astype(np.uint8))
@@ -2249,32 +2653,14 @@ def run_xline_analysis():
             if subtract_dc:
                 grp.create_dataset("isweep_dc_offsets_A", data=isweep_dc_offsets)
             grp.create_dataset("xline_shape_info", data=np.array([nx, nshots, nt_full, nt, iv_npts], dtype=np.int64))
+            grp.create_dataset(
+                "xline_ramp_shape_info",
+                data=np.array([nx, nshots, nramps, nt, iv_npts], dtype=np.int64),
+            )
             grp.create_dataset("trace_spatial_shape", data=np.array(spatial_shape, dtype=np.int64))
 
             if plot_results and plot_png_bytes is None:
-                fig = render_xline_summary_plot(
-                    x,
-                    te_plot,
-                    vp_plot,
-                    vf_plot,
-                    ies_plot,
-                    iis_plot,
-                    n_e_plot,
-                    te_std=te_std,
-                    vp_std=vp_std,
-                    vf_std=vf_std,
-                    ies_std=ies_std,
-                    iis_std=iis_std,
-                    n_e_std=n_e_std,
-                    plot_stds=plot_summary_stds and shot_statistics_available,
-                    vp_spike_mask=vp_spike_mask,
-                    vp_raw=vp_raw,
-                    te_fit_r2=te_fit_r2,
-                    te_poor_fit_r2=te_min_r2,
-                    analysis_ok=analysis_ok,
-                    analysis_status=analysis_status,
-                    shape_factor=shape_factor,
-                )
+                fig = _render_configured_summary()
                 plot_buffer = io.BytesIO()
                 fig.savefig(plot_buffer, format="png", dpi=600)
                 plot_png_bytes = plot_buffer.getvalue()
@@ -2309,6 +2695,7 @@ def run_xline_analysis():
             grp.attrs["n_acquired_traces"] = nx * nshots
             grp.attrs["trace_spatial_ndim"] = len(spatial_shape)
             grp.attrs["nshots"] = nshots
+            grp.attrs["nramps"] = nramps
             grp.attrs["shot_analysis_mode"] = shot_analysis_mode
             grp.attrs["nt_full"] = nt_full
             grp.attrs["nt_sweep"] = nt
@@ -2332,6 +2719,8 @@ def run_xline_analysis():
 
             grp.attrs["sweep_start_index"] = sweep_start_index
             grp.attrs["sweep_end_index"] = sweep_end_index
+            grp.attrs["ramp_start_spacing_samples"] = ramp_start_spacing_samples
+            grp.attrs["ramp_display_mode"] = ramp_display_mode
             grp.attrs["isat_start_index"] = isat_start_index
             grp.attrs["isat_end_index"] = isat_end_index
 
@@ -2375,6 +2764,7 @@ def run_xline_analysis():
             grp.attrs["shape_factor_m"] = (
                 np.nan if shape_factor is None else shape_factor.to_value(u.m)
             )
+            grp.attrs["density_scale"] = density_scale
             grp.attrs["interferometer_line_integrated_density_m2"] = (
                 interferometer_scaling.to_value(u.m**-2)
             )
@@ -2384,7 +2774,15 @@ def run_xline_analysis():
             grp.attrs["shot_statistics_available"] = int(
                 shot_statistics_available
             )
-            grp.attrs["per_shot_axis_order"] = "x,shot"
+            grp.attrs["per_shot_axis_order"] = (
+                "x,shot,ramp" if nramps > 1 else "x,shot"
+            )
+            grp.attrs["profile_axis_order"] = (
+                "x,ramp" if nramps > 1 else "x"
+            )
+            grp.attrs["ramp_time_reference"] = (
+                "seconds from acquired trace start; ramp center"
+            )
             grp.attrs["shot_statistics_stage"] = shot_statistics_stage
             grp.attrs["profile_value_policy"] = (
                 "finite estimates retained; analysis_ok records fit acceptance"
@@ -2425,6 +2823,14 @@ def run_xline_analysis():
             "X_cm": x,
             "Y_cm": xline_y,
             "time_s": time,
+            "ramp_index": np.arange(nramps, dtype=np.int64),
+            "ramp_start_index": ramp_start_indices,
+            "ramp_end_index": ramp_end_indices,
+            "ramp_start_time_s": ramp_start_time_s,
+            "ramp_center_time_s": ramp_center_time_s,
+            "nramps": np.array(nramps),
+            "ramp_start_spacing_samples": np.array(ramp_start_spacing_samples),
+            "ramp_display_mode": np.array(ramp_display_mode),
             "te_eV": te_plot.value,
             "vp_V": vp_plot.value,
             "vf_V": vf_plot.value,
@@ -2450,24 +2856,24 @@ def run_xline_analysis():
             "analysis_valid_count": analysis_valid_count,
             "analysis_ok_shot": analysis_ok_shot,
             "statistics_fit_mask": statistics_fit_mask.astype(np.uint8),
-            "n_e_m3": (n_e_plot.value if hasattr(n_e_plot, "value") else n_e_plot) if n_e_plot is not None else np.full_like(x, np.nan),
+            "n_e_m3": (n_e_plot.value if hasattr(n_e_plot, "value") else n_e_plot) if n_e_plot is not None else np.full(profile_shape, np.nan),
             "n_e_normalized": (
                 electron_density_normalized
                 if electron_density_normalized is not None
-                else np.full_like(x, np.nan, dtype=float)
+                else np.full(profile_shape, np.nan, dtype=float)
             ),
             "te_raw_eV": te_raw.value,
             "vp_raw_V": vp_raw.value,
             "vf_raw_V": vf_raw.value,
-            "ies_raw_A": ies_raw.value if ies_raw is not None else np.full(spatial_shape, np.nan),
-            "iis_raw_A": iis_raw.value if iis_raw is not None else np.full(spatial_shape, np.nan),
-            "n_e_raw_m3": n_e_raw.value if n_e_raw is not None else np.full(spatial_shape, np.nan),
+            "ies_raw_A": ies_raw.value if ies_raw is not None else np.full(profile_shape, np.nan),
+            "iis_raw_A": iis_raw.value if iis_raw is not None else np.full(profile_shape, np.nan),
+            "n_e_raw_m3": n_e_raw.value if n_e_raw is not None else np.full(profile_shape, np.nan),
             "te_processed_eV": te_processed.value,
             "vp_processed_V": vp_processed.value,
             "vf_processed_V": vf_processed.value,
-            "ies_processed_A": ies_processed.value if ies_processed is not None else np.full(spatial_shape, np.nan),
-            "iis_processed_A": iis_processed.value if iis_processed is not None else np.full(spatial_shape, np.nan),
-            "n_e_processed_m3": n_e_processed.value if n_e_processed is not None else np.full(spatial_shape, np.nan),
+            "ies_processed_A": ies_processed.value if ies_processed is not None else np.full(profile_shape, np.nan),
+            "iis_processed_A": iis_processed.value if iis_processed is not None else np.full(profile_shape, np.nan),
+            "n_e_processed_m3": n_e_processed.value if n_e_processed is not None else np.full(profile_shape, np.nan),
             "vp_spike_mask": vp_spike_mask.astype(np.uint8),
             "vsweep_mean_V": vsweep_mean.value,
             "isweep_mean_A": isweep_mean.value,
@@ -2514,12 +2920,24 @@ def run_xline_analysis():
             "te_fit_passed_r2_shot": te_fit_passed_r2_shot,
             "te_fit_candidate_count_shot": te_fit_candidate_count_shot,
             "shot_standard_deviation_ddof": np.array(1),
-            "per_shot_axis_order": np.array("x,shot"),
+            "per_shot_axis_order": np.array(
+                "x,shot,ramp" if nramps > 1 else "x,shot"
+            ),
+            "profile_axis_order": np.array(
+                "x,ramp" if nramps > 1 else "x"
+            ),
+            "ramp_time_reference": np.array(
+                "seconds from acquired trace start; ramp center"
+            ),
             "shot_statistics_stage": np.array(shot_statistics_stage),
             "profile_value_policy": np.array(
                 "finite estimates retained; analysis_ok records fit acceptance"
             ),
             "xline_shape_info": np.array([nx, nshots, nt_full, nt, iv_npts], dtype=np.int64),
+            "xline_ramp_shape_info": np.array(
+                [nx, nshots, nramps, nt, iv_npts],
+                dtype=np.int64,
+            ),
             "trace_spatial_shape": np.array(spatial_shape, dtype=np.int64),
             "dt_s": np.array(dt),
             "te_min_r2": np.array(te_min_r2),
@@ -2538,6 +2956,7 @@ def run_xline_analysis():
             "shape_factor_m": np.array(
                 np.nan if shape_factor is None else shape_factor.to_value(u.m)
             ),
+            "density_scale": np.asarray(density_scale),
             "interferometer_line_integrated_density_m2": np.array(
                 interferometer_scaling.to_value(u.m**-2)
             ),

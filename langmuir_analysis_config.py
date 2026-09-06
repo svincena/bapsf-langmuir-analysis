@@ -18,6 +18,7 @@ PARAMETER_FILE_VERSION = 1
 LAST_PARAMETERS_PATH = Path(__file__).with_name("last_parameters.json")
 SUPPORTED_GEOMETRIES = ("x_line", "xy_plane")
 SUPPORTED_SHOT_ANALYSIS_MODES = ("individual", "average")
+SUPPORTED_RAMP_DISPLAY_MODES = ("separate_profiles", "ramp_time_map")
 
 
 @dataclass(frozen=True)
@@ -363,68 +364,105 @@ def _sections_for_geometry(geometry):
         SectionSpec(
             "Sweep windows",
             "Indices are zero-based. Saturation indices are relative to the extracted sweep.",
-            (
-                _p(
-                    "sweep_start_index",
-                    "Sweep start",
-                    "int",
-                    sweep_start,
-                    "First full-trace sample included in the I–V sweep.",
-                    minimum=0,
-                    maximum=100_000_000,
-                ),
-                _p(
-                    "sweep_end_index",
-                    "Sweep end",
-                    "int",
-                    sweep_end,
-                    "Last full-trace sample included in the I–V sweep.",
-                    minimum=0,
-                    maximum=100_000_000,
-                ),
-                _p(
-                    "isat_start_index",
-                    "Isat window start",
-                    "int",
-                    0,
-                    "First extracted-sweep sample used for the auxiliary Isat mean.",
-                    minimum=0,
-                    maximum=100_000_000,
-                ),
-                _p(
-                    "isat_end_index",
-                    "Isat window end",
-                    "int",
-                    127,
-                    "Last extracted-sweep sample used for the auxiliary Isat mean.",
-                    minimum=0,
-                    maximum=100_000_000,
-                ),
-                _p(
-                    "subtract_dc",
-                    "Subtract electronics baseline",
-                    "bool",
-                    False,
-                    "Use only with an independently measured plasma-off electronics interval.",
-                ),
-                _p(
-                    "isweep_dc_offset_start_index",
-                    "Baseline start",
-                    "int",
-                    dc_start,
-                    "First full-trace sample in the independent electronics baseline.",
-                    minimum=0,
-                    maximum=100_000_000,
-                ),
-                _p(
-                    "isweep_dc_offset_end_index",
-                    "Baseline end",
-                    "int",
-                    dc_end,
-                    "Last full-trace sample in the independent electronics baseline.",
-                    minimum=0,
-                    maximum=100_000_000,
-                ),
+            tuple(
+                [
+                    _p(
+                        "sweep_start_index",
+                        "Sweep start",
+                        "int",
+                        sweep_start,
+                        "First full-trace sample included in the I–V sweep.",
+                        minimum=0,
+                        maximum=100_000_000,
+                    ),
+                    _p(
+                        "sweep_end_index",
+                        "Sweep end",
+                        "int",
+                        sweep_end,
+                        "Last full-trace sample included in the I–V sweep.",
+                        minimum=0,
+                        maximum=100_000_000,
+                    ),
+                ]
+                + (
+                    [
+                        _p(
+                            "nramps",
+                            "Number of ramps",
+                            "int",
+                            1,
+                            "Number of equal-length voltage ramps analyzed in each discharge.",
+                            minimum=1,
+                            maximum=100_000,
+                        ),
+                        _p(
+                            "ramp_start_spacing_samples",
+                            "Ramp start spacing",
+                            "int",
+                            sweep_end - sweep_start + 1,
+                            "Sample spacing between the starts of consecutive ramps.",
+                            unit="samples",
+                            minimum=1,
+                            maximum=100_000_000,
+                        ),
+                        _p(
+                            "ramp_display_mode",
+                            "Multiple-ramp display",
+                            "choice",
+                            "separate_profiles",
+                            "Show independent x profiles or an x-versus-ramp-time map.",
+                            choices=SUPPORTED_RAMP_DISPLAY_MODES,
+                        ),
+                    ]
+                    if is_xline
+                    else []
+                )
+                + [
+                    _p(
+                        "isat_start_index",
+                        "Isat window start",
+                        "int",
+                        0,
+                        "First extracted-sweep sample used for the auxiliary Isat mean.",
+                        minimum=0,
+                        maximum=100_000_000,
+                    ),
+                    _p(
+                        "isat_end_index",
+                        "Isat window end",
+                        "int",
+                        127,
+                        "Last extracted-sweep sample used for the auxiliary Isat mean.",
+                        minimum=0,
+                        maximum=100_000_000,
+                    ),
+                    _p(
+                        "subtract_dc",
+                        "Subtract electronics baseline",
+                        "bool",
+                        False,
+                        "Use only with an independently measured plasma-off electronics interval.",
+                    ),
+                    _p(
+                        "isweep_dc_offset_start_index",
+                        "Baseline start",
+                        "int",
+                        dc_start,
+                        "First full-trace sample in the independent electronics baseline.",
+                        minimum=0,
+                        maximum=100_000_000,
+                    ),
+                    _p(
+                        "isweep_dc_offset_end_index",
+                        "Baseline end",
+                        "int",
+                        dc_end,
+                        "Last full-trace sample in the independent electronics baseline.",
+                        minimum=0,
+                        maximum=100_000_000,
+                    ),
+                ]
             ),
         ),
         SectionSpec(
@@ -920,8 +958,27 @@ def validate_parameters(geometry, values, *, require_input_file=False):
         raise ValueError("Sweep start must be less than sweep end.")
     if normalized["sweep_end_index"] >= normalized["nt_full"]:
         raise ValueError("Sweep end must be smaller than samples per trace.")
-
     sweep_points = normalized["sweep_end_index"] - normalized["sweep_start_index"] + 1
+    if geometry == "x_line":
+        if (
+            normalized["nramps"] > 1
+            and normalized["ramp_start_spacing_samples"] < sweep_points
+        ):
+            raise ValueError(
+                "Ramp start spacing must be at least the extracted ramp length."
+            )
+        last_sweep_end = (
+            normalized["sweep_end_index"]
+            + (normalized["nramps"] - 1)
+            * normalized["ramp_start_spacing_samples"]
+        )
+    else:
+        last_sweep_end = normalized["sweep_end_index"]
+    if last_sweep_end >= normalized["nt_full"]:
+        raise ValueError(
+            "Every extracted ramp must end before samples per trace."
+        )
+
     if normalized["isat_start_index"] > normalized["isat_end_index"]:
         raise ValueError("Isat window start must not exceed its end.")
     if normalized["isat_end_index"] >= sweep_points:
@@ -938,11 +995,15 @@ def validate_parameters(geometry, values, *, require_input_file=False):
         dc_end = normalized["isweep_dc_offset_end_index"]
         if dc_start > dc_end or dc_end >= normalized["nt_full"]:
             raise ValueError("The electronics baseline must lie inside the full trace.")
-        if not (
-            dc_end < normalized["sweep_start_index"]
-            or dc_start > normalized["sweep_end_index"]
-        ):
-            raise ValueError("The electronics baseline must not overlap the I–V sweep.")
+        nramps = normalized.get("nramps", 1)
+        ramp_spacing = normalized.get("ramp_start_spacing_samples", sweep_points)
+        for ramp_index in range(nramps):
+            ramp_start = normalized["sweep_start_index"] + ramp_index * ramp_spacing
+            ramp_end = ramp_start + sweep_points - 1
+            if not (dc_end < ramp_start or dc_start > ramp_end):
+                raise ValueError(
+                    "The electronics baseline must not overlap any I–V ramp."
+                )
 
     return normalized
 

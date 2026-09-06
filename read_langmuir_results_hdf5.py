@@ -118,6 +118,7 @@ SUMMARY_HDF5_DATASETS = {
     "analysis_valid_count",
     "vp_spike_mask",
     "te_fit_r2",
+    "ramp_center_time_s",
 }
 
 

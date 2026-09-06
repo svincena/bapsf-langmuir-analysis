@@ -47,6 +47,15 @@ def test_gui_has_one_fully_populated_tab_per_geometry(
     xline_tab.set_values({"shot_analysis_mode": "average"})
     assert xline_tab.values()["shot_analysis_mode"] == "average"
     assert "Average shots" in xline_tab.editors["shot_analysis_mode"].currentText()
+    assert xline_tab.values()["nramps"] == 1
+    xline_tab.set_values(
+        {"nramps": 3, "ramp_display_mode": "ramp_time_map"}
+    )
+    assert xline_tab.values()["nramps"] == 3
+    assert "X vs ramp/time" in xline_tab.editors[
+        "ramp_display_mode"
+    ].currentText()
+    assert "nramps" not in window.parameter_tabs["xy_plane"].values()
     assert not xline_tab.editors["isweep_dc_offset_start_index"].isEnabled()
     xline_tab.editors["subtract_dc"].setChecked(True)
     assert xline_tab.editors["isweep_dc_offset_start_index"].isEnabled()

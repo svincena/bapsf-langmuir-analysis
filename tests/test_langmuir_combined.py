@@ -1,4 +1,5 @@
 import astropy.units as u
+import h5py
 import numpy as np
 import pytest
 
@@ -116,6 +117,243 @@ def test_averaged_mode_marks_per_shot_fit_products_unavailable():
     available, stage = analysis.shot_statistics_metadata("individual", 4)
     assert available
     assert "individual fits" in stage
+
+
+def test_repeated_ramps_preserve_shot_and_ramp_axes():
+    signal = np.arange(2 * 3 * 20).reshape(2, 3, 20)
+    extracted = analysis.extract_evenly_spaced_ramps(
+        signal,
+        sweep_start=2,
+        sweep_end=5,
+        ramp_count=3,
+        ramp_spacing=6,
+    )
+
+    assert extracted.shape == (2, 3, 3, 4)
+    assert np.array_equal(extracted[:, :, 0], signal[:, :, 2:6])
+    assert np.array_equal(extracted[:, :, 2], signal[:, :, 14:18])
+    assert analysis.analysis_trace_shape(
+        (2,),
+        3,
+        "individual",
+        (4,),
+    ) == (2, 3, 4)
+    assert analysis.analysis_trace_shape(
+        (2,),
+        3,
+        "average",
+        (4,),
+    ) == (2, 1, 4)
+    products = analysis.unavailable_per_shot_fit_products((2,), 3, 8, (4,))
+    assert products["te_shot"].shape == (2, 3, 4)
+    assert products["iv_current_grid_shot"].shape == (2, 3, 4, 8)
+
+
+def test_shot_averaging_keeps_repeated_ramps_independent():
+    voltage = np.array(
+        [
+            [
+                [[0.0, 1.0], [10.0, 11.0]],
+                [[0.1, 1.1], [10.1, 11.1]],
+            ]
+        ]
+    )
+    current = np.array(
+        [
+            [
+                [[0.0, 2.0], [20.0, 22.0]],
+                [[2.0, 4.0], [22.0, 24.0]],
+            ]
+        ]
+    )
+
+    averaged_voltage, averaged_current = analysis.prepare_trace_for_analysis(
+        voltage,
+        current,
+        (0, 0, 1),
+        "average",
+        0.5,
+        shot_axis=1,
+    )
+
+    assert np.allclose(averaged_voltage, [10.05, 11.05])
+    assert np.allclose(averaged_current, [21.0, 23.0])
+
+
+def test_xline_postprocessing_does_not_mix_ramps():
+    x = np.arange(5, dtype=float)
+    first = np.array([1.0, 1.0, 20.0, 1.0, 1.0])
+    second = np.array([100.0, 100.0, 100.0, 100.0, 100.0])
+    values = np.column_stack((first, second))
+
+    processed = analysis.apply_optional_x_ramp_postprocessing(
+        x,
+        values,
+        values,
+        values,
+        enable_vp_spike_rejection=True,
+        vp_spike_half_window=1,
+        vp_spike_threshold_V=5.0,
+        vp_replace_flagged_with_local_interp=True,
+        enable_neighbor_smoothing=False,
+    )
+
+    assert processed["vp_spike_mask"].shape == (5, 2)
+    assert processed["vp_spike_mask"][2, 0]
+    assert not np.any(processed["vp_spike_mask"][:, 1])
+    assert np.all(processed["vp_processed"][:, 1] == 100.0)
+
+
+def test_interferometer_calibrates_each_ramp_independently():
+    x = np.array([-10.0, 0.0, 10.0])
+    density = np.array(
+        [
+            [1.0, 1.0],
+            [2.0, 4.0],
+            [1.0, 1.0],
+        ]
+    ) * u.m**-3
+    line_density = 4.0e17 * u.m**-2
+
+    shape_factor, normalized, scaled, scale = (
+        analysis.scale_xline_density_ramps_to_interferometer(
+            x,
+            density,
+            line_density,
+        )
+    )
+
+    assert shape_factor.shape == (2,)
+    assert normalized.shape == (3, 2)
+    assert scaled.shape == (3, 2)
+    assert scale.shape == (2,)
+    assert np.allclose(np.nanmax(normalized, axis=0), 1.0)
+    assert scale[0] != pytest.approx(scale[1])
+
+
+@pytest.mark.parametrize("display_mode", ["separate_profiles", "ramp_time_map"])
+def test_multi_ramp_xline_summary_rendering(display_mode):
+    import matplotlib.pyplot as plt
+
+    x = np.array([-1.0, 0.0, 1.0])
+    values = np.arange(6, dtype=float).reshape(3, 2) + 1.0
+    figure = analysis.render_xline_multi_ramp_summary_plot(
+        x,
+        np.array([0.01, 0.02]),
+        values * u.eV,
+        values * u.V,
+        values * u.V,
+        values * u.A,
+        values * u.A,
+        values * u.m**-3,
+        display_mode=display_mode,
+        te_std=np.ones_like(values) * u.eV,
+        analysis_ok=np.ones_like(values, dtype=np.uint8),
+        shape_factor=np.array([0.1, 0.2]) * u.m,
+    )
+
+    figure.canvas.draw()
+    assert len(figure.axes) >= 6
+    plt.close(figure)
+
+
+@pytest.mark.parametrize(
+    ("shot_mode", "expected_analysis_traces"),
+    (("individual", 12), ("average", 4)),
+)
+def test_xline_pipeline_exports_repeated_ramp_shapes(
+    monkeypatch,
+    tmp_path,
+    shot_mode,
+    expected_analysis_traces,
+):
+    source_path = tmp_path / f"multi_ramp_{shot_mode}.hdf5"
+    with h5py.File(source_path, "w"):
+        pass
+
+    values = default_parameters("x_line")
+    values.update(
+        filename=str(source_path),
+        nx=2,
+        nshots=3,
+        nt_full=30,
+        sweep_start_index=2,
+        sweep_end_index=5,
+        nramps=2,
+        ramp_start_spacing_samples=10,
+        isat_start_index=0,
+        isat_end_index=1,
+        sg_smooth_bins=3,
+        sg_smooth_order=1,
+        iv_npts=8,
+        shot_analysis_mode=shot_mode,
+        calculate_shape_factor=False,
+        enable_vp_spike_rejection=False,
+        enable_neighbor_smoothing=False,
+        parallel_analysis=False,
+        diagnostic_plot_every=0,
+        make_all_iv_diagnostic_plot=False,
+        plot_results=False,
+        save_results=True,
+    )
+
+    class FakeLapdFile:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(analysis.lapd, "File", lambda *_args, **_kwargs: FakeLapdFile())
+
+    def fake_read_channel(**kwargs):
+        shape = (kwargs["nx"], kwargs["nshots"], kwargs["nt_full"])
+        signal = np.arange(np.prod(shape), dtype=float).reshape(shape)
+        return signal, 1.0e-6
+
+    monkeypatch.setattr(analysis, "read_channel_xline", fake_read_channel)
+
+    def fake_analyze(task):
+        flat_index, idx, *_rest = task
+        grid = np.linspace(-2.0, 2.0, values["iv_npts"])
+        return {
+            "flat_index": flat_index,
+            "idx": idx,
+            "warnings": [],
+            "ok": True,
+            "te_eV": 2.0 + idx[-1],
+            "vp_V": 1.0,
+            "vf_V": -1.0,
+            "ies_A": 0.02,
+            "iis_A": 0.01,
+            "n_e_m3": 1.0e17,
+            "te_fit_r2": 0.999,
+            "te_fit_rmse": 0.01,
+            "te_fit_npts": 8,
+            "te_fit_vstart": -1.0,
+            "te_fit_vstop": 1.0,
+            "te_fit_slope": 0.5,
+            "te_fit_intercept": -2.0,
+            "te_fit_i0": 0.0,
+            "te_fit_passed_r2": True,
+            "te_fit_candidate_count": 1,
+            "iv_voltage_grid": grid,
+            "iv_current_grid": grid * 0.01,
+            "iv_didv_grid": np.full(grid.shape, 0.01),
+            "iv_fit_mask": np.ones(grid.shape, dtype=np.uint8),
+            "diagnostic_data": None,
+        }
+
+    monkeypatch.setattr(analysis, "analyze_trace_worker", fake_analyze)
+    analysis.run_analysis("x_line", values)
+
+    with h5py.File(source_path, "r") as h5_file:
+        group = h5_file["langmuir_xline"]
+        assert group["te_eV"].shape == (2, 2)
+        assert group["te_shot_eV"].shape == (2, 3, 2)
+        assert group["iv_voltage_grid_V"].shape == (2, 2, 8)
+        assert group["vsweep_mean_V"].shape == (2, 2, 4)
+        assert group["ramp_center_time_s"].shape == (2,)
+        assert group.attrs["per_shot_axis_order"] == "x,shot,ramp"
+        assert group.attrs["profile_axis_order"] == "x,ramp"
+        assert group.attrs["n_analysis_traces"] == expected_analysis_traces
 
 
 def test_select_xline_from_xy_map_uses_nearest_y_coordinate():

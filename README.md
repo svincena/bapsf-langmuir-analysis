@@ -26,11 +26,11 @@ titled cards for:
 - interferometer calibration; and
 - execution, plots, diagnostics, and result output.
 
-The experiment path has a native file picker, numerical values use bounded
-editors with units, boolean controls are explicit, and invalid cross-field
-combinations are rejected before a run starts. Analysis runs in a separate
-process, leaving the interface responsive while its output appears in the live
-console. **Stop analysis** terminates that worker if necessary.
+The experiment path has a native file picker, numerical values use direct
+numeric entry fields with units, boolean controls are explicit, and invalid
+cross-field combinations are rejected before a run starts. Analysis runs in a
+separate process, leaving the interface responsive while its output appears in
+the live console. **Stop analysis** terminates that worker if necessary.
 
 Both tabs are saved automatically in `last_parameters.json`, along with the
 last active tab. The file is local run state and is intentionally ignored by
@@ -44,10 +44,12 @@ starting a run, or **Restore this tab's defaults** to reset one geometry.
 The program performs the full dataset workflow:
 
 1. Reads voltage and current channels from a LAPD HDF5 file using `bapsflib`.
-2. Reshapes the shots as `(x, shot, time)` or `(y, x, shot, time)`.
+2. Reshapes the shots as `(x, shot, time)` or `(y, x, shot, time)`. An x-line
+   run can then extract multiple equal-length, evenly spaced ramps as
+   `(x, shot, ramp, ramp_time)`.
 3. Applies the configured electrical scaling, polarity, baseline treatment,
    and time-domain smoothing.
-4. Analyzes every shot independently through
+4. Analyzes every shot and ramp independently through
    [`langmuir_analysis_core.py`](langmuir_analysis_core.py). Independent traces
    can be distributed across worker processes.
 5. Calculates shot statistics and applies geometry-specific spatial cleanup:
@@ -125,6 +127,20 @@ between sweeps. In averaged mode, fit-derived shot standard deviations and
 per-shot fit products are stored as unavailable (`NaN`); the result metadata
 records `shot_analysis_mode` and `shot_statistics_available`.
 
+For an x-line discharge containing repeated sweeps, **Sweep start** and
+**Sweep end** define the first ramp. **Number of ramps** enables repeated-ramp
+analysis, and **Ramp start spacing** gives the start-to-start separation in
+samples. Ramps must not overlap and every ramp must fit within the acquired
+trace. Each ramp is fitted and spatially post-processed independently. With
+per-shot fitting, fit products have shape `(nx, nshots, nramps)`; averaging
+shots before fitting produces `(nx, nramps)`. A single-ramp run retains the
+legacy shapes without a singleton ramp axis.
+
+The **Multiple-ramp display** control selects either distinct ramp profiles or
+six x-versus-ramp-center-time maps. The display choice does not combine ramps
+or change their fitted values. Interferometer density calibration is also
+calculated independently for every ramp.
+
 The solver records fit quality, uncertainties, model-consistency notes, and
 rejection reasons. Finite estimates may be retained for diagnosis even when a
 trace fails the full acceptance policy; use `analysis_ok` and the related
@@ -151,7 +167,9 @@ Both storage formats record the result geometry. Primary quantities include
 `te_eV`, `vp_V`, `vf_V`, `ies_A`, `iis_A`, and `n_e_m3`. The files also contain
 raw and processed spatial results, shot statistics, fit-quality fields,
 interpolated I–V products, calibration settings, and optional embedded plot
-images.
+images. Multi-ramp x-line files additionally record ramp indices, start and
+center times, start spacing, display mode, and the `x,shot,ramp` axis-order
+metadata.
 
 ## Reading HDF5 results
 

@@ -209,10 +209,14 @@ def electron_density_profile_shape_factor_m(x_cm, electron_density_profile):
 
 def _shape_factor_m(data):
     if "shape_factor_m" in data:
-        value = float(np.asarray(data["shape_factor_m"]))
-        if np.isfinite(value):
-            return value
+        stored = np.asarray(data["shape_factor_m"], dtype=float)
+        if stored.shape == ():
+            value = float(stored)
+            if np.isfinite(value):
+                return value
     if get_langmuir_result_geometry(data) == "x_line":
+        if np.asarray(data["n_e_m3"]).ndim != 1:
+            return np.nan
         return electron_density_profile_shape_factor_m(
             data["x_cm"],
             data["n_e_m3"],
@@ -300,6 +304,9 @@ def print_summary(data):
 def plot_xline_summary(data):
     """Make the six-panel profile summary for x-line results."""
     import matplotlib.pyplot as plt
+
+    if np.asarray(data["te_eV"]).ndim == 2:
+        return plot_xline_multi_ramp_summary(data)
 
     x = np.asarray(data["x_cm"], dtype=float)
     panels = [
@@ -436,6 +443,89 @@ def plot_xline_summary(data):
 
     source_file = _scalar_text(data.get("source_file", "")).strip()
     title = Path(source_file).name if source_file else "Langmuir X-Line NPZ Results"
+    fig.suptitle(title)
+    return fig
+
+
+def plot_xline_multi_ramp_summary(data):
+    """Plot stored multi-ramp x-line profiles or x/ramp-time maps."""
+    import matplotlib.pyplot as plt
+
+    x = np.asarray(data["x_cm"], dtype=float)
+    nramps = np.asarray(data["te_eV"]).shape[1]
+    ramp_times = np.asarray(
+        data.get("ramp_center_time_s", np.arange(nramps)),
+        dtype=float,
+    )
+    display_mode = _scalar_text(
+        data.get("ramp_display_mode", "separate_profiles")
+    )
+    panels = [
+        ((0, 0), "te_eV", "te_std_eV", "Electron Temperature", "T_e (eV)"),
+        ((0, 1), "vp_V", "vp_std_V", "Plasma Potential", "V_p (V)"),
+        ((1, 0), "vf_V", "vf_std_V", "Floating Potential", "V_f (V)"),
+        ((1, 1), "ies_A", "ies_std_A", "Electron Saturation Current", "I_es (A)"),
+        ((2, 0), "iis_A", "iis_std_A", "Ion Saturation Current", "I_is (A)"),
+        ((2, 1), "n_e_m3", "n_e_std_m3", "Electron Density", "n_e (m^-3)"),
+    ]
+    fig, axes = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
+    colors = plt.get_cmap("viridis")(np.linspace(0.05, 0.95, nramps))
+    for (row, column), key, std_key, title, value_label in panels:
+        axis = axes[row, column]
+        if key not in data:
+            axis.axis("off")
+            continue
+        values = np.asarray(data[key], dtype=float)
+        if display_mode == "ramp_time_map":
+            image = axis.pcolormesh(
+                x,
+                ramp_times,
+                values.T,
+                shading="auto",
+            )
+            fig.colorbar(image, ax=axis, label=value_label)
+            axis.set_ylabel("Ramp center time (s)")
+        else:
+            std = (
+                np.asarray(data[std_key], dtype=float)
+                if std_key in data
+                else None
+            )
+            for ramp_index, color in enumerate(colors):
+                finite = np.isfinite(x) & np.isfinite(values[:, ramp_index])
+                if not np.any(finite):
+                    continue
+                axis.plot(
+                    x[finite],
+                    values[finite, ramp_index],
+                    color=color,
+                    label=(
+                        f"ramp {ramp_index + 1}, "
+                        f"t={ramp_times[ramp_index]:.4g} s"
+                    ),
+                )
+                if std is not None:
+                    finite_std = finite & np.isfinite(std[:, ramp_index])
+                    if np.any(finite_std):
+                        axis.errorbar(
+                            x[finite_std],
+                            values[finite_std, ramp_index],
+                            yerr=std[finite_std, ramp_index],
+                            fmt="none",
+                            ecolor=color,
+                            alpha=0.55,
+                            capsize=2,
+                        )
+            axis.set_ylabel(value_label)
+            handles, _ = axis.get_legend_handles_labels()
+            if handles:
+                axis.legend(fontsize="small")
+        axis.set_title(title)
+        axis.set_xlabel("X (cm)")
+        axis.grid(True)
+
+    source_file = _scalar_text(data.get("source_file", "")).strip()
+    title = Path(source_file).name if source_file else "Langmuir X-Line Results"
     fig.suptitle(title)
     return fig
 

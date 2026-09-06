@@ -29,6 +29,8 @@ CHOICE_LABELS = {
     "at_vp": "At plasma potential (ion-subtracted)",
     "individual": "Fit each shot separately",
     "average": "Average shots before fitting",
+    "separate_profiles": "Separate ramp profiles",
+    "ramp_time_map": "X vs ramp/time map",
 }
 
 
