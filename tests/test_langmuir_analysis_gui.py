@@ -150,6 +150,84 @@ def test_sis_configuration_picker_reads_immediate_digitizer_groups(
     window.close()
 
 
+def test_sis_metadata_reconciles_single_configuration_and_trace_length(
+    application, monkeypatch, tmp_path
+):
+    import h5py
+    import numpy as np
+
+    hdf5_path = tmp_path / "experiment.hdf5"
+    with h5py.File(hdf5_path, "w") as h5_file:
+        digitizer_group = h5_file.create_group(
+            "Raw data + config"
+        ).create_group("SIS crate")
+        digitizer_group.create_group("Only config")
+        digitizer_group.create_dataset(
+            "Only config [Slot 2: SIS 3302 ch 3]",
+            data=np.zeros((7, 128)),
+        )
+        digitizer_group.create_dataset(
+            "Only config [Slot 2: SIS 3302 ch 3] headers",
+            data=np.zeros(7),
+        )
+
+    assert gui.discover_sis_sample_count(
+        hdf5_path, "SIS crate", "Only config"
+    ) == 128
+
+    monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", tmp_path / "parameters.json")
+    window = LangmuirAnalysisWindow()
+    tab = window.parameter_tabs["x_line"]
+    tab.set_values(
+        {
+            "filename": str(hdf5_path),
+            "digitizer": "SIS crate",
+            "sis_config_name": "Stale config",
+            "nt_full": 256,
+        }
+    )
+
+    adjustments = tab.reconcile_sis_acquisition_metadata()
+
+    assert tab.values()["sis_config_name"] == "Only config"
+    assert tab.values()["nt_full"] == 128
+    assert adjustments == (
+        'SIS configuration: "Stale config" → "Only config"',
+        "Samples per trace: 256 → 128 (from HDF5)",
+    )
+    window.close()
+
+
+def test_sis_metadata_requires_choice_when_multiple_configurations_exist(
+    application, monkeypatch, tmp_path
+):
+    import h5py
+
+    hdf5_path = tmp_path / "experiment.hdf5"
+    with h5py.File(hdf5_path, "w") as h5_file:
+        digitizer_group = h5_file.create_group(
+            "Raw data + config"
+        ).create_group("SIS crate")
+        digitizer_group.create_group("Config A")
+        digitizer_group.create_group("Config B")
+
+    monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", tmp_path / "parameters.json")
+    window = LangmuirAnalysisWindow()
+    tab = window.parameter_tabs["x_line"]
+    tab.set_values(
+        {
+            "filename": str(hdf5_path),
+            "digitizer": "SIS crate",
+            "sis_config_name": "Stale config",
+        }
+    )
+
+    with pytest.raises(ValueError, match="Choose one of.*Config A.*Config B"):
+        tab.reconcile_sis_acquisition_metadata()
+
+    window.close()
+
+
 def test_splash_composes_required_title_trace_and_branding(application):
     assert gui.SPLASH_DURATION_MS == 2_000
     assert gui.SPLASH_TITLE == "LAPD Langmuir Analysis Studio"

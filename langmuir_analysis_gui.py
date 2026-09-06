@@ -581,6 +581,64 @@ def discover_sis_configurations(filename, digitizer):
         raise ValueError(f"Could not open HDF5 file {filename}: {error}") from error
 
 
+def discover_sis_sample_count(filename, digitizer, config_name):
+    """Return the common trace length for a digitizer configuration."""
+    filename = Path(filename).expanduser()
+    digitizer = str(digitizer).strip()
+    config_name = str(config_name).strip()
+    if not filename.is_file():
+        raise ValueError(f"Experiment HDF5 file does not exist: {filename}")
+    if not digitizer:
+        raise ValueError("Digitizer group cannot be empty.")
+    if not config_name:
+        raise ValueError("SIS configuration cannot be empty.")
+
+    # SIS channel datasets are siblings of the configuration group and have
+    # names such as "<configuration> [Slot 2: SIS 3302 ch 3]".
+    import h5py
+
+    digitizer_path = f"/Raw data + config/{digitizer}"
+    try:
+        with h5py.File(filename, "r") as h5_file:
+            if digitizer_path not in h5_file:
+                raise ValueError(f'HDF5 group "{digitizer_path}" was not found.')
+            group = h5_file[digitizer_path]
+            if not isinstance(group, h5py.Group):
+                raise ValueError(f'HDF5 object "{digitizer_path}" is not a group.')
+            if config_name not in group or not isinstance(
+                group[config_name], h5py.Group
+            ):
+                raise ValueError(
+                    f'SIS configuration "{config_name}" was not found in '
+                    f'"{digitizer_path}".'
+                )
+
+            dataset_prefix = f"{config_name} ["
+            sample_counts = {
+                int(item.shape[-1])
+                for name, item in group.items()
+                if name.startswith(dataset_prefix)
+                and isinstance(item, h5py.Dataset)
+                and item.ndim >= 2
+            }
+            if not sample_counts:
+                raise ValueError(
+                    f'No SIS channel datasets were found for configuration '
+                    f'"{config_name}".'
+                )
+            if len(sample_counts) != 1:
+                formatted_counts = ", ".join(
+                    str(count) for count in sorted(sample_counts)
+                )
+                raise ValueError(
+                    f'SIS channel datasets for configuration "{config_name}" '
+                    f"have inconsistent trace lengths: {formatted_counts}."
+                )
+            return sample_counts.pop()
+    except OSError as error:
+        raise ValueError(f"Could not open HDF5 file {filename}: {error}") from error
+
+
 class PathEditor(QtWidgets.QWidget):
     """Line editor with a native file or directory picker."""
 
@@ -963,6 +1021,46 @@ class ParameterTab(QtWidgets.QWidget):
             for key in ("filename", "digitizer")
         )
 
+    def reconcile_sis_acquisition_metadata(self):
+        """Synchronize unambiguous SIS metadata with the selected HDF5 file."""
+        filename, digitizer = self._sis_source_values()
+        config_editor = self.editors["sis_config_name"]
+        config_name = config_editor.value()
+        candidates = discover_sis_configurations(filename, digitizer)
+        if not candidates:
+            raise ValueError(
+                f'No SIS configurations were found under "{digitizer}" in '
+                f"{Path(filename).expanduser()}."
+            )
+
+        adjustments = []
+        if config_name not in candidates:
+            if len(candidates) != 1:
+                valid_names = ", ".join(repr(name) for name in candidates)
+                raise ValueError(
+                    f'SIS configuration "{config_name}" is not present in the '
+                    f"selected HDF5 file. Choose one of: {valid_names}."
+                )
+            selected_name = candidates[0]
+            config_editor.set_value(selected_name)
+            adjustments.append(
+                f'SIS configuration: "{config_name}" → "{selected_name}"'
+            )
+            config_name = selected_name
+
+        sample_count = discover_sis_sample_count(
+            filename, digitizer, config_name
+        )
+        nt_editor = self.editors["nt_full"]
+        configured_sample_count = _editor_value(nt_editor, self.specs["nt_full"])
+        if configured_sample_count != sample_count:
+            nt_editor.set_value(sample_count)
+            adjustments.append(
+                "Samples per trace: "
+                f"{configured_sample_count} → {sample_count} (from HDF5)"
+            )
+        return tuple(adjustments)
+
     def _wire_dependencies(self):
         """Dim controls that have no effect while their feature is disabled."""
         dependencies = {
@@ -1164,10 +1262,12 @@ class LangmuirAnalysisWindow(QtWidgets.QMainWindow):
         # Geometry always comes from the open tab, including after keyboard or
         # programmatic tab changes.
         active_geometry = self._active_geometry()
+        tab = self.parameter_tabs[active_geometry]
         try:
+            metadata_adjustments = tab.reconcile_sis_acquisition_metadata()
             validate_parameters(
                 active_geometry,
-                self.parameter_tabs[active_geometry].values(),
+                tab.values(),
                 require_input_file=True,
             )
             save_last_parameters(
@@ -1183,6 +1283,8 @@ class LangmuirAnalysisWindow(QtWidgets.QMainWindow):
             f"Starting {GEOMETRY_TITLES[active_geometry]} analysis…\n"
             f"Parameters: {LAST_PARAMETERS_PATH}"
         )
+        for adjustment in metadata_adjustments:
+            self._append_console(f"Adjusted {adjustment}")
         process = QtCore.QProcess(self)
         process.setWorkingDirectory(str(Path(__file__).resolve().parent))
         process.setProcessChannelMode(QtCore.QProcess.MergedChannels)
