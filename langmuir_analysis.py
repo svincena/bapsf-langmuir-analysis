@@ -856,16 +856,18 @@ def prepare_trace_for_analysis(
     shot_axis=-1,
 ):
     """Select one shot or form one voltage-binned mean across all shots."""
-    voltage_by_shot = np.asarray(voltage_by_shot, dtype=float)
-    current_by_shot = np.asarray(current_by_shot, dtype=float)
+    # bapsflib supplies float32 arrays. Select a trace before converting: a
+    # full-scan float64 copy per task would stay alive through the returned view.
+    voltage_by_shot = np.asarray(voltage_by_shot)
+    current_by_shot = np.asarray(current_by_shot)
     if voltage_by_shot.shape != current_by_shot.shape:
         raise ValueError("Voltage and current shot arrays must have the same shape.")
 
     fit_index = tuple(fit_index)
     if mode == "individual":
         return (
-            voltage_by_shot[fit_index + (slice(None),)],
-            current_by_shot[fit_index + (slice(None),)],
+            np.asarray(voltage_by_shot[fit_index + (slice(None),)], dtype=float),
+            np.asarray(current_by_shot[fit_index + (slice(None),)], dtype=float),
         )
     if mode != "average":
         raise ValueError(f"Unknown shot analysis mode {mode!r}.")

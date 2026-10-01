@@ -146,6 +146,32 @@ def test_prepare_trace_for_analysis_selects_one_individual_shot():
     assert np.array_equal(selected_current, current[0, 1])
 
 
+@pytest.mark.parametrize("spatial_shape", [(3,), (2, 3)])
+@pytest.mark.parametrize("ramp_shape", [(), (2,)])
+def test_float32_individual_tasks_retain_only_the_selected_trace(
+    spatial_shape, ramp_shape
+):
+    shape = spatial_shape + (2,) + ramp_shape + (16,)
+    voltage = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    current = 2.0 * voltage - 1.0
+    tasks = []
+    for index in np.ndindex(shape[:-1]):
+        selected = analysis.prepare_trace_for_analysis(
+            voltage, current, index, "individual", 0.25
+        )
+        tasks.append(selected)
+        for trace, source in zip(selected, (voltage, current)):
+            assert np.array_equal(trace, source[index])
+            assert trace.dtype == np.dtype(float)
+            # A small view into a freshly converted full scan retains the whole
+            # allocation for every queued task, exhausting memory on XY scans.
+            assert trace.flags.owndata
+
+    assert sum(trace.nbytes for task in tasks for trace in task) == (
+        2 * voltage.size * np.dtype(float).itemsize
+    )
+
+
 def test_prepare_trace_for_analysis_averages_shots_in_voltage_bins():
     voltage = np.array([[[0.0, 1.0, 2.0], [0.1, 1.1, 2.1]]])
     current = np.array([[[0.0, 2.0, 4.0], [2.0, 4.0, 6.0]]])
