@@ -123,6 +123,54 @@ def test_numeric_fields_use_direct_inputs_except_worker_processes(
     window.close()
 
 
+def test_sis_channel_data_types_are_shown_beside_channel_inputs(
+    application, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", tmp_path / "parameters.json")
+    metadata_calls = []
+
+    def channel_data_types(filename, **kwargs):
+        kwargs["channels"] = tuple(kwargs["channels"])
+        metadata_calls.append((filename, kwargs))
+        return {3: "Langmuir bias", 2: "Langmuir current"}
+
+    monkeypatch.setattr(gui, "read_sis_channel_data_types", channel_data_types)
+    window = LangmuirAnalysisWindow()
+    tab = window.parameter_tabs["x_line"]
+    tab.set_values(
+        {
+            "filename": "/data/experiment.hdf5",
+            "digitizer": "SIS crate",
+            "adc": "SIS 3302",
+            "sis_config_name": "Langmuir",
+            "board": 2,
+            "vsweep_channel": 3,
+            "isweep_channel": 2,
+        }
+    )
+
+    assert tab.channel_data_type_labels["vsweep_channel"].text() == (
+        "Data type: Langmuir bias"
+    )
+    assert tab.channel_data_type_labels["isweep_channel"].text() == (
+        "Data type: Langmuir current"
+    )
+    assert metadata_calls[-1] == (
+        "/data/experiment.hdf5",
+        {
+            "digitizer": "SIS crate",
+            "adc": "SIS 3302",
+            "config_name": "Langmuir",
+            "board": 2,
+            "channels": (3, 2),
+        },
+    )
+
+    tab.set_values({"digitizer": "LeCroy scope"})
+    assert all(label.isHidden() for label in tab.channel_data_type_labels.values())
+    window.close()
+
+
 def test_sis_configuration_picker_reads_immediate_digitizer_groups(
     application, monkeypatch, tmp_path
 ):

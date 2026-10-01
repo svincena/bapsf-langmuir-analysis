@@ -3,7 +3,10 @@ import numpy as np
 import pytest
 
 from bapsflib import lapd
-from langmuir_analysis_metadata import read_digitizer_temporal_metadata
+from langmuir_analysis_metadata import (
+    read_digitizer_temporal_metadata,
+    read_sis_channel_data_types,
+)
 
 
 def _read_metadata(path):
@@ -49,6 +52,89 @@ def test_reads_common_trace_length_and_sample_interval(monkeypatch, tmp_path):
         request[2]["config_name"] == "Langmuir"
         for request in requested_channels
     )
+
+
+@pytest.mark.parametrize(
+    ("adc", "board", "slot", "attributes", "channels", "expected"),
+    (
+        (
+            "SIS 3302",
+            2,
+            7,
+            {"Data type 2": np.bytes_("Probe current"), "Data type 3": "Bias"},
+            (3, 2),
+            {3: "Bias", 2: "Probe current"},
+        ),
+        (
+            "SIS 3305",
+            1,
+            13,
+            {
+                "FPGA 1 Data type 4": np.bytes_("Fast voltage"),
+                "FPGA 2 Data type 1": np.bytes_("Fast current"),
+            },
+            (4, 5),
+            {4: "Fast voltage", 5: "Fast current"},
+        ),
+    ),
+)
+def test_reads_sis_channel_data_type_labels(
+    monkeypatch,
+    tmp_path,
+    adc,
+    board,
+    slot,
+    attributes,
+    channels,
+    expected,
+):
+    import h5py
+
+    hdf5_path = tmp_path / "experiment.hdf5"
+    config_path = "/Raw data + config/SIS crate/Langmuir"
+    with h5py.File(hdf5_path, "w") as h5_file:
+        config_group = h5_file.create_group(config_path)
+        config_group.attrs["SIS crate slot numbers"] = np.array([slot])
+        config_group.attrs["SIS crate config indices"] = np.array([6])
+        adc_group = config_group.create_group(
+            f"SIS crate {adc.removeprefix('SIS ')} configurations[6]"
+        )
+        for name, value in attributes.items():
+            adc_group.attrs[name] = value
+
+    class FakeDigitizerMap:
+        configs = {"Langmuir": {"config group path": config_path}}
+
+        @staticmethod
+        def get_slot(requested_board, requested_adc):
+            assert (requested_board, requested_adc) == (board, adc)
+            return slot
+
+    class FakeFile:
+        def __init__(self, filename):
+            self.handle = h5py.File(filename, "r")
+            self.digitizers = {"SIS crate": FakeDigitizerMap()}
+
+        def __getitem__(self, key):
+            return self.handle[key]
+
+        def close(self):
+            self.handle.close()
+
+    monkeypatch.setattr(
+        lapd,
+        "File",
+        lambda filename, **_kwargs: FakeFile(filename),
+    )
+
+    assert read_sis_channel_data_types(
+        hdf5_path,
+        digitizer="SIS crate",
+        adc=adc,
+        config_name="Langmuir",
+        board=board,
+        channels=channels,
+    ) == expected
 
 
 @pytest.mark.parametrize(

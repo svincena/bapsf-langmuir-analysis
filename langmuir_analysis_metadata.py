@@ -6,6 +6,123 @@ import math
 from pathlib import Path
 
 
+def _decode_hdf5_text(value):
+    """Return one HDF5 scalar string as ordinary display text."""
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return str(value).strip("\x00 ")
+
+
+def _sis_data_type_attribute(adc, channel):
+    """Return the SIS configuration attribute for one physical channel."""
+    adc = str(adc).strip()
+    channel = int(channel)
+    if adc == "SIS 3302":
+        return f"Data type {channel}"
+    if adc == "SIS 3305":
+        fpga = 1 if channel <= 4 else 2
+        fpga_channel = channel if fpga == 1 else channel - 4
+        return f"FPGA {fpga} Data type {fpga_channel}"
+    raise ValueError(
+        f'SIS crate data-type labels are unavailable for ADC "{adc}".'
+    )
+
+
+def read_sis_channel_data_types(
+    filename,
+    *,
+    digitizer,
+    adc,
+    config_name,
+    board,
+    channels,
+):
+    """Return the configured ``Data type`` text for SIS crate channels."""
+    filename = Path(filename).expanduser()
+    if not filename.is_file():
+        raise ValueError(f"Experiment HDF5 file does not exist: {filename}")
+
+    digitizer = str(digitizer).strip()
+    adc = str(adc).strip()
+    config_name = str(config_name).strip()
+    board = int(board)
+    channels = tuple(int(channel) for channel in channels)
+
+    file_obj = None
+    try:
+        # bapsflib supplies the authoritative relationship between an SIS
+        # board number and its physical crate slot. The per-channel Data type
+        # strings themselves are retained only in the raw configuration group.
+        from bapsflib import lapd
+
+        file_obj = lapd.File(filename, silent=True)
+        if digitizer not in file_obj.digitizers:
+            raise ValueError(
+                f'Digitizer "{digitizer}" is not mapped in {filename}.'
+            )
+        digitizer_map = file_obj.digitizers[digitizer]
+        if config_name not in digitizer_map.configs:
+            raise ValueError(
+                f'SIS configuration "{config_name}" is not mapped in {filename}.'
+            )
+
+        slot = digitizer_map.get_slot(board, adc)
+        if slot is None:
+            raise ValueError(
+                f'Board {board} is not available for ADC "{adc}".'
+            )
+
+        config = digitizer_map.configs[config_name]
+        config_group = file_obj[config["config group path"]]
+        slots = tuple(config_group.attrs["SIS crate slot numbers"])
+        indices = tuple(config_group.attrs["SIS crate config indices"])
+        if len(slots) != len(indices):
+            raise ValueError(
+                "SIS crate slot and configuration-index metadata have "
+                "different lengths."
+            )
+        matching_indices = [
+            int(index)
+            for candidate_slot, index in zip(slots, indices, strict=True)
+            if int(candidate_slot) == int(slot)
+        ]
+        if len(matching_indices) != 1:
+            raise ValueError(
+                f"SIS crate slot {slot} does not identify exactly one configuration."
+            )
+
+        adc_number = adc.removeprefix("SIS ")
+        adc_group_name = (
+            f"SIS crate {adc_number} configurations[{matching_indices[0]}]"
+        )
+        if adc_group_name not in config_group:
+            raise ValueError(
+                f'SIS ADC configuration group "{adc_group_name}" was not found.'
+            )
+        adc_group = config_group[adc_group_name]
+
+        data_types = {}
+        for channel in channels:
+            attribute = _sis_data_type_attribute(adc, channel)
+            if attribute not in adc_group.attrs:
+                raise ValueError(
+                    f'SIS channel {channel} has no "Data type" metadata.'
+                )
+            data_types[channel] = _decode_hdf5_text(adc_group.attrs[attribute])
+        return data_types
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError(
+            f"Could not read SIS channel data types from {filename}: {error}"
+        ) from error
+    finally:
+        if file_obj is not None:
+            file_obj.close()
+
+
 def _validated_trace_length(specs, role):
     """Return a positive integer trace length from digitizer specifications."""
     nt_value = specs.get("nt")

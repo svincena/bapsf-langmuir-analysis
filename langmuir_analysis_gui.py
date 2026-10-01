@@ -23,7 +23,10 @@ from langmuir_analysis_config import (
     save_last_parameters,
     validate_parameters,
 )
-from langmuir_analysis_metadata import read_digitizer_temporal_metadata
+from langmuir_analysis_metadata import (
+    read_digitizer_temporal_metadata,
+    read_sis_channel_data_types,
+)
 
 
 GEOMETRY_TITLES = {
@@ -549,6 +552,7 @@ QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #34485c; min-height: 30px; border-radius: 5px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QToolTip { color: #eaf3fa; background: #152333; border: 1px solid #3a526a; padding: 5px; }
+QLabel#fieldMetadata { color: #7f9caf; font-size: 11px; }
 """
 
 
@@ -1222,6 +1226,7 @@ class ParameterTab(QtWidgets.QWidget):
         self.editors = {}
         self.specs = {}
         self.section_cards = {}
+        self.channel_data_type_labels = {}
         self._setting_values = False
 
         root_layout = QtWidgets.QVBoxLayout(self)
@@ -1319,7 +1324,25 @@ class ParameterTab(QtWidgets.QWidget):
             )
             self.editors[spec.key] = editor
             self.specs[spec.key] = spec
-            form.addRow(label, editor)
+            field_widget = editor
+            if spec.key in {"vsweep_channel", "isweep_channel"}:
+                field_widget = QtWidgets.QWidget()
+                field_layout = QtWidgets.QHBoxLayout(field_widget)
+                field_layout.setContentsMargins(0, 0, 0, 0)
+                field_layout.setSpacing(9)
+                field_layout.addWidget(editor, 1)
+                data_type_label = QtWidgets.QLabel("Data type: unavailable")
+                data_type_label.setObjectName("fieldMetadata")
+                data_type_label.setTextInteractionFlags(
+                    QtCore.Qt.TextSelectableByMouse
+                )
+                data_type_label.setToolTip(
+                    "Channel description stored in the selected SIS crate "
+                    "configuration."
+                )
+                field_layout.addWidget(data_type_label, 2)
+                self.channel_data_type_labels[spec.key] = data_type_label
+            form.addRow(label, field_widget)
         card_layout.addLayout(form)
         return card
 
@@ -1333,6 +1356,45 @@ class ParameterTab(QtWidgets.QWidget):
     def _source_filename(self):
         """Return the experiment filename currently displayed by this tab."""
         return _editor_value(self.editors["filename"], self.specs["filename"])
+
+    def _refresh_channel_data_types(self, *_args):
+        """Show SIS configuration descriptions beside both channel inputs."""
+        digitizer = _editor_value(
+            self.editors["digitizer"], self.specs["digitizer"]
+        )
+        is_sis_crate = str(digitizer).strip().casefold() == "sis crate"
+        for label in self.channel_data_type_labels.values():
+            label.setVisible(is_sis_crate)
+            label.setText("Data type: unavailable")
+        if not is_sis_crate:
+            return
+
+        try:
+            channels_by_key = {
+                key: _editor_value(self.editors[key], self.specs[key])
+                for key in ("vsweep_channel", "isweep_channel")
+            }
+            data_types = read_sis_channel_data_types(
+                self._source_filename(),
+                digitizer=digitizer,
+                adc=_editor_value(self.editors["adc"], self.specs["adc"]),
+                config_name=self.editors["sis_config_name"].value(),
+                board=_editor_value(self.editors["board"], self.specs["board"]),
+                channels=channels_by_key.values(),
+            )
+        except ValueError as error:
+            for label in self.channel_data_type_labels.values():
+                label.setToolTip(str(error))
+            return
+
+        for key, channel in channels_by_key.items():
+            data_type = data_types.get(channel) or "not specified"
+            label = self.channel_data_type_labels[key]
+            label.setText(f"Data type: {data_type}")
+            label.setToolTip(
+                f'SIS channel {channel} is described as "{data_type}" '
+                "in the selected configuration."
+            )
 
     def _temporal_source_is_hdf5(self):
         return self.editors["temporal_metadata_source"].currentData() == "hdf5"
@@ -1590,15 +1652,25 @@ class ParameterTab(QtWidgets.QWidget):
         sis_editor.configuration_selected.connect(
             lambda _name: self._refresh_temporal_metadata(show_errors=True)
         )
+        sis_editor.configuration_selected.connect(
+            self._refresh_channel_data_types
+        )
         sis_editor.line_edit.editingFinished.connect(
             lambda: self._refresh_temporal_metadata(show_errors=True)
+        )
+        sis_editor.line_edit.editingFinished.connect(
+            self._refresh_channel_data_types
         )
         filename_editor.line_edit.editingFinished.connect(
             self._refresh_temporal_metadata
         )
+        filename_editor.line_edit.editingFinished.connect(
+            self._refresh_channel_data_types
+        )
         filename_editor.path_selected.connect(
             lambda _path: self._refresh_temporal_metadata()
         )
+        filename_editor.path_selected.connect(self._refresh_channel_data_types)
         for key in (
             "digitizer",
             "adc",
@@ -1609,8 +1681,12 @@ class ParameterTab(QtWidgets.QWidget):
             self.editors[key].editingFinished.connect(
                 self._refresh_temporal_metadata
             )
+            self.editors[key].editingFinished.connect(
+                self._refresh_channel_data_types
+            )
         self._update_geometry_source_controls()
         self._update_temporal_source_controls(refresh=False)
+        self._refresh_channel_data_types()
 
     def values(self):
         return {
@@ -1628,6 +1704,7 @@ class ParameterTab(QtWidgets.QWidget):
             self._setting_values = False
         self._update_geometry_source_controls()
         self._update_temporal_source_controls()
+        self._refresh_channel_data_types()
 
     def restore_defaults(self):
         self.set_values(default_parameters(self.geometry))
