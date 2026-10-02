@@ -17,10 +17,14 @@ from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 from langmuir_analysis_config import (
     LAST_PARAMETERS_PATH,
     PARAMETER_SECTIONS,
+    SUPPORTED_TIMING_UNITS,
     SUPPORTED_GEOMETRIES,
+    SWEEP_TIMING_FIELDS,
+    TIMING_UNIT_SECONDS,
     default_parameters,
     load_last_parameters,
     save_last_parameters,
+    time_to_sample,
     validate_parameters,
 )
 from langmuir_analysis_metadata import (
@@ -1051,23 +1055,27 @@ class DirectNumericInput(QtWidgets.QLineEdit):
         self.minimum = minimum
         self.maximum = maximum
         self.decimals = int(decimals)
+        self.set_numeric_kind(numeric_kind)
+        self.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.set_value(value)
+
+    def set_numeric_kind(self, numeric_kind):
+        self.numeric_kind = numeric_kind
         locale = QtCore.QLocale.c()
         locale.setNumberOptions(QtCore.QLocale.RejectGroupSeparator)
 
         if numeric_kind == "int":
-            validator = QtGui.QIntValidator(int(minimum), int(maximum), self)
+            validator = QtGui.QIntValidator(int(self.minimum), int(self.maximum), self)
         else:
             validator = QtGui.QDoubleValidator(
-                float(minimum),
-                float(maximum),
+                float(self.minimum),
+                float(self.maximum),
                 self.decimals,
                 self,
             )
             validator.setNotation(QtGui.QDoubleValidator.ScientificNotation)
         validator.setLocale(locale)
         self.setValidator(validator)
-        self.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        self.set_value(value)
 
     def value(self):
         text = self.text().strip()
@@ -1085,6 +1093,130 @@ class DirectNumericInput(QtWidgets.QLineEdit):
         else:
             text = format(float(value), ".15g")
         self.setText(text)
+
+
+class SweepTimingEditor(QtWidgets.QWidget):
+    """Direct numeric timing entry with persisted units and sample feedback."""
+
+    def __init__(self, spec, sample_interval, parent=None):
+        super().__init__(parent)
+        self.spec = spec
+        self.sample_interval = sample_interval
+        self._unit = "samples"
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        row = QtWidgets.QHBoxLayout()
+        self.number = DirectNumericInput(
+            spec.default,
+            numeric_kind="int",
+            minimum=spec.minimum,
+            maximum=spec.maximum,
+            decimals=12,
+        )
+        self.units = QtWidgets.QComboBox()
+        labels = {"samples": "Samples", "microseconds": "µs", "milliseconds": "ms"}
+        for unit in SUPPORTED_TIMING_UNITS:
+            self.units.addItem(labels[unit], unit)
+        row.addWidget(self.number, 1)
+        row.addWidget(self.units)
+        layout.addLayout(row)
+        self.equivalent = QtWidgets.QLabel()
+        self.equivalent.setObjectName("fieldMetadata")
+        self.equivalent.setWordWrap(True)
+        layout.addWidget(self.equivalent)
+        self.number.textChanged.connect(self.refresh_equivalent)
+        self.units.currentIndexChanged.connect(self._change_unit)
+
+    def value(self):
+        value = self.number.value()
+        if self._unit == "samples":
+            return value
+        return time_to_sample(
+            value * TIMING_UNIT_SECONDS[self._unit], self.sample_interval()
+        )
+
+    def input_parameters(self):
+        unit_key, time_key = SWEEP_TIMING_FIELDS[self.spec.key]
+        return {
+            unit_key: self._unit,
+            time_key: (
+                self.number.value() * TIMING_UNIT_SECONDS[self._unit]
+                if self._unit != "samples"
+                else 0.0
+            ),
+        }
+
+    def _set_unit(self, unit):
+        self._unit = unit
+        self.number.minimum = self.spec.minimum if unit == "samples" else 0
+        self.number.maximum = self.spec.maximum if unit == "samples" else 1e18
+        self.number.set_numeric_kind("int" if unit == "samples" else "float")
+        with QtCore.QSignalBlocker(self.units):
+            self.units.setCurrentIndex(self.units.findData(unit))
+
+    def _change_unit(self, *_args):
+        unit = self.units.currentData()
+        try:
+            dt = self.sample_interval()
+            time_s = (
+                self.number.value() * dt
+                if self._unit == "samples"
+                else self.number.value() * TIMING_UNIT_SECONDS[self._unit]
+            )
+        except ValueError as error:
+            with QtCore.QSignalBlocker(self.units):
+                self.units.setCurrentIndex(self.units.findData(self._unit))
+            self.equivalent.setText(str(error))
+            return
+        self._set_unit(unit)
+        self.number.set_value(
+            time_to_sample(time_s, dt)
+            if unit == "samples"
+            else time_s / TIMING_UNIT_SECONDS[unit]
+        )
+        self.refresh_equivalent()
+
+    def set_value(self, value):
+        self.number.set_value(
+            value
+            if self._unit == "samples"
+            else value * self.sample_interval() / TIMING_UNIT_SECONDS[self._unit]
+        )
+        self.refresh_equivalent()
+
+    def set_parameters(self, values):
+        unit_key, time_key = SWEEP_TIMING_FIELDS[self.spec.key]
+        unit = values.get(unit_key, self._unit)
+        if unit not in SUPPORTED_TIMING_UNITS:
+            raise ValueError(f"Unsupported timing unit {unit!r}.")
+        if unit == "samples":
+            value = values[self.spec.key] if self.spec.key in values else self.value()
+        else:
+            time_s = values.get(time_key)
+            if time_s is None:
+                if self.spec.key in values:
+                    time_s = values[self.spec.key] * self.sample_interval()
+                elif self._unit == "samples":
+                    time_s = self.number.value() * self.sample_interval()
+                else:
+                    time_s = self.number.value() * TIMING_UNIT_SECONDS[self._unit]
+            value = time_s / TIMING_UNIT_SECONDS[unit]
+        self._set_unit(unit)
+        self.number.set_value(value)
+        self.refresh_equivalent()
+
+    def refresh_equivalent(self, *_args):
+        try:
+            dt = self.sample_interval()
+            samples = self.value()
+            if self._unit == "samples":
+                text = f"{samples * dt * 1e6:.12g} µs ({samples * dt * 1e3:.12g} ms)"
+            else:
+                text = f"Nearest sample: {samples} ({samples * dt * 1e6:.12g} µs)"
+            self.equivalent.setText(text)
+        except ValueError as error:
+            self.equivalent.setText(str(error))
 
 
 class IntegerPairEditor(QtWidgets.QWidget):
@@ -1126,8 +1258,11 @@ def _make_editor(
     *,
     sis_source_values=None,
     bmotion_source_filename=None,
+    sample_interval=None,
 ):
-    if spec.key == "sis_config_name":
+    if spec.key in SWEEP_TIMING_FIELDS:
+        editor = SweepTimingEditor(spec, sample_interval)
+    elif spec.key == "sis_config_name":
         editor = SisConfigurationEditor(spec.default, sis_source_values)
     elif spec.key == "bmotion_config_name":
         editor = BMotionConfigurationEditor(
@@ -1181,6 +1316,7 @@ def _editor_value(editor, spec):
             SisConfigurationEditor,
             BMotionConfigurationEditor,
             IntegerPairEditor,
+            SweepTimingEditor,
         ),
     ):
         return editor.value()
@@ -1204,6 +1340,7 @@ def _set_editor_value(editor, spec, value):
             BMotionConfigurationEditor,
             IntegerPairEditor,
             DirectNumericInput,
+            SweepTimingEditor,
         ),
     ):
         editor.set_value(value)
@@ -1305,6 +1442,8 @@ class ParameterTab(QtWidgets.QWidget):
         form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
         form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         for spec in section.parameters:
+            if spec.hidden:
+                continue
             label_text = spec.label + (f"  [{spec.unit}]" if spec.unit else "")
             label = QtWidgets.QLabel(label_text)
             label.setObjectName("fieldLabel")
@@ -1321,6 +1460,7 @@ class ParameterTab(QtWidgets.QWidget):
                     if spec.key == "bmotion_config_name"
                     else None
                 ),
+                sample_interval=lambda: self.editors["dt_s"].value(),
             )
             self.editors[spec.key] = editor
             self.specs[spec.key] = spec
@@ -1645,6 +1785,7 @@ class ParameterTab(QtWidgets.QWidget):
             lambda _path: self._refresh_bmotion_geometry()
         )
         temporal_source = self.editors["temporal_metadata_source"]
+        self.editors["dt_s"].textChanged.connect(self._refresh_sweep_timing)
         temporal_source.currentIndexChanged.connect(
             self._update_temporal_source_controls
         )
@@ -1687,19 +1828,30 @@ class ParameterTab(QtWidgets.QWidget):
         self._update_geometry_source_controls()
         self._update_temporal_source_controls(refresh=False)
         self._refresh_channel_data_types()
+        self._refresh_sweep_timing()
+
+    def _refresh_sweep_timing(self, *_args):
+        for key in SWEEP_TIMING_FIELDS:
+            self.editors[key].refresh_equivalent()
 
     def values(self):
-        return {
+        values = {
             key: _editor_value(self.editors[key], spec)
             for key, spec in self.specs.items()
         }
+        for key in SWEEP_TIMING_FIELDS:
+            values.update(self.editors[key].input_parameters())
+        return values
 
     def set_values(self, values):
         self._setting_values = True
         try:
             for key, value in values.items():
-                if key in self.editors:
+                if key in self.editors and key not in SWEEP_TIMING_FIELDS:
                     _set_editor_value(self.editors[key], self.specs[key], value)
+            for key, companion_keys in SWEEP_TIMING_FIELDS.items():
+                if any(item in values for item in (key, *companion_keys)):
+                    self.editors[key].set_parameters(values)
         finally:
             self._setting_values = False
         self._update_geometry_source_controls()

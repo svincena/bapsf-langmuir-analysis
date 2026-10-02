@@ -5,11 +5,60 @@ import pytest
 from langmuir_analysis_config import (
     PARAMETER_SECTIONS,
     SUPPORTED_GEOMETRIES,
+    SWEEP_TIMING_FIELDS,
     default_parameters,
     load_last_parameters,
     save_last_parameters,
+    time_to_sample,
     validate_parameters,
 )
+
+
+@pytest.mark.parametrize("dt_s", [20e-9, 40e-9, 320e-9])
+def test_time_to_sample_rounds_to_nearest_sample_with_half_up(dt_s):
+    assert time_to_sample(0, dt_s) == 0
+    assert time_to_sample(12.49 * dt_s, dt_s) == 12
+    assert time_to_sample(12.5 * dt_s, dt_s) == 13
+    assert time_to_sample(13 * dt_s, dt_s) == 13
+
+
+@pytest.mark.parametrize("geometry", SUPPORTED_GEOMETRIES)
+def test_time_entries_persist_and_resolve_against_updated_sampling(geometry, tmp_path):
+    parameters = {item: default_parameters(item) for item in SUPPORTED_GEOMETRIES}
+    values = parameters[geometry]
+    values.update(dt_s=20e-9, nramps=2)
+    for key, time_s in zip(SWEEP_TIMING_FIELDS, (100e-6, 300e-6, 400e-6)):
+        unit_key, time_key = SWEEP_TIMING_FIELDS[key]
+        values.update({unit_key: "microseconds", time_key: time_s})
+    path = tmp_path / "parameters.json"
+    saved = save_last_parameters(parameters, geometry, path)
+    loaded, active, warning = load_last_parameters(path)
+    assert warning is None
+    assert active == geometry
+    assert loaded == saved
+    assert [loaded[geometry][key] for key in SWEEP_TIMING_FIELDS] == [
+        5000,
+        15000,
+        20000,
+    ]
+    loaded[geometry]["dt_s"] = 40e-9
+    resolved = validate_parameters(geometry, loaded[geometry])
+    assert [resolved[key] for key in SWEEP_TIMING_FIELDS] == [2500, 7500, 10000]
+    assert resolved["sweep_start_time_s"] == 100e-6
+
+
+def test_time_entry_validation_checks_resolved_ramp_bounds():
+    values = default_parameters("x_line")
+    values.update(sweep_end_input_unit="milliseconds", sweep_end_time_s=1.0)
+    with pytest.raises(ValueError, match="Sweep end"):
+        validate_parameters("x_line", values)
+    values.update(
+        sweep_end_time_s=300e-6,
+        ramp_start_spacing_input_unit="microseconds",
+        ramp_start_spacing_time_s=20e-9 * 0.1,
+    )
+    with pytest.raises(ValueError, match="Ramp start spacing"):
+        validate_parameters("x_line", values)
 
 
 @pytest.mark.parametrize("geometry", SUPPORTED_GEOMETRIES)

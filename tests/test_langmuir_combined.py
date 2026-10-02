@@ -53,6 +53,42 @@ def test_run_analysis_refreshes_hdf5_temporal_metadata(monkeypatch):
     assert observed == [(20_000, 2e-8)]
 
 
+def test_worker_resolves_time_entries_after_rereading_selected_channel_timing(
+    monkeypatch,
+):
+    values = default_parameters("x_line")
+    values.update(
+        dt_s=20e-9,
+        sweep_start_input_unit="microseconds",
+        sweep_start_time_s=100e-6,
+        sweep_end_input_unit="milliseconds",
+        sweep_end_time_s=300e-6,
+        ramp_start_spacing_input_unit="microseconds",
+        ramp_start_spacing_time_s=400e-6,
+        nramps=2,
+    )
+    monkeypatch.setattr(
+        analysis,
+        "read_digitizer_temporal_metadata",
+        lambda *_args, **_kwargs: {"nt_full": 30_000, "dt_s": 40e-9},
+    )
+    observed = []
+    monkeypatch.setattr(
+        analysis,
+        "run_xline_analysis",
+        lambda: observed.append(
+            (
+                analysis.sweep_start_index,
+                analysis.sweep_end_index,
+                analysis.ramp_start_spacing_samples,
+                analysis.nt,
+            )
+        ),
+    )
+    analysis.run_analysis("x_line", values)
+    assert observed == [(2500, 7500, 10000, 5001)]
+
+
 def test_sample_interval_selection_honors_manual_mode_and_checks_hdf5_mode():
     assert analysis.resolve_sample_interval(2e-6, "manual", 1e-6, 1e-6) == 2e-6
     assert analysis.resolve_sample_interval(1e-6, "hdf5", 1e-6, 1e-6) == 1e-6

@@ -53,6 +53,16 @@ when it is evenly spaced, because the analysis uses one scalar `dt`. Manual
 mode leaves both fields editable and uses the entered sample interval even when
 the file reports a different value.
 
+**Sweep start**, **Sweep end**, and **Ramp start spacing** each accept samples,
+microseconds (µs), or milliseconds (ms). Sweep times are measured from the
+beginning of the full digitizer trace; the sweep end is inclusive. Time entries
+use the selected channels' sample interval in HDF5 timing mode, or the entered
+interval in manual mode, and round to the nearest sample (halfway values round
+up). Each field shows its equivalent timing or rounded sample count. The GUI
+saves the chosen units and entered times, so a channel timing change preserves
+the entered time and recomputes the sample index. The worker refreshes HDF5
+timing before resolving these entries and checking ramp bounds.
+
 Both tabs are saved automatically in `last_parameters.json`, along with the
 last active tab. The file is local run state and is intentionally ignored by
 Git. If it is absent, all controls use the documented defaults in

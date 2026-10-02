@@ -22,6 +22,15 @@ SUPPORTED_TEMPORAL_METADATA_SOURCES = ("manual", "hdf5")
 SUPPORTED_XY_Y_ACQUISITION_ORDERS = ("descending", "ascending")
 SUPPORTED_SHOT_ANALYSIS_MODES = ("individual", "average")
 SUPPORTED_RAMP_DISPLAY_MODES = ("separate_profiles", "ramp_time_map")
+TIMING_UNIT_SECONDS = {"microseconds": 1e-6, "milliseconds": 1e-3}
+SUPPORTED_TIMING_UNITS = ("samples", *TIMING_UNIT_SECONDS)
+SWEEP_TIMING_FIELDS = {
+    "sweep_start_index": ("sweep_start_input_unit", "sweep_start_time_s"),
+    "sweep_end_index": ("sweep_end_input_unit", "sweep_end_time_s"),
+    "ramp_start_spacing_samples": (
+        "ramp_start_spacing_input_unit", "ramp_start_spacing_time_s"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -37,6 +46,7 @@ class ParameterSpec:
     decimals: int = 3
     step: float = 1.0
     choices: tuple[str, ...] = ()
+    hidden: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,6 +70,7 @@ def _p(
     decimals=3,
     step=1.0,
     choices=(),
+    hidden=False,
 ):
     return ParameterSpec(
         key=key,
@@ -73,6 +84,56 @@ def _p(
         decimals=decimals,
         step=step,
         choices=tuple(choices),
+        hidden=hidden,
+    )
+
+
+def time_to_sample(time_s, dt_s):
+    """Round trace-relative time to the nearest sample, with ties upward."""
+    time_s, dt_s = float(time_s), float(dt_s)
+    if not math.isfinite(time_s) or time_s < 0:
+        raise ValueError("Sweep time must be finite and nonnegative.")
+    if not math.isfinite(dt_s) or dt_s <= 0:
+        raise ValueError("Sample interval must be finite and positive.")
+    samples = time_s / dt_s
+    if not math.isfinite(samples):
+        raise ValueError("Sweep time exceeds the supported sample range.")
+    # A decimal time divided by dt can land just below a half-sample due to
+    # floating-point representation. Stabilize only this rounding boundary.
+    return math.floor(samples + 0.5 + 4 * math.ulp(samples))
+
+
+def _timing_parameters(key, label, default, description, minimum):
+    unit_key, time_key = SWEEP_TIMING_FIELDS[key]
+    return (
+        _p(
+            key,
+            label,
+            "int",
+            default,
+            description,
+            minimum=minimum,
+            maximum=100_000_000,
+        ),
+        _p(
+            unit_key,
+            f"{label} input unit",
+            "choice",
+            "samples",
+            "Units used to enter this sweep timing value.",
+            choices=SUPPORTED_TIMING_UNITS,
+            hidden=True,
+        ),
+        _p(
+            time_key,
+            f"{label} time",
+            "float",
+            0.0,
+            "Trace-relative time or ramp-start interval; authoritative for time input.",
+            minimum=0,
+            maximum=1e12,
+            hidden=True,
+        ),
     )
 
 
@@ -408,26 +469,24 @@ def _sections_for_geometry(geometry):
         ),
         SectionSpec(
             "Sweep windows",
-            "Indices are zero-based. Saturation indices are relative to the extracted sweep.",
+            "Sweep times are relative to the full-trace start. Samples are "
+            "zero-based; the end is inclusive. Saturation indices are relative "
+            "to the extracted sweep.",
             tuple(
                 [
-                    _p(
+                    *_timing_parameters(
                         "sweep_start_index",
                         "Sweep start",
-                        "int",
                         sweep_start,
                         "First full-trace sample included in the I–V sweep.",
-                        minimum=0,
-                        maximum=100_000_000,
+                        0,
                     ),
-                    _p(
+                    *_timing_parameters(
                         "sweep_end_index",
                         "Sweep end",
-                        "int",
                         sweep_end,
                         "Last full-trace sample included in the I–V sweep.",
-                        minimum=0,
-                        maximum=100_000_000,
+                        0,
                     ),
                 ]
                 + [
@@ -440,15 +499,12 @@ def _sections_for_geometry(geometry):
                         minimum=1,
                         maximum=100_000,
                     ),
-                    _p(
+                    *_timing_parameters(
                         "ramp_start_spacing_samples",
                         "Ramp start spacing",
-                        "int",
                         sweep_end - sweep_start + 1,
                         "Sample spacing between the starts of consecutive ramps.",
-                        unit="samples",
-                        minimum=1,
-                        maximum=100_000_000,
+                        1,
                     ),
                 ]
                 + (
@@ -992,6 +1048,11 @@ def validate_parameters(geometry, values, *, require_input_file=False):
     normalized = {
         key: _coerce_parameter(spec, merged[key]) for key, spec in specs.items()
     }
+    for key, (unit_key, time_key) in SWEEP_TIMING_FIELDS.items():
+        if normalized[unit_key] != "samples":
+            normalized[key] = _coerce_parameter(
+                specs[key], time_to_sample(normalized[time_key], normalized["dt_s"])
+            )
 
     if (
         normalized["spatial_geometry_source"] == "bmotion"

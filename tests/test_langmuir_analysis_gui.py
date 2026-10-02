@@ -99,7 +99,11 @@ def test_numeric_fields_use_direct_inputs_except_worker_processes(
     for tab in window.parameter_tabs.values():
         for key, spec in tab.specs.items():
             editor = tab.editors[key]
-            if spec.kind in {"int", "float"}:
+            if key in gui.SWEEP_TIMING_FIELDS:
+                assert isinstance(editor, gui.SweepTimingEditor)
+                assert isinstance(editor.number, gui.DirectNumericInput)
+                assert isinstance(editor.units, QtWidgets.QComboBox)
+            elif spec.kind in {"int", "float"}:
                 assert isinstance(editor, gui.DirectNumericInput)
                 assert not isinstance(editor, QtWidgets.QAbstractSpinBox)
             elif spec.kind == "int_pair":
@@ -121,6 +125,81 @@ def test_numeric_fields_use_direct_inputs_except_worker_processes(
         window.parameter_tabs["x_line"].values()
 
     window.close()
+
+
+@pytest.mark.parametrize("geometry", SUPPORTED_GEOMETRIES)
+def test_sweep_unit_switches_preserve_time_and_round_sample_indices(
+    application, geometry
+):
+    tab = gui.ParameterTab(geometry)
+    tab.set_values({"temporal_metadata_source": "manual", "dt_s": 40e-9})
+    editor = tab.editors["sweep_start_index"]
+    editor.set_value(6800)
+    editor.units.setCurrentIndex(editor.units.findData("microseconds"))
+    assert editor.number.value() == pytest.approx(272)
+    editor.units.setCurrentIndex(editor.units.findData("milliseconds"))
+    assert editor.number.value() == pytest.approx(0.272)
+    assert tab.values()["sweep_start_index"] == 6800
+    editor.number.set_value(0.27202)
+    assert tab.values()["sweep_start_index"] == 6801
+    assert "6801" in editor.equivalent.text()
+    editor.units.setCurrentIndex(editor.units.findData("samples"))
+    assert editor.number.value() == 6801
+    editor.number.setText("6800.5")
+    with pytest.raises(ValueError, match="integer"):
+        tab.values()
+    # Restoring saved values must also recover from partially edited input.
+    tab.restore_defaults()
+    assert (
+        tab.values()["sweep_start_index"]
+        == gui.default_parameters(geometry)["sweep_start_index"]
+    )
+    tab.close()
+
+
+def test_time_input_survives_channel_metadata_refresh_and_gui_reload(
+    application, monkeypatch, tmp_path
+):
+    import h5py
+
+    path = tmp_path / "experiment.hdf5"
+    with h5py.File(path, "w") as file:
+        file.create_group("Raw data + config/SIS crate/Only config")
+    calls = []
+
+    def metadata(filename, **kwargs):
+        calls.append(kwargs)
+        return {
+            "nt_full": 200_000,
+            "dt_s": 20e-9 if kwargs["voltage_channel"] == 3 else 40e-9,
+        }
+
+    monkeypatch.setattr(gui, "read_digitizer_temporal_metadata", metadata)
+    tab = gui.ParameterTab("x_line")
+    tab.set_values(
+        {"filename": str(path), "sis_config_name": "Only config", "nramps": 2}
+    )
+    for key, value in zip(gui.SWEEP_TIMING_FIELDS, (100, 300, 400)):
+        editor = tab.editors[key]
+        editor.units.setCurrentIndex(editor.units.findData("microseconds"))
+        editor.number.set_value(value)
+    assert [tab.values()[key] for key in gui.SWEEP_TIMING_FIELDS] == [
+        5000,
+        15000,
+        20000,
+    ]
+    tab.editors["vsweep_channel"].set_value(4)
+    tab.editors["vsweep_channel"].editingFinished.emit()
+    values = tab.values()
+    assert [values[key] for key in gui.SWEEP_TIMING_FIELDS] == [2500, 7500, 10000]
+    assert tab.editors["sweep_start_index"].number.value() == 100
+    assert calls[-1]["voltage_channel"] == 4
+    restored = gui.ParameterTab("x_line")
+    restored.set_values(values)
+    assert restored.values() == values
+    assert restored.editors["sweep_start_index"].units.currentText() == "µs"
+    tab.close()
+    restored.close()
 
 
 def test_sis_channel_data_types_are_shown_beside_channel_inputs(
