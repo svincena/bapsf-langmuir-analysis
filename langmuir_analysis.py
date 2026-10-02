@@ -1818,13 +1818,13 @@ def apply_optional_xy_ramp_postprocessing(te, vp, vf, ies, iis, **kwargs):
     }
 
 
-def _plot_map(ax, x_mesh, y_mesh, values, title, cbar_label):
+def _plot_map(ax, x_mesh, y_mesh, values, title, cbar_label, *, cax=None, notes_ax=None):
     values = np.asarray(values, dtype=float)
     finite = np.isfinite(values)
     mesh = None
     if np.any(finite):
         mesh = ax.pcolormesh(x_mesh, y_mesh, values, shading="auto")
-        cbar = ax.figure.colorbar(mesh, ax=ax)
+        cbar = ax.figure.colorbar(mesh, ax=ax, cax=cax)
         cbar.set_label(cbar_label)
     else:
         finite_x = np.asarray(x_mesh)[np.isfinite(x_mesh)]
@@ -1833,11 +1833,14 @@ def _plot_map(ax, x_mesh, y_mesh, values, title, cbar_label):
             ax.set_xlim(np.min(finite_x), np.max(finite_x))
         if finite_y.size:
             ax.set_ylim(np.min(finite_y), np.max(finite_y))
-        ax.text(
+        empty_ax = ax if notes_ax is None else notes_ax
+        if cax is not None:
+            cax.set_visible(False)
+        empty_ax.text(
             0.5,
             0.5,
-            "No accepted values",
-            transform=ax.transAxes,
+            "No accepted\nvalues",
+            transform=empty_ax.transAxes,
             ha="center",
             va="center",
             color="0.35",
@@ -1868,43 +1871,62 @@ def render_xy_summary_plot(
     interferometer_profile_y_cm=None,
     title="Langmuir XY-Plane Summary",
 ):
-    fig, axs = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
+    fig = plt.figure(figsize=(14, 12), constrained_layout=True)
+    panels = fig.add_gridspec(3, 2)
+    axs = np.empty((3, 2), dtype=object)
+    colorbar_axes, note_axes = {}, {}
+    for row, col in np.ndindex(axs.shape):
+        # Reserve a narrow, wrapping annotation column independently of the
+        # equal-aspect map and colorbar so legends never cover scan locations.
+        panel = panels[row, col].subgridspec(1, 3, width_ratios=(1, 0.045, 0.25))
+        ax = fig.add_subplot(panel[0, 0])
+        axs[row, col] = ax
+        colorbar_axes[ax] = fig.add_subplot(panel[0, 1])
+        note_axes[ax] = fig.add_subplot(panel[0, 2])
+        note_axes[ax].axis("off")
 
-    _plot_map(axs[0, 0], x_mesh, y_mesh, te.value, "Electron Temperature", "T_e (eV)")
-    _plot_map(axs[0, 1], x_mesh, y_mesh, vp.value, "Plasma Potential", "V_p (V)")
-    _plot_map(axs[1, 0], x_mesh, y_mesh, vf.value, "Floating Potential", "V_f (V)")
-    _plot_map(axs[1, 1], x_mesh, y_mesh, ies.value, "Electron Saturation Current", "I_es (A)")
-    _plot_map(axs[2, 0], x_mesh, y_mesh, iis.value, "Ion Saturation Current", "I_is (A)")
+    def plot_map(ax, values, plot_title, label):
+        return _plot_map(
+            ax, x_mesh, y_mesh, values, plot_title, label,
+            cax=colorbar_axes[ax], notes_ax=note_axes[ax],
+        )
+
+    plot_map(axs[0, 0], te.value, "Electron Temperature", "T_e (eV)")
+    plot_map(axs[0, 1], vp.value, "Plasma Potential", "V_p (V)")
+    plot_map(axs[1, 0], vf.value, "Floating Potential", "V_f (V)")
+    plot_map(axs[1, 1], ies.value, "Electron Saturation Current", "I_es (A)")
+    plot_map(axs[2, 0], iis.value, "Ion Saturation Current", "I_is (A)")
     if n_e is not None:
-        _plot_map(axs[2, 1], x_mesh, y_mesh, n_e.value, "Electron Density", "n_e (m^-3)")
+        plot_map(axs[2, 1], n_e.value, "Electron Density", "n_e (m^-3)")
         if interferometer_profile_y_cm is not None:
             axs[2, 1].axhline(
                 interferometer_profile_y_cm,
                 color="white",
                 linestyle="--",
                 linewidth=1.2,
-                label=f"interferometer x-line: y={interferometer_profile_y_cm:g} cm",
+                label=f"Interferometer\nx-line\ny={interferometer_profile_y_cm:g} cm",
             )
-            axs[2, 1].legend()
+
         if shape_factor is not None:
             shape_factor_m = u.Quantity(shape_factor).to_value(u.m)
             shape_factor_text = (
-                f"X-line shape factor = {shape_factor_m:.4g} m"
+                f"X-line shape\nfactor\n{shape_factor_m:.4g} m"
                 if np.isfinite(shape_factor_m)
-                else "X-line shape factor unavailable"
+                else "X-line shape\nfactor\nunavailable"
             )
-            axs[2, 1].text(
-                0.03,
-                0.97,
+            note_axes[axs[2, 1]].text(
+                0,
+                0.02,
                 shape_factor_text,
-                transform=axs[2, 1].transAxes,
+                transform=note_axes[axs[2, 1]].transAxes,
                 ha="left",
-                va="top",
+                va="bottom",
+                fontsize=8,
                 color="black",
-                bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"},
             )
     else:
         axs[2, 1].axis("off")
+        colorbar_axes[axs[2, 1]].set_visible(False)
 
     # Keep finite estimates visible while marking locations where no shot fit
     # passed the full acceptance policy.
@@ -1930,9 +1952,8 @@ def render_xy_summary_plot(
                     y_mesh[rejected],
                     "x",
                     color="tab:orange",
-                    label="no accepted fits",
+                    label="No accepted\nfits",
                 )
-                ax.legend()
 
     if te_fit_r2 is not None and te_poor_fit_r2 is not None:
         poor_te_fit = np.isfinite(te_fit_r2) & (te_fit_r2 < te_poor_fit_r2)
@@ -1943,9 +1964,8 @@ def render_xy_summary_plot(
                 "rx",
                 ms=5,
                 mew=1.4,
-                label=f"Te fit R^2 < {te_poor_fit_r2:.2f}",
+                label=f"Te fit\nR² < {te_poor_fit_r2:.2f}",
             )
-            axs[0, 0].legend()
 
     if vp_spike_mask is not None and np.any(vp_spike_mask):
         axs[0, 1].plot(
@@ -1953,9 +1973,16 @@ def render_xy_summary_plot(
             y_mesh[vp_spike_mask],
             "ko",
             ms=3,
-            label="flagged Vp spikes",
+            label="Flagged Vp\nspikes",
         )
-        axs[0, 1].legend()
+
+    for ax in axs.flat:
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            note_axes[ax].legend(
+                handles, labels, loc="upper left", fontsize=8, frameon=False,
+                borderaxespad=0, handlelength=1, handletextpad=0.4, labelspacing=1,
+            )
 
     summary_title = title if analysis_status is None else f"{title}\n{analysis_status}"
     fig.suptitle(summary_title, fontsize=16)

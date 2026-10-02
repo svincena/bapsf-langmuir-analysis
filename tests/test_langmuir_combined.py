@@ -743,3 +743,39 @@ def test_xy_interferometer_scaling_uses_selected_xline_shape_factor():
 def test_select_xline_from_xy_map_rejects_inconsistent_shapes(y, density, message):
     with pytest.raises(ValueError, match=message):
         analysis.select_xline_from_xy_map(y, density)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_xy_summary_annotations_stay_in_narrow_side_columns(empty):
+    import matplotlib.pyplot as plt
+
+    x_mesh, y_mesh = np.meshgrid(np.linspace(-10, 10, 5), np.linspace(-10, 10, 5))
+    values = np.full((5, 5), np.nan) if empty else np.arange(25).reshape(5, 5) + 1.0
+    figure = analysis.render_xy_summary_plot(
+        x_mesh, y_mesh, values * u.eV, values * u.V, values * u.V,
+        values * u.A, values * u.A, values * u.m**-3,
+        analysis_ok=np.zeros((5, 5), dtype=bool),
+        te_fit_r2=np.full((5, 5), 0.1), te_poor_fit_r2=0.9,
+        vp_spike_mask=np.ones((5, 5), dtype=bool),
+        shape_factor=0.12 * u.m, interferometer_profile_y_cm=0,
+    )
+    try:
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        for index in range(6):
+            map_ax, _colorbar_ax, notes_ax = figure.axes[3 * index : 3 * index + 3]
+            assert map_ax.get_legend() is None
+            assert not map_ax.texts
+            assert notes_ax.get_position().x0 > map_ax.get_position().x1
+            assert notes_ax.get_position().width < 0.1
+            legend = notes_ax.get_legend()
+            if legend is not None:
+                bounds = legend.get_window_extent(renderer)
+                assert bounds.x0 > map_ax.get_window_extent(renderer).x1
+                assert bounds.x1 <= notes_ax.get_window_extent(renderer).x1 + 1
+            if empty:
+                assert any("No accepted" in text.get_text() for text in notes_ax.texts)
+        if not empty:
+            assert len(figure.axes[2].get_legend().get_texts()) == 2
+    finally:
+        plt.close(figure)
