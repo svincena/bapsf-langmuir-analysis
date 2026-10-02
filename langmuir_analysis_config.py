@@ -501,7 +501,7 @@ def _sections_for_geometry(geometry):
                     ),
                     *_timing_parameters(
                         "ramp_start_spacing_samples",
-                        "Ramp start spacing",
+                        "Ramp spacing",
                         sweep_end - sweep_start + 1,
                         "Sample spacing between the starts of consecutive ramps.",
                         1,
@@ -1080,7 +1080,7 @@ def validate_parameters(geometry, values, *, require_input_file=False):
         and normalized["ramp_start_spacing_samples"] < sweep_points
     ):
         raise ValueError(
-            "Ramp start spacing must be at least the extracted ramp length."
+            "Ramp spacing must be at least the extracted ramp length."
         )
     last_sweep_end = (
         normalized["sweep_end_index"]

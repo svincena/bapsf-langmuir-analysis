@@ -53,7 +53,7 @@ when it is evenly spaced, because the analysis uses one scalar `dt`. Manual
 mode leaves both fields editable and uses the entered sample interval even when
 the file reports a different value.
 
-**Sweep start**, **Sweep end**, and **Ramp start spacing** each accept samples,
+**Sweep start**, **Sweep end**, and **Ramp spacing** each accept samples,
 microseconds (µs), or milliseconds (ms). Sweep times are measured from the
 beginning of the full digitizer trace; the sweep end is inclusive. Time entries
 use the selected channels' sample interval in HDF5 timing mode, or the entered
@@ -160,7 +160,7 @@ records `shot_analysis_mode` and `shot_statistics_available`.
 
 For a discharge containing repeated sweeps, **Sweep start** and **Sweep end**
 define the first ramp. **Number of ramps** enables repeated-ramp analysis, and
-**Ramp start spacing** gives the start-to-start separation in samples. Ramps
+**Ramp spacing** gives the start-to-start separation in samples. Ramps
 must not overlap and every ramp must fit within the acquired trace. Each ramp
 is fitted and spatially post-processed independently. With per-shot fitting,
 x-line products have shape `(nx, nshots, nramps)` and XY products have shape

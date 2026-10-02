@@ -57,7 +57,7 @@ def test_time_entry_validation_checks_resolved_ramp_bounds():
         ramp_start_spacing_input_unit="microseconds",
         ramp_start_spacing_time_s=20e-9 * 0.1,
     )
-    with pytest.raises(ValueError, match="Ramp start spacing"):
+    with pytest.raises(ValueError, match="Ramp spacing"):
         validate_parameters("x_line", values)
 
 
