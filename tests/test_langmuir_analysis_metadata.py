@@ -6,9 +6,38 @@ from bapsflib import lapd
 from langmuir_analysis_config import default_parameters
 from langmuir_analysis_metadata import (
     read_digitizer_temporal_metadata,
+    read_run_description,
     read_sis_channel_data_types,
     read_sweep_preview_trace,
 )
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [(b"First line\nSecond line", "First line\nSecond line"), ("", "")],
+)
+def test_run_description_reads_metadata_only_and_closes_file(
+    monkeypatch, tmp_path, stored, expected
+):
+    path = tmp_path / "run.hdf5"
+    path.touch()
+    opened, closed = [], []
+
+    class FakeFile:
+        def __init__(self):
+            self.info = {"run description": stored}
+
+        def close(self):
+            closed.append(True)
+
+    def open_file(filename, **kwargs):
+        opened.append((filename, kwargs))
+        return FakeFile()
+
+    monkeypatch.setattr(lapd, "File", open_file)
+    assert read_run_description(path) == expected
+    assert opened == [(path, {"mode": "r", "silent": True})]
+    assert closed == [True]
 
 
 @pytest.mark.parametrize("source", ["manual", "hdf5"])

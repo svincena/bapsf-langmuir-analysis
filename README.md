@@ -53,6 +53,10 @@ when it is evenly spaced, because the analysis uses one scalar `dt`. Manual
 mode leaves both fields editable and uses the entered sample interval even when
 the file reports a different value.
 
+Use **View run description…** beside the experiment-file field to read the
+selected data run's description in a separate, read-only window. The viewer
+reports when the file has no run description.
+
 **Sweep start**, **Sweep end**, and **Ramp spacing** each accept samples,
 microseconds (µs), or milliseconds (ms). Sweep times are measured from the
 beginning of the full digitizer trace; the sweep end is inclusive. Time entries

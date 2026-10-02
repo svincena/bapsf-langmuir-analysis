@@ -22,6 +22,7 @@ import argparse
 import io
 import multiprocessing as mp
 import os
+import textwrap
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -354,6 +355,17 @@ def sanitize_filename_component(text):
         elif char.isspace():
             safe_chars.append("_")
     return "".join(safe_chars).strip("._") or "plot"
+
+
+def _summary_title(title, analysis_status=None):
+    """Wrap long run names and fit status within the summary figure width."""
+    parts = [title]
+    if analysis_status is not None:
+        parts.append(analysis_status)
+    return "\n".join(
+        textwrap.fill(part, width=70, break_long_words=True)
+        for part in parts
+    )
 
 
 def save_diagnostic_figure(fig, output_dir, filename_stem, dpi=600):
@@ -1313,7 +1325,7 @@ def render_xline_summary_plot(
     else:
         axs[2, 1].axis("off")
 
-    summary_title = title if analysis_status is None else f"{title}\n{analysis_status}"
+    summary_title = _summary_title(title, analysis_status)
     fig.suptitle(summary_title, fontsize=16)
     return fig
 
@@ -1445,10 +1457,10 @@ def render_xline_multi_ramp_summary_plot(
                 va="top",
                 bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"},
             )
-    title = "Langmuir X-Line Multi-Ramp Summary"
-    if analysis_status is not None:
-        title += f"\n{analysis_status}"
-    fig.suptitle(title, fontsize=16)
+    fig.suptitle(
+        _summary_title("Langmuir X-Line Multi-Ramp Summary", analysis_status),
+        fontsize=16,
+    )
     return fig
 
 
@@ -1984,7 +1996,7 @@ def render_xy_summary_plot(
                 borderaxespad=0, handlelength=1, handletextpad=0.4, labelspacing=1,
             )
 
-    summary_title = title if analysis_status is None else f"{title}\n{analysis_status}"
+    summary_title = _summary_title(title, analysis_status)
     fig.suptitle(summary_title, fontsize=16)
     return fig
 

@@ -90,6 +90,38 @@ def test_gui_has_one_fully_populated_tab_per_geometry(
     window.close()
 
 
+def test_run_description_button_uses_current_tab_file_and_read_only_dialog(
+    application, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", tmp_path / "parameters.json")
+    calls = []
+    monkeypatch.setattr(
+        gui, "read_run_description",
+        lambda filename: calls.append(filename) or "Run notes\nSecond line",
+    )
+    window = LangmuirAnalysisWindow()
+    tab = window.parameter_tabs["xy_plane"]
+    tab.editors["filename"].line_edit.setText("/tmp/current-run.hdf5")
+    displayed = []
+
+    def inspect_dialog():
+        dialog = next(
+            widget for widget in application.topLevelWidgets()
+            if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Run description"
+        )
+        viewer = dialog.findChild(QtWidgets.QPlainTextEdit)
+        displayed.append((viewer.isReadOnly(), viewer.toPlainText()))
+        dialog.reject()
+
+    QtCore.QTimer.singleShot(0, inspect_dialog)
+    tab.run_description_button.click()
+    assert calls == ["/tmp/current-run.hdf5"]
+    assert displayed == [(True, "Run notes\nSecond line")]
+    tab.set_running(True)
+    assert not tab.run_description_button.isEnabled()
+    window.close()
+
+
 def test_numeric_fields_use_direct_inputs_except_worker_processes(
     application, monkeypatch, tmp_path
 ):

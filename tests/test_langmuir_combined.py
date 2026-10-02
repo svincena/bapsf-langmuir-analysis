@@ -779,3 +779,30 @@ def test_xy_summary_annotations_stay_in_narrow_side_columns(empty):
             assert len(figure.axes[2].get_legend().get_texts()) == 2
     finally:
         plt.close(figure)
+
+
+def test_xy_summary_title_fits_saved_figure_with_long_status():
+    import matplotlib.pyplot as plt
+
+    x_mesh, y_mesh = np.meshgrid([-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0])
+    values = np.ones((3, 3))
+    title = "Experiment 2026-10-01 run 1234 - Langmuir XY-plane Summary"
+    status = (
+        "Reported 120/140 finite per-shot fits; accepted 95/140 per-shot fits; "
+        "top rejection (45): insufficient points in the selected electron "
+        "temperature fit interval after excluding invalid current samples"
+    )
+    figure = analysis.render_xy_summary_plot(
+        x_mesh, y_mesh, values * u.eV, values * u.V, values * u.V,
+        values * u.A, values * u.A, analysis_status=status, title=title,
+    )
+    try:
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        bounds = figure._suptitle.get_window_extent(renderer)
+        width, height = figure.canvas.get_width_height()
+        assert 0 <= bounds.x0 < bounds.x1 <= width
+        assert 0 <= bounds.y0 < bounds.y1 <= height
+        assert " ".join(figure._suptitle.get_text().split()) == f"{title} {status}"
+    finally:
+        plt.close(figure)

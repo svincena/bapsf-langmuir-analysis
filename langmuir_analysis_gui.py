@@ -29,6 +29,7 @@ from langmuir_analysis_config import (
 )
 from langmuir_analysis_metadata import (
     read_digitizer_temporal_metadata,
+    read_run_description,
     read_sis_channel_data_types,
 )
 
@@ -1465,6 +1466,19 @@ class ParameterTab(QtWidgets.QWidget):
             self.editors[spec.key] = editor
             self.specs[spec.key] = spec
             field_widget = editor
+            if spec.key == "filename":
+                field_widget = QtWidgets.QWidget()
+                field_layout = QtWidgets.QHBoxLayout(field_widget)
+                field_layout.setContentsMargins(0, 0, 0, 0)
+                field_layout.setSpacing(9)
+                field_layout.addWidget(editor, 1)
+                self.run_description_button = QtWidgets.QPushButton(
+                    "View run description…"
+                )
+                self.run_description_button.clicked.connect(
+                    self.show_run_description
+                )
+                field_layout.addWidget(self.run_description_button)
             if spec.key in {"vsweep_channel", "isweep_channel"}:
                 field_widget = QtWidgets.QWidget()
                 field_layout = QtWidgets.QHBoxLayout(field_widget)
@@ -1524,6 +1538,44 @@ class ParameterTab(QtWidgets.QWidget):
     def _source_filename(self):
         """Return the experiment filename currently displayed by this tab."""
         return _editor_value(self.editors["filename"], self.specs["filename"])
+
+    def show_run_description(self):
+        """Display the currently selected file's run metadata on demand."""
+        filename = self._source_filename().strip()
+        if not filename:
+            QtWidgets.QMessageBox.information(
+                self, "No experiment file selected", "Select an experiment file first."
+            )
+            return
+        try:
+            description = read_run_description(filename)
+        except (ValueError, OSError, ImportError) as error:
+            QtWidgets.QMessageBox.warning(
+                self, "Could not read run description", str(error)
+            )
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Run description")
+        dialog.resize(680, 440)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        source_label = QtWidgets.QLabel(str(Path(filename).expanduser()))
+        source_label.setWordWrap(True)
+        source_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(source_label)
+        description_view = QtWidgets.QPlainTextEdit()
+        description_view.setReadOnly(True)
+        description_view.setPlainText(
+            description or "No run description is stored in this experiment file."
+        )
+        layout.addWidget(description_view, 1)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
 
     def _refresh_channel_data_types(self, *_args):
         """Show SIS configuration descriptions beside both channel inputs."""
@@ -1892,6 +1944,7 @@ class ParameterTab(QtWidgets.QWidget):
     def set_running(self, running):
         self.start_button.setDisabled(running)
         self.choose_sweep_button.setDisabled(running)
+        self.run_description_button.setDisabled(running)
 
 
 class LangmuirAnalysisWindow(QtWidgets.QMainWindow):

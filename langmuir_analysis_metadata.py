@@ -15,6 +15,30 @@ def _decode_hdf5_text(value):
     return str(value).strip("\x00 ")
 
 
+def read_run_description(filename):
+    """Read the selected LAPD run description without modifying the file."""
+    filename = Path(filename).expanduser()
+    if not filename.is_file():
+        raise ValueError(f"Experiment HDF5 file does not exist: {filename}")
+
+    file_obj = None
+    try:
+        from bapsflib import lapd
+
+        file_obj = lapd.File(filename, mode="r", silent=True)
+        description = file_obj.info.get("run description", "")
+        return _decode_hdf5_text(description) if description is not None else ""
+    except (OSError, ValueError):
+        raise
+    except Exception as error:
+        raise ValueError(
+            f"Could not read run description from {filename}: {error}"
+        ) from error
+    finally:
+        if file_obj is not None:
+            file_obj.close()
+
+
 def _sis_data_type_attribute(adc, channel):
     """Return the SIS configuration attribute for one physical channel."""
     adc = str(adc).strip()
