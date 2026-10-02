@@ -63,6 +63,25 @@ saves the chosen units and entered times, so a channel timing change preserves
 the entered time and recomputes the sample index. The worker refreshes HDF5
 timing before resolving these entries and checking ramp bounds.
 
+Click **Choose sweep limits from traces…** in **Sweep windows** to open a
+single-shot preview. It starts at the center of the scan and displays the full,
+unsmoothed voltage and current traces on two graphs sharing one time axis.
+The preview uses the configured channel scaling, current polarity, and
+electronics baseline subtraction. X, Y (for XY scans), and shot indices are
+zero-based; choose another location and click **Load location** to inspect it.
+Displayed Y follows ascending physical coordinates even for descending-Y
+acquisition. Only the two selected channel traces are read, and the source
+HDF5 file is opened read-only.
+
+Use the toolbar **Zoom** or **Pan** on either graph to adjust both time limits.
+**Home / full trace** resets the view; toolbar **Back** and **Forward** let you
+retry earlier views. **Show current sweep** restores the currently entered
+interval. The panel shows the nearest sample limits and inclusive sample
+count. Click **Use visible interval** to approve the final view as the sweep
+start and end; invalid sweep or repeated-ramp bounds are reported before
+approval. **Cancel** leaves the sweep limits as entered. The selected sample
+limits are applied in the units already chosen in the main parameter editor.
+
 Both tabs are saved automatically in `last_parameters.json`, along with the
 last active tab. The file is local run state and is intentionally ignored by
 Git. If it is absent, all controls use the documented defaults in

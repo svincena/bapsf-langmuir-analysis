@@ -267,3 +267,170 @@ def read_digitizer_temporal_metadata(
     finally:
         if file_obj is not None:
             file_obj.close()
+
+
+def read_result_sample_interval(raw, channel):
+    """Return bapsflib's sample interval in seconds, if it is available."""
+    import astropy.units as u
+    import numpy as np
+
+    raw_dt = raw.dt
+    if raw_dt is None:
+        return None
+    try:
+        if hasattr(raw_dt, "to_value"):
+            channel_dt_s = float(raw_dt.to_value(u.s))
+        else:
+            channel_dt_s = float(raw_dt.value)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"Channel {channel}: bapsflib returned an invalid sample interval."
+        ) from error
+    if not np.isfinite(channel_dt_s) or channel_dt_s <= 0:
+        raise ValueError(
+            f"Channel {channel}: bapsflib returned invalid sample interval "
+            f"{channel_dt_s!r} s."
+        )
+    return channel_dt_s
+
+
+def resolve_sample_interval(
+    configured_dt_s,
+    temporal_source,
+    voltage_dt_s,
+    current_dt_s,
+):
+    """Validate channel timing and select the configured scalar interval."""
+    import numpy as np
+
+    configured_dt_s = float(configured_dt_s)
+    if not np.isfinite(configured_dt_s) or configured_dt_s <= 0:
+        raise ValueError("Configured sample interval must be positive and finite.")
+    if temporal_source not in {"manual", "hdf5"}:
+        raise ValueError(f"Unsupported temporal information source {temporal_source!r}.")
+
+    available_intervals = [
+        ("voltage", voltage_dt_s),
+        ("current", current_dt_s),
+    ]
+    if voltage_dt_s is not None and current_dt_s is not None and not np.isclose(
+        voltage_dt_s,
+        current_dt_s,
+        rtol=1e-9,
+        atol=1e-15,
+    ):
+        raise ValueError(
+            "Voltage and current channels report different sample intervals: "
+            f"{voltage_dt_s:.15g} s and {current_dt_s:.15g} s."
+        )
+
+    if temporal_source == "hdf5":
+        for role, observed_dt_s in available_intervals:
+            if observed_dt_s is not None and not np.isclose(
+                configured_dt_s,
+                observed_dt_s,
+                rtol=1e-9,
+                atol=1e-15,
+            ):
+                raise ValueError(
+                    f"The {role} channel sample interval changed after HDF5 "
+                    f"metadata reconciliation: expected {configured_dt_s:.15g} s, "
+                    f"found {observed_dt_s:.15g} s."
+                )
+    return configured_dt_s
+
+
+def read_sweep_preview_trace(values, shot_number):
+    """Read just one full voltage/current trace, with analysis scaling, read-only."""
+    filename = Path(values["filename"]).expanduser()
+    if not filename.is_file():
+        raise ValueError(f"Experiment HDF5 file does not exist: {filename}")
+    if (
+        isinstance(shot_number, bool)
+        or int(shot_number) != shot_number
+        or shot_number < 1
+    ):
+        raise ValueError("Preview shot number must be a positive integer.")
+    routing = {
+        "digitizer": values["digitizer"],
+        "adc": values["adc"],
+        "config_name": values["sis_config_name"],
+    }
+    timing = {"dt_s": values["dt_s"], "nt_full": values["nt_full"]}
+    if values["temporal_metadata_source"] == "hdf5":
+        timing = read_digitizer_temporal_metadata(
+            filename,
+            **routing,
+            board=values["board"],
+            voltage_channel=values["vsweep_channel"],
+            current_channel=values["isweep_channel"],
+        )
+    file_obj = None
+    try:
+        import numpy as np
+        from bapsflib import lapd
+
+        file_obj = lapd.File(filename, mode="r", silent=True)
+        signals, intervals = {}, {}
+        for role, channel in (
+            ("voltage", values["vsweep_channel"]),
+            ("current", values["isweep_channel"]),
+        ):
+            raw = file_obj.read_data(
+                values["board"],
+                channel,
+                **routing,
+                shotnum=slice(int(shot_number), int(shot_number) + 1),
+                silent=True,
+            )
+            signal = np.asarray(raw["signal"])
+            if signal.shape != (1, timing["nt_full"]) or not np.array_equal(
+                raw["shotnum"], [shot_number]
+            ):
+                raise ValueError(
+                    f"The {role} channel does not contain shot {shot_number} "
+                    f"with {timing['nt_full']} samples."
+                )
+            signals[role] = np.array(signal[0], dtype=float, copy=True)
+            intervals[role] = read_result_sample_interval(raw, channel)
+        dt_s = resolve_sample_interval(
+            timing["dt_s"],
+            values["temporal_metadata_source"],
+            intervals["voltage"],
+            intervals["current"],
+        )
+        voltage = signals["voltage"] * values["vsweep_attenuation"]
+        current = (
+            signals["current"]
+            * values["isweep_attenuation"]
+            / values["isweep_resistance_ohm"]
+        )
+        if values["negate_Isweep_current"]:
+            current = -current
+        if values["subtract_dc"]:
+            start, end = (
+                values["isweep_dc_offset_start_index"],
+                values["isweep_dc_offset_end_index"],
+            )
+            if not 0 <= start <= end < current.size:
+                raise ValueError(
+                    "The electronics baseline must lie inside the full trace."
+                )
+            current = current - np.mean(current[start : end + 1])
+        return {
+            "time_s": np.arange(timing["nt_full"]) * dt_s,
+            "voltage_V": voltage,
+            "current_A": current,
+            "dt_s": dt_s,
+            "nt_full": timing["nt_full"],
+            "shot_number": int(shot_number),
+        }
+    except (ValueError, OSError):
+        raise
+    except Exception as error:
+        raise ValueError(
+            f"Could not read preview shot {shot_number}: {error}"
+        ) from error
+    finally:
+        if file_obj is not None:
+            file_obj.close()

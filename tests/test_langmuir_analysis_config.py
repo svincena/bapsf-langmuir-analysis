@@ -8,6 +8,7 @@ from langmuir_analysis_config import (
     SWEEP_TIMING_FIELDS,
     default_parameters,
     load_last_parameters,
+    preview_shot_number,
     save_last_parameters,
     time_to_sample,
     validate_parameters,
@@ -313,3 +314,17 @@ def test_repeated_ramps_must_fit_inside_trace_and_avoid_dc_window():
     )
     with pytest.raises(ValueError, match="must not overlap any I–V ramp"):
         validate_parameters("x_line", values)
+@pytest.mark.parametrize("order, expected", [("ascending", 104), ("descending", 124)])
+def test_preview_location_maps_displayed_y_to_acquisition_shot(order, expected):
+    values = default_parameters("xy_plane")
+    values.update(nx=5, ny=3, nshots=2, data_offset=100, xy_y_acquisition_order=order)
+    assert preview_shot_number("xy_plane", values, 1, 1, 1) == 114
+    assert preview_shot_number("xy_plane", values, 1, 1, 0) == expected
+
+
+def test_preview_location_honors_xline_offset_and_rejects_invalid_indices():
+    values = default_parameters("x_line")
+    values.update(nx=5, nshots=3, data_offset=100)
+    assert preview_shot_number("x_line", values, 2, 1) == 108
+    with pytest.raises(ValueError, match="X index"):
+        preview_shot_number("x_line", values, 5, 1)

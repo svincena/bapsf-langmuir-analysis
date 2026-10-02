@@ -1484,7 +1484,35 @@ class ParameterTab(QtWidgets.QWidget):
                 self.channel_data_type_labels[spec.key] = data_type_label
             form.addRow(label, field_widget)
         card_layout.addLayout(form)
+        if section.title == "Sweep windows":
+            self.choose_sweep_button = QtWidgets.QPushButton("Choose sweep limits from traces…")
+            self.choose_sweep_button.clicked.connect(self.choose_sweep_limits)
+            card_layout.addWidget(self.choose_sweep_button)
         return card
+
+    def choose_sweep_limits(self):
+        """Preview one acquired shot and apply only an explicitly approved view."""
+        try:
+            self.reconcile_bmotion_geometry()
+            self.reconcile_sis_acquisition_metadata()
+            from langmuir_sweep_selector import SweepSelectionDialog
+
+            dialog = SweepSelectionDialog(self.geometry, self.values(), self)
+            try:
+                if dialog.exec() != QtWidgets.QDialog.Accepted:
+                    return
+                for key in ("dt_s", "nt_full"):
+                    _set_editor_value(
+                        self.editors[key], self.specs[key], dialog.values[key]
+                    )
+                for key, index in zip(
+                    ("sweep_start_index", "sweep_end_index"), dialog.selected_samples
+                ):
+                    self.editors[key].set_value(index)
+            finally:
+                dialog.deleteLater()
+        except (ValueError, OSError, ImportError) as error:
+            QtWidgets.QMessageBox.warning(self, "Could not choose sweep limits", str(error))
 
     def _sis_source_values(self):
         """Read the current file and digitizer values from this tab."""
@@ -1863,6 +1891,7 @@ class ParameterTab(QtWidgets.QWidget):
 
     def set_running(self, running):
         self.start_button.setDisabled(running)
+        self.choose_sweep_button.setDisabled(running)
 
 
 class LangmuirAnalysisWindow(QtWidgets.QMainWindow):

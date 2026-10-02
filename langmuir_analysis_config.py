@@ -103,6 +103,29 @@ def time_to_sample(time_s, dt_s):
     return math.floor(samples + 0.5 + 4 * math.ulp(samples))
 
 
+def preview_shot_number(geometry, values, x_index, shot_index, y_index=0):
+    """Map a displayed scan position to its one-based acquisition shot."""
+    if geometry not in SUPPORTED_GEOMETRIES:
+        raise ValueError(f"Unsupported analysis geometry {geometry!r}.")
+    for label, index, count in (
+        ("X", x_index, values["nx"]),
+        ("Shot", shot_index, values["nshots"]),
+        ("Y", y_index, values.get("ny", 1) if geometry == "xy_plane" else 1),
+    ):
+        if isinstance(index, bool) or int(index) != index or not 0 <= index < count:
+            raise ValueError(f"{label} index must be an integer from 0 to {count - 1}.")
+    acquisition_y = y_index
+    if geometry == "xy_plane" and values["xy_y_acquisition_order"] == "descending":
+        # Displayed Y is ascending, while the raw shot blocks can descend in Y.
+        acquisition_y = values["ny"] - 1 - y_index
+    return int(
+        values["data_offset"]
+        + 1
+        + (acquisition_y * values["nx"] + x_index) * values["nshots"]
+        + shot_index
+    )
+
+
 def _timing_parameters(key, label, default, description, minimum):
     unit_key, time_key = SWEEP_TIMING_FIELDS[key]
     return (

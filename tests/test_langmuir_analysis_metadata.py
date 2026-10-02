@@ -1,12 +1,118 @@
 import astropy.units as u
 import numpy as np
 import pytest
-
 from bapsflib import lapd
+
+from langmuir_analysis_config import default_parameters
 from langmuir_analysis_metadata import (
     read_digitizer_temporal_metadata,
     read_sis_channel_data_types,
+    read_sweep_preview_trace,
 )
+
+
+@pytest.mark.parametrize("source", ["manual", "hdf5"])
+def test_preview_reads_only_one_shot_read_only_with_analysis_scaling(
+    monkeypatch, tmp_path, source
+):
+    path = tmp_path / "preview.hdf5"
+    path.touch()
+    values = default_parameters("x_line")
+    values.update(
+        filename=str(path),
+        nt_full=8,
+        dt_s=1e-6,
+        temporal_metadata_source=source,
+        vsweep_attenuation=100.0,
+        isweep_resistance_ohm=2.0,
+        negate_Isweep_current=True,
+        subtract_dc=True,
+        isweep_dc_offset_start_index=0,
+        isweep_dc_offset_end_index=1,
+    )
+    reads, opens, closed = [], [], []
+
+    class Raw(dict):
+        dt = 2e-6 * u.s
+
+    class FakeFile:
+        def get_digitizer_specs(self, *_args, **_kwargs):
+            return {"nt": 8, "clock rate": 1 * u.MHz, "sample average": 2}
+
+        def read_data(self, board, channel, **kwargs):
+            reads.append((board, channel, kwargs))
+            return Raw(
+                signal=np.arange(8, dtype=np.float32)[None, :], shotnum=np.array([108])
+            )
+
+        def close(self):
+            closed.append(True)
+
+    def open_file(filename, **kwargs):
+        opens.append(kwargs)
+        return FakeFile()
+
+    monkeypatch.setattr(lapd, "File", open_file)
+    preview = read_sweep_preview_trace(values, 108)
+    assert len(reads) == 2
+    assert [item[1] for item in reads] == [
+        values["vsweep_channel"],
+        values["isweep_channel"],
+    ]
+    assert all(item[2]["shotnum"] == slice(108, 109) for item in reads)
+    assert opens[-1]["mode"] == "r"
+    assert len(closed) == len(opens)
+    assert np.array_equal(preview["voltage_V"], np.arange(8) * 100)
+    assert np.array_equal(preview["current_A"], -np.arange(8) / 2 + 0.25)
+    assert preview["dt_s"] == (1e-6 if source == "manual" else 2e-6)
+    assert np.allclose(preview["time_s"], np.arange(8) * preview["dt_s"])
+
+
+def test_preview_rejects_channel_timing_mismatch_and_closes_file(monkeypatch, tmp_path):
+    path = tmp_path / "preview.hdf5"
+    path.touch()
+    values = default_parameters("x_line")
+    values.update(
+        filename=str(path), temporal_metadata_source="manual", nt_full=8, dt_s=1e-6
+    )
+    closed = []
+
+    class Raw(dict):
+        dt = None
+
+    class FakeFile:
+        def read_data(self, board, channel, **kwargs):
+            raw = Raw(signal=np.ones((1, 8)), shotnum=np.array([1]))
+            raw.dt = (1e-6 if channel == values["vsweep_channel"] else 2e-6) * u.s
+            return raw
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(lapd, "File", lambda *_args, **_kwargs: FakeFile())
+    with pytest.raises(ValueError, match="different sample intervals"):
+        read_sweep_preview_trace(values, 1)
+    assert closed == [True]
+
+
+def test_preview_rejects_missing_shot_instead_of_substituting_another(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "preview.hdf5"
+    path.touch()
+    values = default_parameters("x_line")
+    values.update(filename=str(path), temporal_metadata_source="manual", nt_full=8)
+
+    class FakeFile:
+        def read_data(self, *_args, **_kwargs):
+            return {"signal": np.ones((1, 8)), "shotnum": np.array([2])}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(lapd, "File", lambda *_args, **_kwargs: FakeFile())
+    with pytest.raises(ValueError, match="does not contain shot 1"):
+        read_sweep_preview_trace(values, 1)
 
 
 def _read_metadata(path):

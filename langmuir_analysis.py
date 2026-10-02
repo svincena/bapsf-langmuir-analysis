@@ -46,7 +46,11 @@ from langmuir_analysis_config import (
     validate_parameters,
 )
 from langmuir_analysis_core import analyze_iv_trace, bin_average_by_voltage
-from langmuir_analysis_metadata import read_digitizer_temporal_metadata
+from langmuir_analysis_metadata import (
+    read_digitizer_temporal_metadata,
+    read_result_sample_interval as _read_result_sample_interval,
+    resolve_sample_interval,
+)
 from langmuir_diagnostics import (
     render_iv_diagnostic_plot as render_analysis_iv_diagnostic_plot,
 )
@@ -719,72 +723,6 @@ def read_channel_xline(
     signal = signal.reshape(expected_shape)
     signal = signal * scale_factor
     return signal, channel_dt_s
-
-
-def _read_result_sample_interval(raw, channel):
-    """Return bapsflib's sample interval in seconds, if it is available."""
-    raw_dt = raw.dt
-    if raw_dt is None:
-        return None
-    try:
-        if hasattr(raw_dt, "to_value"):
-            channel_dt_s = float(raw_dt.to_value(u.s))
-        else:
-            channel_dt_s = float(raw_dt.value)
-    except (AttributeError, TypeError, ValueError) as error:
-        raise ValueError(
-            f"Channel {channel}: bapsflib returned an invalid sample interval."
-        ) from error
-    if not np.isfinite(channel_dt_s) or channel_dt_s <= 0:
-        raise ValueError(
-            f"Channel {channel}: bapsflib returned invalid sample interval "
-            f"{channel_dt_s!r} s."
-        )
-    return channel_dt_s
-
-
-def resolve_sample_interval(
-    configured_dt_s,
-    temporal_source,
-    voltage_dt_s,
-    current_dt_s,
-):
-    """Validate channel timing and select the configured scalar interval."""
-    configured_dt_s = float(configured_dt_s)
-    if not np.isfinite(configured_dt_s) or configured_dt_s <= 0:
-        raise ValueError("Configured sample interval must be positive and finite.")
-    if temporal_source not in {"manual", "hdf5"}:
-        raise ValueError(f"Unsupported temporal information source {temporal_source!r}.")
-
-    available_intervals = [
-        ("voltage", voltage_dt_s),
-        ("current", current_dt_s),
-    ]
-    if voltage_dt_s is not None and current_dt_s is not None and not np.isclose(
-        voltage_dt_s,
-        current_dt_s,
-        rtol=1e-9,
-        atol=1e-15,
-    ):
-        raise ValueError(
-            "Voltage and current channels report different sample intervals: "
-            f"{voltage_dt_s:.15g} s and {current_dt_s:.15g} s."
-        )
-
-    if temporal_source == "hdf5":
-        for role, observed_dt_s in available_intervals:
-            if observed_dt_s is not None and not np.isclose(
-                configured_dt_s,
-                observed_dt_s,
-                rtol=1e-9,
-                atol=1e-15,
-            ):
-                raise ValueError(
-                    f"The {role} channel sample interval changed after HDF5 "
-                    f"metadata reconciliation: expected {configured_dt_s:.15g} s, "
-                    f"found {observed_dt_s:.15g} s."
-                )
-    return configured_dt_s
 
 
 def extract_evenly_spaced_ramps(
