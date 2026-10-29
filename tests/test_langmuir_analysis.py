@@ -1,9 +1,11 @@
 import astropy.units as u
-from astropy.constants import e, k_B, m_e
 import numpy as np
 import pytest
+from astropy.constants import e, k_B, m_e
 
 from langmuir_analysis_core import (
+    _fit_electron_temperature,
+    _validated_config,
     analyze_iv_trace,
     density_from_electron_saturation_current,
 )
@@ -66,6 +68,7 @@ def test_ideal_trace_recovers_physical_parameters():
     result = analyze_iv_trace(voltage, current, _config())
 
     assert result["ok"] is True
+    assert result["te_region_method"] == "linear_region"
     assert result["warnings"] == []
     assert result["te_fit_valid"] is True
     assert result["te_fit_passed_r2"] is True
@@ -299,17 +302,22 @@ def test_descending_quantity_sweep_matches_forward_float_sweep():
         assert descending[key] == pytest.approx(forward[key], rel=1e-10, abs=1e-12)
 
 
-def test_sloped_ion_branch_is_allowed_by_default_and_strict_mode_rejects():
+@pytest.mark.parametrize("method", ["bounded", "linear_region"])
+def test_sloped_ion_branch_respects_region_and_ideal_model_checks(method):
     voltage, current, _ = _ideal_trace()
     drift = 15e-6 * np.clip(voltage - voltage[0], 0, 8)
-    relaxed = analyze_iv_trace(voltage, current + drift, _config())
+    relaxed = analyze_iv_trace(
+        voltage, current + drift, _config(te_region_method=method),
+    )
     strict = analyze_iv_trace(
         voltage,
         current + drift,
-        _config(enforce_ideal_model_checks=True),
+        _config(te_region_method=method, enforce_ideal_model_checks=True),
     )
 
-    assert relaxed["ok"] is True
+    assert relaxed["ok"] == (method == "bounded")
+    if method == "linear_region":
+        assert any("no sufficiently linear" in warning for warning in relaxed["warnings"])
     assert any("sloped" in note for note in relaxed["model_notes"])
     assert strict["ok"] is False
     assert any("ion-saturation plateau" in warning for warning in strict["warnings"])
@@ -369,7 +377,7 @@ def test_moderate_noise_recovers_solution_but_excessive_noise_rejects_fit():
     assert recovered["n_e_m3"] == pytest.approx(truth["n_e_m3"], rel=0.06)
     assert rejected["ok"] is False
     assert np.isfinite(rejected["te_eV"])
-    assert any("R^2" in warning for warning in rejected["warnings"])
+    assert any("no sufficiently linear" in warning for warning in rejected["warnings"])
 
 
 def test_unresolved_regional_ion_estimate_is_rejected():
@@ -382,7 +390,8 @@ def test_unresolved_regional_ion_estimate_is_rejected():
     assert any("ion-saturation current estimate" in warning for warning in result["warnings"])
 
 
-def test_high_r2_bimaxwellian_branch_fails_curvature_gate():
+@pytest.mark.parametrize("method", ["bounded", "linear_region"])
+def test_high_r2_bimaxwellian_branch_respects_region_and_curvature_checks(method):
     voltage, current, truth = _ideal_trace()
     ideal_electron_current = truth["ies_A"] * np.where(
         voltage <= truth["vp_V"],
@@ -406,18 +415,191 @@ def test_high_r2_bimaxwellian_branch_fails_curvature_gate():
         )
     )
 
-    relaxed = analyze_iv_trace(voltage, ion_current + bimaxwellian_current, _config())
+    relaxed = analyze_iv_trace(
+        voltage, ion_current + bimaxwellian_current, _config(te_region_method=method),
+    )
     result = analyze_iv_trace(
         voltage,
         ion_current + bimaxwellian_current,
-        _config(enforce_ideal_model_checks=True),
+        _config(te_region_method=method, enforce_ideal_model_checks=True),
     )
 
-    assert relaxed["ok"] is True
+    assert relaxed["ok"] == (method == "bounded")
     assert any("curvature" in note for note in relaxed["model_notes"])
     assert result["te_fit_r2"] > 0.98
     assert result["ok"] is False
     assert np.isfinite(result["te_eV"])
     assert np.isfinite(result["vp_V"])
     assert np.isfinite(result["n_e_m3"])
-    assert any("curvature" in warning for warning in result["warnings"])
+    reason = "curvature" if method == "bounded" else "no sufficiently linear"
+    assert any(reason in warning for warning in result["warnings"])
+
+
+@pytest.mark.parametrize("method", ["bounded", "linear_region"])
+@pytest.mark.parametrize("outlier_current", [1e-6, 1.2, np.nan])
+def test_te_fit_region_does_not_bridge_current_threshold_excursions(outlier_current, method):
+    voltage = np.linspace(-10.0, -1.0, 181)
+    electron_current = np.exp(voltage / 3.0)
+    electron_current[60] = outlier_current
+    result = _fit_electron_temperature(
+        voltage, electron_current, 1.0, -10.0, 0.0, 0.0,
+        _validated_config(_config(te_region_method=method)),
+    )
+
+    mask = result["fit_mask"]
+    assert not mask[60]
+    selected = np.flatnonzero(mask)
+    assert np.all(np.diff(selected) == 1)
+    assert result["valid"]
+    assert result["te_eV_candidate"] == pytest.approx(3.0, rel=1e-10)
+
+
+def test_disconnected_short_intervals_cannot_satisfy_minimum_fit_points():
+    voltage = np.linspace(-10.0, -1.0, 181)
+    electron_current = np.exp(voltage / 3.0)
+    electron_current[::6] = 1.2
+    result = _fit_electron_temperature(
+        voltage, electron_current, 1.0, -10.0, 0.0, 0.0,
+        _validated_config(_config(te_min_points=12)),
+    )
+
+    assert result["npts"] < 12
+    assert not result["valid"]
+    assert np.isnan(result["te_eV_candidate"])
+    assert "no sufficiently linear" in result["reason"]
+
+
+@pytest.mark.parametrize("method", ["bounded", "linear_region"])
+@pytest.mark.parametrize(
+    ("floor_frac", "ion_noise", "vf", "margin"),
+    [(0.03, 0.0, -20.0, 0.2), (0.2, 0.0, -20.0, 0.2),
+     (0.03, 0.03, -20.0, 0.2), (0.03, 0.0, -6.0, 2.0)],
+)
+def test_te_fit_obeys_both_voltage_and_current_bounds(floor_frac, ion_noise, vf, margin, method):
+    voltage = np.linspace(-20.0, 5.0, 501)
+    electron_current = np.exp(np.minimum(voltage, 0.0) / 3.0)
+    result = _fit_electron_temperature(
+        voltage, electron_current, 1.0, vf, 0.0, ion_noise,
+        _validated_config(_config(te_region_method=method,
+                                  te_current_floor_frac=floor_frac,
+                                  te_margin_from_vp=margin)),
+    )
+    mask = result["fit_mask"]
+    assert result["valid"]
+    assert np.all(voltage[mask] >= vf)
+    assert np.all(voltage[mask] <= -margin)
+    assert np.all(electron_current[mask] >= max(floor_frac, 5 * ion_noise))
+    assert np.all(electron_current[mask] <= 0.8)
+    assert result["vstart"] == voltage[mask][0]
+    assert result["vstop"] == voltage[mask][-1]
+    assert result["te_eV_candidate"] == pytest.approx(3.0, rel=1e-10)
+
+
+@pytest.mark.parametrize("temperature", [0.5, 3.0, 20.0])
+def test_known_temperature_is_recovered_with_selected_retarding_bounds(temperature):
+    vp = 10.0
+    voltage = np.linspace(vp - 12 * temperature, vp + 4 * temperature, 6401)
+    electron_current = 0.01 * np.exp(np.minimum(voltage - vp, 0) / temperature)
+    result = analyze_iv_trace(
+        voltage, electron_current - 0.0002,
+        _config(voltage_bin_width=temperature / 60,
+                vp_smoothing_width_V=temperature / 3,
+                te_margin_from_vp=temperature / 10,
+                ies_method="at_vp"),
+        include_diagnostic_data=True,
+    )
+    assert result["ok"]
+    assert result["te_eV"] == pytest.approx(temperature, rel=0.01)
+    assert result["te_fit_vstart"] >= result["vf_V"]
+    assert result["te_fit_vstop"] <= result["vp_derivative_V"] - temperature / 10
+
+
+def test_diagnostic_marks_measured_fit_bins_and_both_limits():
+    import matplotlib.pyplot as plt
+
+    from langmuir_diagnostics import plot_iv_diagnostic_panels
+
+    voltage, current, _ = _ideal_trace()
+    result = analyze_iv_trace(
+        voltage, current, _config(iv_npts=7), include_diagnostic_data=True,
+    )
+    data = result["diagnostic_data"]
+    mask = data["te_fit_mask"]
+    assert mask.sum() == result["te_fit_npts"]
+    assert data["V_binned"][mask][0] == result["te_fit_vstart"]
+    assert data["V_binned"][mask][-1] == result["te_fit_vstop"]
+
+    fig, axs = plt.subplots(3)
+    try:
+        plot_iv_diagnostic_panels(result, axs)
+        lines = {line.get_label(): line for line in axs[2].lines}
+        measured = lines["measured Te fit bins"]
+        np.testing.assert_array_equal(measured.get_xdata(), data["V_binned"][mask])
+        np.testing.assert_allclose(
+            measured.get_ydata(), np.log(data["I_binned"][mask] - result["ion_current_A"]),
+        )
+        np.testing.assert_array_equal(
+            lines["Te lower limit"].get_xdata(), [result["te_fit_vstart"]] * 2,
+        )
+        np.testing.assert_array_equal(
+            lines["Te upper limit"].get_xdata(), [result["te_fit_vstop"]] * 2,
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_linear_region_moves_both_limits_and_rejects_cancelling_curvature():
+    voltage = np.linspace(-10.0, 4.0, 281)
+    centered_voltage = voltage + 3
+    log_current = voltage / 3.0 + (
+        0.005 * np.sign(centered_voltage)
+        * np.maximum(np.abs(centered_voltage) - 3, 0) ** 3
+    )
+    cfg = _validated_config(_config(te_region_method="bounded",
+                                    te_current_floor_frac=0, te_min_r2=0.99))
+    bounded = _fit_electron_temperature(
+        voltage, np.exp(log_current), 10, -10, 5, 0, cfg,
+    )
+    selected = _fit_electron_temperature(
+        voltage, np.exp(log_current), 10, -10, 5, 0,
+        {**cfg, "te_region_method": "linear_region"},
+    )
+
+    # Both tails curve, with opposite signs: R² and a quadratic alone miss it.
+    assert bounded["r2"] > 0.99
+    assert bounded["curvature_log"] < 0.05
+    assert selected["valid"]
+    assert selected["vstart"] > bounded["vstart"]
+    assert selected["vstop"] < bounded["vstop"]
+    assert selected["te_eV_candidate"] == pytest.approx(3.0, rel=0.03)
+    assert selected["block_deviation_log"] <= 0.02
+    assert selected["log_span"] >= 1.0
+    assert selected["candidate_count"] > 1
+
+
+@pytest.mark.parametrize("temperature", [0.5, 3.0, 20.0])
+def test_linear_region_preserves_true_temperature_without_targeting_acceptance(temperature):
+    voltage = np.linspace(-3 * temperature, -0.3 * temperature, 181)
+    electron_current = np.exp(voltage / temperature)
+    result = _fit_electron_temperature(
+        voltage, electron_current, 1, -4 * temperature, 0, 0,
+        _validated_config(_config(te_region_method="linear_region", te_max_eV=10,
+                                  te_margin_from_vp=0)),
+    )
+    assert result["te_eV_candidate"] == pytest.approx(temperature, rel=1e-10)
+    assert result["vstart"] == voltage[0]
+    assert result["vstop"] == voltage[-1]
+    assert result["valid"] == (temperature <= 10)
+    if temperature > 10:
+        assert "physical range" in result["reason"]
+
+
+def test_linear_region_rejects_short_straight_segment_without_an_efold():
+    voltage = np.linspace(0.0, 1.0, 31)
+    result = _fit_electron_temperature(
+        voltage, np.exp(voltage / 2), 3, 0, 2, 0,
+        _validated_config(_config(te_region_method="linear_region")),
+    )
+    assert result["r2"] == pytest.approx(1.0)
+    assert not result["valid"]
+    assert "no sufficiently linear" in result["reason"]

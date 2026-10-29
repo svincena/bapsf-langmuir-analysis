@@ -40,6 +40,8 @@ GEOMETRY_TITLES = {
 }
 
 CHOICE_LABELS = {
+    "bounded": "Widest threshold-bounded interval",
+    "linear_region": "Broad straight semilog region",
     "manual": "Manual entry",
     "bmotion": "From HDF5 (bmotion)",
     "hdf5": "From HDF5 (bapsflib)",

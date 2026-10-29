@@ -668,6 +668,14 @@ def _sections_for_geometry(geometry):
                     maximum=20,
                 ),
                 _p(
+                    "te_region_method",
+                    "Te fit-region method",
+                    "choice",
+                    "linear_region",
+                    "Fit the widest threshold-bounded interval, or search both limits for a broad straight semilog region without targeting a temperature.",
+                    choices=("bounded", "linear_region"),
+                ),
+                _p(
                     "te_min_points",
                     "Minimum Te fit points",
                     "int",

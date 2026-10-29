@@ -51,6 +51,12 @@ def test_gui_has_one_fully_populated_tab_per_geometry(
         assert tab.section_cards["Spatial geometry"].property(
             "layoutColumn"
         ) == tab.section_cards["Acquisition geometry"].property("layoutColumn")
+    assert xline_tab.values()["te_region_method"] == "linear_region"
+    xline_tab.set_values({"te_region_method": "bounded"})
+    assert xline_tab.values()["te_region_method"] == "bounded"
+    xline_tab.set_values({"te_region_method": "linear_region"})
+    assert xline_tab.values()["te_region_method"] == "linear_region"
+    assert "straight semilog" in xline_tab.editors["te_region_method"].currentText()
     assert xline_tab.values()["ies_method"] == "high_bias_median"
     xline_tab.set_values({"ies_method": "at_vp"})
     assert xline_tab.values()["ies_method"] == "at_vp"

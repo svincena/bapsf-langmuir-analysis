@@ -142,3 +142,13 @@ def test_xy_reader_plots_one_summary_per_ramp():
     for figure in figures:
         assert len(figure.axes) >= 6
         plt.close(figure)
+
+
+@pytest.mark.parametrize("geometry", ["x_line", "xy_plane"])
+def test_npz_reader_preserves_optional_te_region_method(tmp_path, geometry):
+    data = _minimal_schema(geometry)
+    data["te_region_method"] = np.array("linear_region")
+    path = tmp_path / "linear-region.npz"
+    np.savez(path, **data)
+    loaded = load_langmuir_results_npz(path)
+    assert loaded["te_region_method"].item() == "linear_region"

@@ -24,6 +24,9 @@ def build_iv_diagnostic_summary(result):
     if ies_method:
         summary.append(f"I_es method = {ies_method}")
 
+    if result.get("te_region_method"):
+        summary.append(f"Te region = {result["te_region_method"]}")
+
     r2 = result.get("te_fit_r2", np.nan)
     rel_uncertainty = result.get("te_fit_relative_uncertainty", np.nan)
     summary.extend(
@@ -76,6 +79,16 @@ def plot_iv_diagnostic_panels(result, axs):
     Ig = result["iv_current_grid"]
     dIdV = result["iv_didv_grid"]
     fit_mask = np.asarray(result["iv_fit_mask"], dtype=bool)
+    Vb = np.asarray(diagnostic_data["V_binned"])
+    Ib = np.asarray(diagnostic_data["I_binned"])
+    binned_fit_mask = np.asarray(
+        diagnostic_data.get(
+            "te_fit_mask",
+            (Vb >= result.get("te_fit_vstart", np.nan))
+            & (Vb <= result.get("te_fit_vstop", np.nan)),
+        ),
+        dtype=bool,
+    )
     vf = result.get("vf_V", np.nan)
     vp = result.get("vp_V", np.nan)
     vp_derivative = result.get("vp_derivative_V", np.nan)
@@ -120,15 +133,21 @@ def plot_iv_diagnostic_panels(result, axs):
             lw=1.5,
             label="log(Ie)",
         )
-        fit_good = log_good & fit_mask
+        binned_electron_current = Ib - ion_current
+        fit_good = binned_fit_mask & (binned_electron_current > 0)
         if np.any(fit_good):
             axs[2].plot(
-                Vg[fit_good],
-                np.log(electron_current[fit_good]),
+                Vb[fit_good],
+                np.log(binned_electron_current[fit_good]),
                 ".",
                 ms=5,
-                label="fit range",
+                label="measured Te fit bins",
             )
+            for bound, label in [
+                (Vb[fit_good][0], "Te lower limit"),
+                (Vb[fit_good][-1], "Te upper limit"),
+            ]:
+                axs[2].axvline(bound, color="tab:purple", ls=":", label=label)
         slope = result.get("te_fit_slope", np.nan)
         intercept = result.get("te_fit_intercept", np.nan)
         if np.any(fit_mask) and np.isfinite(slope) and np.isfinite(intercept):

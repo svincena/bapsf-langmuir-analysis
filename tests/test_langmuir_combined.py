@@ -415,6 +415,7 @@ def test_xline_pipeline_exports_repeated_ramp_shapes(
         sg_smooth_order=1,
         iv_npts=8,
         shot_analysis_mode=shot_mode,
+        te_region_method="linear_region",
         calculate_shape_factor=False,
         enable_vp_spike_rejection=False,
         enable_neighbor_smoothing=False,
@@ -439,6 +440,7 @@ def test_xline_pipeline_exports_repeated_ramp_shapes(
     monkeypatch.setattr(analysis, "read_channel_xline", fake_read_channel)
 
     def fake_analyze(task):
+        assert task[-1]["te_region_method"] == "linear_region"
         flat_index, idx, *_rest = task
         grid = np.linspace(-2.0, 2.0, values["iv_npts"])
         return {
@@ -486,6 +488,11 @@ def test_xline_pipeline_exports_repeated_ramp_shapes(
         assert group.attrs["bmotion_config_name"] == ""
         assert group.attrs["temporal_metadata_source"] == "manual"
         assert group.attrs["dt_s"] == 2.0e-6
+        assert group.attrs["te_region_method"] == "linear_region"
+
+    npz_path = source_path.with_name(f"{source_path.stem}_langmuir_xline.npz")
+    with np.load(npz_path, allow_pickle=False) as result:
+        assert result["te_region_method"].item() == "linear_region"
 
 
 def test_xy_postprocessing_and_calibration_do_not_mix_ramps():
@@ -594,6 +601,7 @@ def test_xy_pipeline_exports_repeated_ramp_shapes(
         sg_smooth_order=1,
         iv_npts=8,
         shot_analysis_mode=shot_mode,
+        te_region_method="linear_region",
         calculate_shape_factor=False,
         enable_vp_spike_rejection=False,
         enable_neighbor_smoothing=False,
@@ -623,6 +631,7 @@ def test_xy_pipeline_exports_repeated_ramp_shapes(
     monkeypatch.setattr(analysis, "read_channel_xy", fake_read_channel)
 
     def fake_analyze(task):
+        assert task[-1]["te_region_method"] == "linear_region"
         flat_index, idx, *_rest = task
         grid = np.linspace(-2.0, 2.0, values["iv_npts"])
         return {
@@ -671,6 +680,7 @@ def test_xy_pipeline_exports_repeated_ramp_shapes(
         assert group.attrs["bmotion_config_name"] == ""
         assert group.attrs["temporal_metadata_source"] == "manual"
         assert group.attrs["dt_s"] == 2.0e-6
+        assert group.attrs["te_region_method"] == "linear_region"
         assert group.attrs["y_acquisition_order"] == "descending"
 
     npz_path = source_path.with_name(f"{source_path.stem}_langmuir_xy.npz")
@@ -679,6 +689,7 @@ def test_xy_pipeline_exports_repeated_ramp_shapes(
         assert result["te_shot_eV"].shape == (2, 3, 2, 2)
         assert result["xy_ramp_shape_info"].tolist() == [2, 3, 2, 2, 4, 8]
         assert result["profile_axis_order"].item() == "y,x,ramp"
+        assert result["te_region_method"].item() == "linear_region"
         assert result["spatial_geometry_source"].item() == "manual"
         assert result["bmotion_config_name"].item() == ""
         assert result["temporal_metadata_source"].item() == "manual"

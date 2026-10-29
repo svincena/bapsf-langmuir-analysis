@@ -328,3 +328,35 @@ def test_preview_location_honors_xline_offset_and_rejects_invalid_indices():
     assert preview_shot_number("x_line", values, 2, 1) == 108
     with pytest.raises(ValueError, match="X index"):
         preview_shot_number("x_line", values, 5, 1)
+
+
+@pytest.mark.parametrize("geometry", SUPPORTED_GEOMETRIES)
+def test_te_region_method_is_selectable_and_persisted(geometry, tmp_path):
+    parameters = {item: default_parameters(item) for item in SUPPORTED_GEOMETRIES}
+    assert parameters[geometry]["te_region_method"] == "linear_region"
+    parameters[geometry]["te_region_method"] = "bounded"
+    path = tmp_path / "parameters.json"
+    save_last_parameters(parameters, geometry, path)
+    loaded, active, warning = load_last_parameters(path)
+    assert warning is None
+    assert active == geometry
+    assert loaded[geometry]["te_region_method"] == "bounded"
+    parameters[geometry]["te_region_method"] = "unknown"
+    with pytest.raises(ValueError, match="Te fit-region method"):
+        validate_parameters(geometry, parameters[geometry])
+
+
+def test_saved_parameters_without_te_region_method_use_new_default(tmp_path):
+    parameters = {geometry: default_parameters(geometry) for geometry in SUPPORTED_GEOMETRIES}
+    for values in parameters.values():
+        del values["te_region_method"]
+    path = tmp_path / "parameters.json"
+    path.write_text(json.dumps({
+        "version": 1, "active_geometry": "x_line", "parameters": parameters,
+    }))
+
+    loaded, _, warning = load_last_parameters(path)
+
+    assert warning is None
+    for values in loaded.values():
+        assert values["te_region_method"] == "linear_region"

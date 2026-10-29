@@ -125,6 +125,7 @@ vp_smoothing: Any = _RUNTIME_UNCONFIGURED
 vp_smoothing_width_V: Any = _RUNTIME_UNCONFIGURED
 vp_savgol_order: Any = _RUNTIME_UNCONFIGURED
 ies_method: Any = _RUNTIME_UNCONFIGURED
+te_region_method: Any = _RUNTIME_UNCONFIGURED
 te_min_points: Any = _RUNTIME_UNCONFIGURED
 te_margin_from_vp: Any = _RUNTIME_UNCONFIGURED
 te_current_floor_frac: Any = _RUNTIME_UNCONFIGURED
@@ -250,6 +251,7 @@ def configure_analysis(geometry, parameter_values):
         "vp_smoothing_width_V": values["vp_smoothing_width_V"],
         "vp_savgol_order": values["vp_savgol_order"],
         "ies_method": values["ies_method"],
+        "te_region_method": values["te_region_method"],
         "te_min_points": values["te_min_points"],
         "te_margin_from_vp": values["te_margin_from_vp"],
         "te_current_floor_frac": values["te_current_floor_frac"],
@@ -3042,6 +3044,7 @@ def run_xline_analysis():
             grp.attrs["analysis_processes_used"] = analysis_processes_used
             grp.attrs["analysis_start_method"] = "fork" if use_parallel_analysis else "serial"
 
+            grp.attrs["te_region_method"] = te_region_method
             grp.attrs["te_min_points"] = te_min_points
             grp.attrs["te_margin_from_vp_V"] = te_margin_from_vp
             grp.attrs["te_current_floor_frac"] = te_current_floor_frac
@@ -3241,6 +3244,7 @@ def run_xline_analysis():
             ),
             "trace_spatial_shape": np.array(spatial_shape, dtype=np.int64),
             "dt_s": np.array(dt),
+            "te_region_method": np.array(te_region_method),
             "te_min_r2": np.array(te_min_r2),
             "ion_min_snr": np.array(ion_min_snr),
             "ies_method": np.array(ies_method),
@@ -4248,6 +4252,7 @@ def run_xy_analysis():
             grp.attrs["analysis_processes_used"] = analysis_processes_used
             grp.attrs["analysis_start_method"] = "fork" if use_parallel_analysis else "serial"
 
+            grp.attrs["te_region_method"] = te_region_method
             grp.attrs["te_min_points"] = te_min_points
             grp.attrs["te_margin_from_vp_V"] = te_margin_from_vp
             grp.attrs["te_current_floor_frac"] = te_current_floor_frac
@@ -4464,6 +4469,7 @@ def run_xy_analysis():
             ),
             "trace_spatial_shape": np.array(spatial_shape, dtype=np.int64),
             "dt_s": np.array(dt),
+            "te_region_method": np.array(te_region_method),
             "te_min_r2": np.array(te_min_r2),
             "ion_min_snr": np.array(ion_min_snr),
             "ies_method": np.array(ies_method),

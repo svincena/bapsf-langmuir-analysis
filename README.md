@@ -142,6 +142,37 @@ curve and estimates:
 - Electron density, `n_e`, from the planar Maxwellian electron-saturation
   current relation using the configured probe area.
 
+The temperature regression fits `ln(I - I_ion)` against bias in volts;
+`Te` in eV is the reciprocal slope. Its lower bound requires both `V >= Vf`
+and electron current at least the larger of `te_current_floor_frac * Ies`
+and five times the ion-region residual noise. Its upper bound requires both
+`V <= Vp_derivative - te_margin_from_vp` and electron current no greater than
+`0.8 * Ies`. Every fitted bin must pass all of these limits. If threshold
+excursions split the eligible bins, the uninterrupted interval with the widest
+voltage coverage is used; the selector does not optimize for temperature or
+R². Too few bins or insufficient current span rejects the fit. Diagnostic
+semilog panels mark both voltage limits and the measured bins actually fitted.
+A high R² alone does not establish a single Maxwellian temperature: curvature,
+ion subtraction, and plasma-potential consistency also need inspection.
+
+**Te fit-region method** defaults to `linear_region` (**Broad straight semilog
+region** in the GUI). The alternative `bounded` method uses the widest
+threshold-passing interval described above. The default method
+searches both voltage limits on a bounded grid and refines around a broad
+passing candidate. It requires the configured minimum bin count and R²,
+at least one e-fold of fitted current, relative slope uncertainty no greater
+than 30%, quadratic semilog curvature no greater than 0.05, and absolute
+mean log residual no greater than 0.02 in each of up to eight consecutive
+blocks. The block check catches opposite curvatures that can cancel in a
+quadratic fit. Every candidate still obeys the voltage and current limits
+above. Among passing candidates, voltage coverage determines selection;
+neither the lowest temperature nor the highest R² wins. The configured Te
+range is applied after selection, so an out-of-range hot branch is rejected
+instead of replaced by a colder window. If no supported straight interval is
+found, the fit is rejected; the bounded estimate remains for diagnosis only.
+The selected method is recorded as `te_region_method` in HDF5 and NPZ output,
+and `te_fit_candidate_count` records the number of candidate intervals tested.
+
 #### Electron-saturation current methods
 
 The **Ies estimation method** control provides two definitions. The selected

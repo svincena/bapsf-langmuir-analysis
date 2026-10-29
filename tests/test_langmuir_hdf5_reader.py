@@ -94,3 +94,12 @@ def test_hdf5_inventory_lists_groups_and_dataset_shapes(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "xy_plane: /langmuir_xy" in output
     assert "te_eV: shape=(), dtype=float64" in output
+
+
+@pytest.mark.parametrize("geometry", ["x_line", "xy_plane"])
+def test_hdf5_reader_preserves_optional_te_region_method(tmp_path, geometry):
+    path = _add_result_group(tmp_path / "linear-region.hdf5", geometry)
+    with h5py.File(path, "a") as h5_file:
+        h5_file[HDF5_GROUP_BY_GEOMETRY[geometry]].attrs["te_region_method"] = "linear_region"
+    loaded = load_langmuir_results_hdf5(path, summary_only=True)
+    assert loaded["te_region_method"] == "linear_region"

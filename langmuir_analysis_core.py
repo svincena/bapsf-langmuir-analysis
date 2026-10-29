@@ -14,10 +14,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import astropy.units as u
-from astropy.constants import e, k_B, m_e
 import numpy as np
+from astropy.constants import e, k_B, m_e
 from scipy.signal import savgol_filter
-
 
 _MIN_CURVE_POINTS = 7
 _ION_WINDOW_FRACTION = 0.25
@@ -28,6 +27,7 @@ _TE_CURRENT_CEILING_FRACTION = 0.80
 _TE_MIN_LOG_SPAN = 1.0
 _TE_MAX_RELATIVE_SLOPE_UNCERTAINTY = 0.30
 _TE_MAX_CURVATURE_LOG = 0.05
+_TE_MAX_LINEAR_DEVIATION_LOG = 0.02
 _TE_CURVATURE_SIGNIFICANCE = 3.0
 _ELECTRON_SIGNAL_TO_NOISE = 5.0
 _MAX_REVERSE_SWEEP_FRACTION = 0.05
@@ -41,6 +41,7 @@ _DEFAULT_CONFIG = {
     "vp_smoothing_width_V": 2.5,
     "vp_savgol_order": 2,
     "ies_method": "high_bias_median",
+    "te_region_method": "linear_region",
     "te_min_points": 8,
     "te_margin_from_vp": 0.2,
     "te_current_floor_frac": 0.03,
@@ -199,6 +200,11 @@ def _validated_config(config):
     if smoothing not in {"none", "moving", "savgol"}:
         raise ValueError("vp_smoothing must be None, 'moving', or 'savgol'.")
     cfg["vp_smoothing"] = smoothing
+
+    region_method = str(cfg["te_region_method"]).lower()
+    if region_method not in {"bounded", "linear_region"}:
+        raise ValueError("te_region_method must be 'bounded' or 'linear_region'.")
+    cfg["te_region_method"] = region_method
 
     ies_method = str(cfg["ies_method"]).lower()
     if ies_method not in _IES_METHODS:
@@ -587,11 +593,128 @@ def _fit_electron_temperature(V, electron_current, I_es, vf, vp, ion_noise, cfg)
         & (electron_current <= signal_ceiling)
     )
     threshold_indices = np.flatnonzero(within_thresholds)
+    intervals = (
+        np.split(threshold_indices, np.flatnonzero(np.diff(threshold_indices) > 1) + 1)
+        if threshold_indices.size else []
+    )
     mask = np.zeros(V.shape, dtype=bool)
-    if threshold_indices.size:
-        mask[threshold_indices[0] : threshold_indices[-1] + 1] = True
-        mask &= eligible
+    if intervals:
+        selected = max(intervals, key=lambda ix: (V[ix[-1]] - V[ix[0]], ix.size))
+        mask[selected] = True
+    fit = _fit_semilog_region(V, electron_current, mask, cfg)
+    fit["candidate_count"] = int(np.any(mask))
+    if cfg["te_region_method"] == "bounded":
+        return fit
+    return _find_linear_te_region(V, electron_current, intervals, cfg, fit)
 
+
+def _find_linear_te_region(V, electron_current, intervals, cfg, fallback):
+    """Find broad semilog support, without ranking by temperature or peak R².
+
+    Sample both boundaries on a bounded grid, then refine around the broadest
+    passing interval. All candidates remain inside measured, threshold-passing
+    contiguous bins. One e-fold of current and the usual sample/uncertainty
+    requirements prevent short, accidentally straight windows from winning.
+    """
+    cache = {}
+    initial_indices = np.flatnonzero(fallback["fit_mask"])
+    if initial_indices.size:
+        cache[(int(initial_indices[0]), int(initial_indices[-1]) + 1)] = {
+            key: value for key, value in fallback.items() if key != "fit_mask"
+        }
+
+    def evaluate(start, stop):
+        key = (int(start), int(stop))
+        if key not in cache:
+            x = V[start:stop]
+            candidate = _fit_semilog_region(
+                x, electron_current[start:stop], np.ones(x.shape, dtype=bool), cfg
+            )
+            candidate.pop("fit_mask")
+            cache[key] = candidate
+        fit = cache[key]
+        # Temperature bounds are an acceptance check on the chosen fit, never
+        # a search criterion. A true hot branch must not be replaced by a colder
+        # window merely because the former exceeds te_max_eV.
+        linear = (
+            fit["passed_r2"]
+            and fit["log_span"] >= _TE_MIN_LOG_SPAN
+            and fit["relative_slope_uncertainty"] <= _TE_MAX_RELATIVE_SLOPE_UNCERTAINTY
+            and np.isfinite(fit["curvature_log"])
+            and fit["curvature_log"] <= _TE_MAX_CURVATURE_LOG
+            and fit["block_deviation_log"] <= _TE_MAX_LINEAR_DEVIATION_LOG
+        )
+        return fit, linear
+
+    def broadest(pairs):
+        ordered = sorted(
+            set(pairs), key=lambda pair: (-(V[pair[1] - 1] - V[pair[0]]), pair)
+        )
+        for start, stop in ordered:
+            if stop - start >= cfg["te_min_points"]:
+                fit, linear = evaluate(start, stop)
+                if linear:
+                    return start, stop, fit
+        return None
+
+    pairs = []
+    for interval in intervals:
+        if interval.size < cfg["te_min_points"]:
+            continue
+        edges = np.unique(
+            np.linspace(
+                interval[0], interval[-1] + 1, min(33, interval.size + 1), dtype=int
+            )
+        )
+        pairs.extend((int(a), int(b)) for a in edges[:-1] for b in edges[1:] if b > a)
+    best = broadest(pairs)
+    if best is None:
+        fallback["candidate_count"] = max(fallback["candidate_count"], len(cache))
+        fallback["valid"] = False
+        fallback["reason"] = (
+            "no sufficiently linear electron-retarding interval with resolved current "
+            "and at least one e-fold of current span"
+        )
+        return fallback
+
+    start, stop, fit = best
+    interval = next(ix for ix in intervals if ix[0] <= start and stop <= ix[-1] + 1)
+    step = max(1, int(np.ceil(interval.size / 32)))
+    while step >= 1:
+        starts = np.unique(
+            np.linspace(
+                max(interval[0], start - step),
+                min(stop - cfg["te_min_points"], start + step),
+                9, dtype=int,
+            )
+        )
+        stops = np.unique(
+            np.linspace(
+                max(start + cfg["te_min_points"], stop - step),
+                min(interval[-1] + 1, stop + step),
+                9, dtype=int,
+            )
+        )
+        width = V[stop - 1] - V[start]
+        refined = broadest(
+            (int(a), int(b)) for a in starts for b in stops
+            if b > a and V[b - 1] - V[a] >= width
+        )
+        if refined is not None:
+            start, stop, fit = refined
+        if step == 1:
+            break
+        step = max(1, step // 4)
+
+    fit = dict(fit)
+    fit["fit_mask"] = np.zeros(V.shape, dtype=bool)
+    fit["fit_mask"][start:stop] = True
+    fit["candidate_count"] = len(cache)
+    return fit
+
+
+def _fit_semilog_region(V, electron_current, mask, cfg):
+    """Regress one fixed set of measured bins and apply fit quality checks."""
     output = {
         "fit_mask": mask,
         "npts": int(np.count_nonzero(mask)),
@@ -602,6 +725,7 @@ def _fit_electron_temperature(V, electron_current, I_es, vf, vp, ion_noise, cfg)
         "relative_slope_uncertainty": np.nan,
         "log_span": np.nan,
         "curvature_log": np.nan,
+        "block_deviation_log": np.nan,
         "curvature_detected": False,
         "te_eV_candidate": np.nan,
         "passed_r2": False,
@@ -624,6 +748,11 @@ def _fit_electron_temperature(V, electron_current, I_es, vf, vp, ion_noise, cfg)
 
     fitted = slope * V_fit + intercept
     residual = log_current - fitted
+    # Opposite curvature at the two ends can cancel in a quadratic fit. Check
+    # signed residual means as well, so an S-shaped branch cannot look straight
+    # merely because its quadratic coefficient is small.
+    residual_blocks = np.array_split(residual, max(1, min(8, len(residual) // 3)))
+    block_deviation = max(abs(float(np.mean(block))) for block in residual_blocks)
     ss_res = float(np.sum(residual**2))
     ss_tot = float(np.sum((log_current - np.mean(log_current)) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else -np.inf
@@ -659,6 +788,7 @@ def _fit_electron_temperature(V, electron_current, I_es, vf, vp, ion_noise, cfg)
             "relative_slope_uncertainty": float(relative_uncertainty),
             "log_span": log_span,
             "curvature_log": curvature_log,
+            "block_deviation_log": block_deviation,
             "curvature_detected": curvature_detected,
             "te_eV_candidate": float(te_candidate),
             "passed_r2": bool(np.isfinite(r2) and r2 >= cfg["te_min_r2"]),
@@ -714,6 +844,7 @@ def _empty_result(trace_label):
         "vf_V": np.nan,
         "ies_A": np.nan,
         "ies_method": None,
+        "te_region_method": None,
         "iis_A": np.nan,
         "n_e_m3": np.nan,
         "ion_current_A": np.nan,
@@ -739,7 +870,7 @@ def _empty_result(trace_label):
         "te_fit_curvature_flagged": False,
         "te_fit_valid": False,
         # Compatibility aliases. I0 is now the measured median ion-region
-        # current, not the old artificial positivity shift; one fit is attempted.
+        # current, not the old artificial positivity shift.
         "te_fit_i0": np.nan,
         "te_fit_subtract_i0": True,
         "te_fit_passed_r2": False,
@@ -772,6 +903,7 @@ def analyze_iv_trace(
     cfg = _validated_config(config)
     result = _empty_result(trace_label)
     result["ies_method"] = cfg["ies_method"]
+    result["te_region_method"] = cfg["te_region_method"]
     bias, current = _validate_trace_arrays(bias_values, current_values)
 
     if not _sweep_direction_is_valid(bias, cfg["voltage_bin_width"]):
@@ -942,6 +1074,10 @@ def analyze_iv_trace(
         ion["noise_A"],
         cfg,
     )
+    if include_diagnostic_data:
+        # This mask indexes the measured bins actually used by the regression;
+        # the fixed-size display grid is only an interpolation of those bins.
+        result["diagnostic_data"]["te_fit_mask"] = te_fit["fit_mask"].copy()
     result["te_fit_npts"] = te_fit["npts"]
     result["te_fit_r2"] = te_fit["r2"]
     result["te_fit_rmse"] = te_fit["rmse_logI"]
@@ -954,7 +1090,7 @@ def analyze_iv_trace(
     result["te_fit_curvature_log"] = te_fit["curvature_log"]
     result["te_fit_curvature_flagged"] = te_fit["curvature_detected"]
     result["te_fit_passed_r2"] = te_fit["passed_r2"]
-    result["te_fit_candidate_count"] = 1 if te_fit["npts"] else 0
+    result["te_fit_candidate_count"] = te_fit["candidate_count"]
     result["te_fit_valid"] = te_fit["valid"]
     if te_fit["curvature_detected"]:
         result["model_notes"].append(
