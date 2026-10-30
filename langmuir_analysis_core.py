@@ -16,6 +16,7 @@ from collections.abc import Mapping
 import astropy.units as u
 import numpy as np
 from astropy.constants import e, k_B, m_e
+from scipy.optimize import minimize_scalar
 from scipy.signal import savgol_filter
 
 _MIN_CURVE_POINTS = 7
@@ -108,6 +109,108 @@ def _as_float_1d(values, name, unit=None):
     if array.ndim != 1:
         raise ValueError(f"{name} must be one-dimensional.")
     return array
+
+
+def fit_exponential_with_linear_background(voltage, current, *, temperature_bounds):
+    """Fit a specified retarding window to A exp((V-Vmax)/T) + C + D(V-Vmax).
+
+    This opt-in diagnostic separates an exponential component from a locally
+    smooth background. It does not identify that background as an electron
+    beam or establish that the exponential represents the bulk. Inspect
+    window stability and independent ion/current-zero information before
+    making that interpretation. The ordinary I-V solver is unaffected.
+
+    Inputs use volts and amperes; bounds and returned temperature use eV.
+    Uncertainty assumes independent, equal-variance current errors and is
+    conditional on the background model, not a physical systematic error.
+    """
+    voltage, current = _validate_trace_arrays(voltage, current)
+    lower, upper = map(float, temperature_bounds)
+    if not (np.isfinite(lower) and np.isfinite(upper) and 0 < lower < upper):
+        raise ValueError("temperature_bounds must be finite, positive and ordered.")
+    finite = np.isfinite(voltage) & np.isfinite(current)
+    voltage, current = voltage[finite], current[finite]
+    if voltage.size < _MIN_CURVE_POINTS or np.any(np.diff(voltage) <= 0):
+        raise ValueError(
+            "A background fit needs at least seven increasing voltage samples."
+        )
+
+    x = voltage - voltage[-1]
+    span = np.ptp(voltage)
+    scale = np.ptp(current)
+    if scale <= 0:
+        raise ValueError("A background fit needs a resolved current variation.")
+    normalized = current / scale
+
+    # Variable projection leaves only log(T) nonlinear; A, C and D are solved
+    # by linear least squares at each trial temperature. Scaling keeps the
+    # fit and covariance independent of density/current units.
+    def solve(log_temperature):
+        temperature = np.exp(log_temperature)
+        exponential = np.exp(x / temperature)
+        design = np.column_stack((exponential, np.ones(x.shape), x / span))
+        coefficients = np.linalg.lstsq(design, normalized, rcond=None)[0]
+        residual = design @ coefficients - normalized
+        return float(np.dot(residual, residual)), coefficients, residual, exponential
+
+    log_bounds = np.log([lower, upper])
+    grid = np.linspace(*log_bounds, 49)
+    scores = [solve(value)[0] for value in grid]
+    index = int(np.argmin(scores))
+    bracket = grid[max(0, index - 1)], grid[min(len(grid) - 1, index + 1)]
+    optimized = minimize_scalar(
+        lambda value: solve(value)[0],
+        bounds=bracket,
+        method="bounded",
+        options={"xatol": 1e-10},
+    )
+    temperature = float(np.exp(optimized.x))
+    ss_res, coefficients, residual, exponential = solve(optimized.x)
+    amplitude, offset, background_span = coefficients
+    jacobian = np.column_stack(
+        (
+            exponential,
+            np.ones(x.shape),
+            x / span,
+            -amplitude * exponential * x / temperature,
+        )
+    )
+    # Reject rank-deficient or poorly identified decompositions rather than
+    # reporting precise temperatures from a nearly straight short window.
+    _, singular, vh = np.linalg.svd(jacobian, full_matrices=False)
+    full_rank = singular[-1] > np.finfo(float).eps * max(jacobian.shape) * singular[0]
+    covariance = (
+        (vh.T / singular**2) @ vh * ss_res / (len(x) - 4)
+        if full_rank
+        else np.full((4, 4), np.nan)
+    )
+    relative_uncertainty = float(np.sqrt(covariance[3, 3]))
+    at_boundary = min(optimized.x - log_bounds[0], log_bounds[1] - optimized.x) < 0.01
+    valid = bool(
+        optimized.success
+        and full_rank
+        and amplitude > 0
+        and not at_boundary
+        and span / temperature >= _TE_MIN_LOG_SPAN
+        and np.isfinite(relative_uncertainty)
+        and relative_uncertainty <= _TE_MAX_RELATIVE_SLOPE_UNCERTAINTY
+    )
+    return {
+        "valid": valid,
+        "te_eV": temperature,
+        "te_relative_uncertainty": relative_uncertainty,
+        "amplitude_A": float(amplitude * scale),
+        "background_at_vmax_A": float(offset * scale),
+        "background_at_vmax_uncertainty_A": float(np.sqrt(covariance[1, 1]) * scale),
+        "background_slope_A_per_V": float(background_span * scale / span),
+        "rmse_A": float(np.sqrt(np.mean(residual**2)) * scale),
+        "r2": float(1 - ss_res / np.sum((normalized - np.mean(normalized)) ** 2)),
+        "vstart_V": float(voltage[0]),
+        "vstop_V": float(voltage[-1]),
+        "fitted_current_A": current + residual * scale,
+        "exponential_current_A": amplitude * exponential * scale,
+        "background_current_A": (offset + background_span * x / span) * scale,
+    }
 
 
 def _validate_trace_arrays(voltage, current):
@@ -1144,6 +1247,30 @@ def analyze_iv_trace(
         result["warnings"].append(te_fit["reason"])
         return result
 
+    if cfg["ies_method"] == "at_vp":
+        # Extrapolating the retarding fit to I(Vp) is nearly self-referential:
+        # an over-smoothed derivative knee can lower both Vp and Ies while
+        # still passing that consistency check. A flat high-bias branch gives
+        # independent evidence. Use it only as a check, preserving the chosen
+        # saturation-current definition and allowing sloped experimental data.
+        plateau, _ = _estimate_electron_saturation_current(
+            Vb, Ib, electron_current, vp_value, ion["noise_A"],
+            method="high_bias_median", enforce_flatness=True,
+        )
+        if (
+            plateau is not None
+            and abs(I_es - plateau["current_A"])
+            > _SATURATION_MAX_TREND_FRACTION * plateau["current_A"]
+        ):
+            message = (
+                "electron current at derivative Vp disagrees with a nearly flat "
+                "high-bias branch; inspect Vp smoothing and current-collection assumptions"
+            )
+            if cfg["enforce_ideal_model_checks"]:
+                result["warnings"].append(message)
+                return result
+            result["model_notes"].append(message)
+
     fitted_vp = result["vp_fit_V"]
     vp_tolerance = max(
         2 * cfg["voltage_bin_width"],
@@ -1172,3 +1299,154 @@ def analyze_iv_trace(
 
     result["ok"] = True
     return result
+
+
+def scan_bulk_temperature_windows(result, *, temperature_bounds, config=None):
+    """Scan nested windows ending below the independently measured knee.
+
+    Retain a candidate only when three neighboring window widths agree to 5%
+    and residuals are compatible with ion-region noise or a 0.5% model error.
+    No preferred bulk temperature is supplied or used to rank candidates.
+    These are empirical research checks, not universal beam-identification
+    criteria. A smooth background may also be an ion/current-zero error.
+    """
+    cfg = _validated_config(config)
+    data = result["diagnostic_data"]
+    if data is None or not np.isfinite(result["vp_derivative_V"]):
+        return [], None
+    voltage, current = data["V_binned"], data["I_binned"]
+    upper = result["vp_derivative_V"] - cfg["te_margin_from_vp"]
+    noise = result["ion_noise_A"]
+    scans = []
+    for width in (6, 9, 12, 15, 18, 24, 30, 45, 60):
+        if voltage[0] > upper - width + np.median(np.diff(voltage)):
+            continue
+        mask = (voltage >= upper - width) & (voltage <= upper)
+        if np.count_nonzero(mask) < cfg["te_min_points"]:
+            continue
+        fit = fit_exponential_with_linear_background(
+            voltage[mask],
+            current[mask],
+            temperature_bounds=temperature_bounds,
+        )
+        fit["width_V"] = width
+        fit["residual_pass"] = fit["rmse_A"] <= max(
+            1.5 * noise, 0.005 * fit["amplitude_A"]
+        )
+        # Small total-current errors can overwhelm the faint bulk component.
+        # Check its resolved log residuals separately, using the ordinary
+        # solver's 3% current floor, five-sigma support and 0.02 block limit.
+        model = fit["exponential_current_A"]
+        corrected = current[mask] - fit["background_current_A"]
+        support = model >= max(
+            _ELECTRON_SIGNAL_TO_NOISE * noise,
+            cfg["te_current_floor_frac"] * fit["amplitude_A"],
+        )
+        fit["bulk_log_pass"] = False
+        fit["bulk_signal_vstart_V"] = np.nan
+        fit["bulk_signal_vstop_V"] = np.nan
+        if np.count_nonzero(support) >= cfg["te_min_points"] and np.all(
+            corrected[support] > 0
+        ):
+            residual = np.log(corrected[support] / model[support])
+            blocks = np.array_split(
+                np.arange(residual.size), min(8, residual.size // 3)
+            )
+            fit["bulk_log_pass"] = bool(
+                all(
+                    abs(np.mean(residual[block]))
+                    <= _TE_MAX_LINEAR_DEVIATION_LOG
+                    + 3
+                    * noise
+                    * np.sqrt(np.sum(1 / model[support][block] ** 2))
+                    / len(block)
+                    for block in blocks
+                )
+                and np.ptp(voltage[mask][support]) / fit["te_eV"] >= 1
+            )
+            fit["bulk_signal_vstart_V"] = float(voltage[mask][support][0])
+            fit["bulk_signal_vstop_V"] = float(voltage[mask][support][-1])
+        fit["mask"] = mask
+        scans.append(fit)
+    stable = []
+    for index in range(2, len(scans)):
+        neighbors = scans[index - 2 : index + 1]
+        temperatures = [fit["te_eV"] for fit in neighbors]
+        if (
+            all(
+                fit["valid"] and fit["residual_pass"] and fit["bulk_log_pass"]
+                for fit in neighbors
+            )
+            and max(temperatures) / min(temperatures) < 1.05
+        ):
+            stable.append(scans[index])
+    return scans, max(stable, key=lambda fit: fit["width_V"]) if stable else None
+
+
+def screen_for_hot_tail(result, *, minimum_current_fraction, config=None):
+    """Return conservative evidence of excess electron current, not beam proof."""
+    cfg = _validated_config(config)
+    minimum_current_fraction = float(minimum_current_fraction)
+    if (
+        not np.isfinite(minimum_current_fraction)
+        or not 0 < minimum_current_fraction <= 1
+    ):
+        raise ValueError("minimum_current_fraction must be in (0, 1].")
+    inconclusive = {
+        "status": "inconclusive",
+        "reason": "A stable bulk/background decomposition was not resolved.",
+    }
+    if (
+        not all(
+            np.isfinite(result.get(key, np.nan))
+            for key in (
+                "ion_current_A",
+                "ion_current_uncertainty_A",
+                "ion_noise_A",
+                "ies_A",
+            )
+        )
+        or result["ies_A"] <= 0
+    ):
+        return {
+            **inconclusive,
+            "reason": "Calibrated ion current and a resolved electron branch are required.",
+        }
+    try:
+        _, bulk = scan_bulk_temperature_windows(
+            result,
+            temperature_bounds=(cfg["te_min_eV"], cfg["te_max_eV"]),
+            config=cfg,
+        )
+    except (ValueError, np.linalg.LinAlgError):
+        return inconclusive
+    if bulk is None:
+        return inconclusive
+    excess = bulk["background_at_vmax_A"] - result["ion_current_A"]
+    uncertainty = float(
+        np.hypot(
+            bulk["background_at_vmax_uncertainty_A"],
+            result["ion_current_uncertainty_A"],
+        )
+    )
+    fraction = float(excess / result["ies_A"])
+    possible = bool(
+        excess > _ELECTRON_SIGNAL_TO_NOISE * uncertainty
+        and fraction >= minimum_current_fraction
+    )
+    return {
+        "status": "possible" if possible else "not_resolved",
+        "reason": (
+            "Significant excess electron background is consistent with a hot tail or beam; ion-current errors can also cause it."
+            if possible
+            else "No significant excess electron background was resolved; a beam is not ruled out."
+        ),
+        "excess_current_A": float(excess),
+        "excess_current_uncertainty_A": uncertainty,
+        "excess_current_fraction": fraction,
+        "bulk_candidate_te_eV": bulk["te_eV"],
+        "background_vstart_V": bulk["vstart_V"],
+        "background_vstop_V": bulk["vstop_V"],
+        "bulk_signal_vstart_V": bulk["bulk_signal_vstart_V"],
+        "bulk_signal_vstop_V": bulk["bulk_signal_vstop_V"],
+    }

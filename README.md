@@ -127,6 +127,31 @@ physical solver independent of both scan geometry and interface code.
 
 ### Plasma-physics perspective
 
+Run `.venv/bin/python synthetic_langmuir_validation.py` for an independent
+synthetic injection/recovery study around Te = 3 eV and ne = 5e12 cm⁻³.
+It writes traces, fit tables, a figure, and a report to the ignored
+`synthetic_validation_output/` directory. The study documents the magnetic
+field, probe geometry, and collection assumptions, and varies temperature,
+density, noise, ion expansion, and electron collection. It also demonstrates
+the sensitivity of `at_vp` density to derivative smoothing. The solver flags
+when that method disagrees by more than 20% with a nearly flat high-bias
+branch; ideal-model mode rejects that inconsistency. This check preserves
+the selected current definition and does not determine an effective
+magnetized collection area.
+
+For a bulk-plus-beam study, run
+`.venv/bin/python synthetic_langmuir_beam_validation.py`. This adds a directed
+warm electron beam with independently specified density, drift energy, and
+thermal spread, then compares the ordinary fit with the explicitly invoked
+`fit_exponential_with_linear_background` diagnostic. The study scans retarding
+windows for a stable exponential component after separating a locally smooth
+background. Extra background current is evidence to investigate; it does not
+uniquely identify a beam. Reports and plots are saved under
+`synthetic_validation_output/beam/`. The ordinary plasma fits remain separate
+from the background-separated bulk-temperature candidates.
+Hot-tail screening remains a standalone research diagnostic. No GUI screening
+controls or automatic bulk-temperature correction are enabled.
+
 For each swept probe trace, the analysis constructs a monotonic current–voltage
 curve and estimates:
 

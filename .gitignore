@@ -9,3 +9,6 @@ __pycache__/
 
 .venv/
 *.code-workspace
+
+# Reproducible synthetic traces, fit tables, and diagnostic figures
+/synthetic_validation_output/
