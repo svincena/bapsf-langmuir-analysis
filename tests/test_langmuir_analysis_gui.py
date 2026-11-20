@@ -96,6 +96,111 @@ def test_gui_has_one_fully_populated_tab_per_geometry(
     window.close()
 
 
+@pytest.mark.parametrize("active_geometry", SUPPORTED_GEOMETRIES)
+@pytest.mark.parametrize("inactive_spatial_source", ["manual", "bmotion"])
+def test_save_parameters_uses_active_file_when_other_tab_file_was_deleted(
+    application, monkeypatch, tmp_path, active_geometry, inactive_spatial_source
+):
+    from pathlib import Path
+
+    parameter_path = tmp_path / "parameters.json"
+    monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", parameter_path)
+    window = LangmuirAnalysisWindow()
+    inspected_files = []
+    errors = []
+
+    def configurations(filename, *_args):
+        inspected_files.append(filename)
+        if not Path(filename).is_file():
+            raise ValueError(f"Experiment HDF5 file does not exist: {filename}")
+        return ("Only config",)
+
+    monkeypatch.setattr(gui, "discover_bmotion_configurations", configurations)
+    monkeypatch.setattr(gui, "discover_sis_configurations", configurations)
+    monkeypatch.setattr(
+        gui, "read_bmotion_geometry",
+        lambda *_args: {
+            "nx": 3, "x_min_cm": -1.0, "x_max_cm": 1.0,
+            "ny": 2, "y_min_cm": -1.0, "y_max_cm": 1.0,
+            "xy_y_acquisition_order": "ascending", "nshots": 2, "data_offset": 0,
+        },
+    )
+    monkeypatch.setattr(
+        gui, "read_digitizer_temporal_metadata",
+        lambda *_args, **_kwargs: {"nt_full": 30000, "dt_s": 2e-8},
+    )
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox, "critical",
+        lambda _parent, _title, message: errors.append(message),
+    )
+    inactive_geometry = next(
+        geometry for geometry in SUPPORTED_GEOMETRIES if geometry != active_geometry
+    )
+    current_file = tmp_path / "current.hdf5"
+    deleted_file = tmp_path / "previous.hdf5"
+    current_file.touch()
+    deleted_file.touch()
+    active_tab = window.parameter_tabs[active_geometry]
+    inactive_tab = window.parameter_tabs[inactive_geometry]
+    try:
+        active_tab.set_values(
+            {"filename": str(current_file), "spatial_geometry_source": "bmotion"}
+        )
+        inactive_tab.set_values(
+            {
+                "filename": str(deleted_file),
+                "spatial_geometry_source": inactive_spatial_source,
+            }
+        )
+        inactive_values = inactive_tab.values()
+        deleted_file.unlink()
+        window.tabs.setCurrentIndex(SUPPORTED_GEOMETRIES.index(active_geometry))
+        # Saving must refresh the active file's controlled fields, even if the
+        # cached values have gone stale, without inspecting the inactive file.
+        active_tab.editors["nx"].set_value(7)
+        active_tab.editors["nt_full"].set_value(40000)
+        inspected_files.clear()
+
+        assert window.save_parameters() is True
+        saved, saved_geometry, warning = gui.load_last_parameters(parameter_path)
+        assert warning is None
+        assert saved_geometry == active_geometry
+        assert saved[active_geometry]["filename"] == str(current_file)
+        assert saved[active_geometry]["nx"] == 3
+        assert saved[active_geometry]["nt_full"] == 30000
+        assert saved[inactive_geometry] == inactive_values
+        assert inspected_files == [str(current_file), str(current_file)]
+        assert errors == []
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("active_geometry", SUPPORTED_GEOMETRIES)
+def test_save_parameters_still_reports_missing_active_file(
+    application, monkeypatch, tmp_path, active_geometry
+):
+    parameter_path = tmp_path / "parameters.json"
+    monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", parameter_path)
+    window = LangmuirAnalysisWindow()
+    errors = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox, "critical",
+        lambda _parent, _title, message: errors.append(message),
+    )
+    missing_file = tmp_path / "missing.hdf5"
+    try:
+        window.tabs.setCurrentIndex(SUPPORTED_GEOMETRIES.index(active_geometry))
+        window.parameter_tabs[active_geometry].set_values(
+            {"filename": str(missing_file), "spatial_geometry_source": "manual"}
+        )
+        assert window.save_parameters() is False
+        assert len(errors) == 1
+        assert str(missing_file) in errors[0]
+        assert not parameter_path.exists()
+    finally:
+        window.close()
+
+
 def test_run_description_button_uses_current_tab_file_and_read_only_dialog(
     application, monkeypatch, tmp_path
 ):

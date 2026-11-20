@@ -2071,24 +2071,22 @@ class LangmuirAnalysisWindow(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def save_parameters(self):
         try:
-            metadata_adjustments = []
-            for geometry, tab in self.parameter_tabs.items():
-                adjustments = tab.reconcile_bmotion_geometry()
-                if tab._temporal_source_is_hdf5():
-                    adjustments += tab.reconcile_sis_acquisition_metadata()
-                metadata_adjustments.extend(
-                    (geometry, adjustment)
-                    for adjustment in adjustments
-                )
+            geometry = self._active_geometry()
+            tab = self.parameter_tabs[geometry]
+            # Each tab owns a separate source file. Preserve inactive settings
+            # as cached state; an old or deleted source must not block this tab.
+            metadata_adjustments = tab.reconcile_bmotion_geometry()
+            if tab._temporal_source_is_hdf5():
+                metadata_adjustments += tab.reconcile_sis_acquisition_metadata()
             save_last_parameters(
-                self._all_values(), self._active_geometry(), LAST_PARAMETERS_PATH
+                self._all_values(), geometry, LAST_PARAMETERS_PATH
             )
         except (TypeError, ValueError, OSError) as error:
             QtWidgets.QMessageBox.critical(
                 self, "Could not save parameters", str(error)
             )
             return False
-        for geometry, adjustment in metadata_adjustments:
+        for adjustment in metadata_adjustments:
             self._append_console(
                 f"Adjusted {GEOMETRY_TITLES[geometry]} {adjustment}"
             )
