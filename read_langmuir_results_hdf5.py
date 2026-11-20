@@ -7,6 +7,10 @@ Files are always opened read-only.
 
 Examples
 --------
+Select an experiment file, then choose a saved summary or the full analysis GUI::
+
+    python read_langmuir_results_hdf5.py
+
 Print a compact summary::
 
     python read_langmuir_results_hdf5.py experiment.hdf5
@@ -27,7 +31,6 @@ import h5py
 import numpy as np
 
 from read_langmuir_results_npz import plot_summary, print_summary
-
 
 HDF5_GROUP_BY_GEOMETRY = {
     "x_line": "langmuir_xline",
@@ -281,6 +284,71 @@ def print_hdf5_inventory(path):
                     print(f"  {name}: shape={item.shape}, dtype={item.dtype}")
 
 
+def _reader_application():
+    """Initialize Qt lazily for the interactive reader workflow."""
+    # Initialize dateutil before Qt's feature-import hook, as in the main GUI,
+    # so later bapsflib imports in the same process remain safe.
+    import dateutil.rrule
+    import dateutil.tz  # noqa: F401
+    from PySide6 import QtWidgets
+
+    application = QtWidgets.QApplication.instance()
+    if application is None:
+        application = QtWidgets.QApplication([])
+    return application
+
+
+def _select_hdf5_file():
+    """Select an existing HDF5 file, returning an empty string on cancellation."""
+    _application = _reader_application()
+    from PySide6 import QtWidgets
+
+    path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+        None,
+        "Select Langmuir results HDF5 file",
+        "",
+        "HDF5 files (*.hdf5 *.h5 *.hdf);;All files (*)",
+    )
+    return path
+
+
+def _choose_reader_action(path):
+    """Offer saved results or the full analysis editor for the selected file."""
+    _application = _reader_application()
+    from PySide6 import QtWidgets
+
+    dialog = QtWidgets.QMessageBox()
+    dialog.setWindowTitle("Langmuir results")
+    dialog.setText(f"Selected file: {Path(path).name}")
+    dialog.setInformativeText(
+        "Show the saved results summary or open the full analysis GUI?"
+    )
+    summary = dialog.addButton(
+        "Show Summary", QtWidgets.QMessageBox.ButtonRole.AcceptRole
+    )
+    analysis = dialog.addButton(
+        "Open Full Analysis", QtWidgets.QMessageBox.ButtonRole.ActionRole
+    )
+    dialog.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+    dialog.setDefaultButton(summary)
+    dialog.exec()
+    if dialog.clickedButton() is analysis:
+        return "analysis"
+    if dialog.clickedButton() is summary:
+        return "summary"
+    return None
+
+
+def _launch_analysis_gui(path):
+    from langmuir_analysis_gui import launch_gui
+
+    # The picker already created an application, so launch_gui leaves event-loop
+    # ownership to this standalone reader. Keep the window alive while it runs.
+    application = _reader_application()
+    _window = launch_gui(source_filename=path)
+    return application.exec()
+
+
 def main(argv=None):
     """Run the read-only HDF5 result-reader command line interface."""
     parser = argparse.ArgumentParser(
@@ -296,7 +364,14 @@ def main(argv=None):
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("hdf5_path", help="Path to an experiment HDF5 file.")
+    parser.add_argument(
+        "hdf5_path",
+        nargs="?",
+        help=(
+            "Path to an experiment HDF5 file; if omitted, select a file and "
+            "choose a saved summary or the full analysis GUI."
+        ),
+    )
     parser.add_argument(
         "--geometry",
         choices=sorted(SUPPORTED_LANGMUIR_GEOMETRIES),
@@ -313,6 +388,16 @@ def main(argv=None):
         help="List result groups and dataset shapes without loading arrays.",
     )
     args = parser.parse_args(argv)
+
+    if args.hdf5_path is None:
+        args.hdf5_path = _select_hdf5_file()
+        if not args.hdf5_path:
+            return None
+        action = _choose_reader_action(args.hdf5_path)
+        if action is None:
+            return None
+        if action == "analysis":
+            return _launch_analysis_gui(args.hdf5_path)
 
     if args.list_fields:
         print_hdf5_inventory(args.hdf5_path)

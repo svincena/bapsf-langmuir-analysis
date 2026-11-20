@@ -696,3 +696,17 @@ def test_launch_gui_keeps_main_window_hidden_for_two_seconds(
     assert window._startup_splash is None
     assert window._startup_timer is None
     window.close()
+
+
+def test_launch_gui_prefills_selected_source_file(application, monkeypatch, tmp_path):
+    monkeypatch.setattr(gui, "LAST_PARAMETERS_PATH", tmp_path / "last_parameters.json")
+    source = tmp_path / "selected.hdf5"
+    window = gui.launch_gui(source_filename=source)
+
+    assert all(
+        tab.values()["filename"] == str(source)
+        for tab in window.parameter_tabs.values()
+    )
+    window._startup_timer.stop()
+    window._startup_timer.timeout.emit()
+    window.close()

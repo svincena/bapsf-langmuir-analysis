@@ -2222,7 +2222,7 @@ class LangmuirAnalysisWindow(QtWidgets.QMainWindow):
         event.accept()
 
 
-def launch_gui(*, splash_duration_ms=SPLASH_DURATION_MS):
+def launch_gui(*, splash_duration_ms=SPLASH_DURATION_MS, source_filename=None):
     """Create the desktop application and reveal it after the startup splash."""
     application = QtWidgets.QApplication.instance()
     owns_application = application is None
@@ -2240,6 +2240,9 @@ def launch_gui(*, splash_duration_ms=SPLASH_DURATION_MS):
     application.processEvents(QtCore.QEventLoop.ExcludeUserInputEvents)
 
     window = LangmuirAnalysisWindow()
+    if source_filename is not None:
+        for tab in window.parameter_tabs.values():
+            tab.set_values({"filename": str(source_filename)})
     window._startup_splash = splash
 
     def reveal_main_window():
