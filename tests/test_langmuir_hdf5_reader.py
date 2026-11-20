@@ -17,6 +17,7 @@ def _add_result_group(path, geometry, omitted_dataset=None):
         group = h5_file.create_group(HDF5_GROUP_BY_GEOMETRY[geometry])
         group.attrs["geometry"] = geometry
         group.attrs["source_file"] = "synthetic.hdf5"
+        group.attrs["analysis_date"] = "2026-11-20"
         group.attrs["te_min_r2"] = 0.95
         for name in EXPECTED_HDF5_DATASETS_BY_GEOMETRY[geometry]:
             if name != omitted_dataset:
@@ -34,6 +35,7 @@ def test_hdf5_reader_detects_and_loads_each_geometry(tmp_path, geometry):
 
     assert data["geometry"].item() == geometry
     assert data["hdf5_group"].item() == f"/{HDF5_GROUP_BY_GEOMETRY[geometry]}"
+    assert data["analysis_date"] == "2026-11-20"
     assert "te_eV" in data
     assert "iv_voltage_grid_shot_V" not in data
 

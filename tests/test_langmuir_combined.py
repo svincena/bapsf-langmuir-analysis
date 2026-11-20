@@ -1,3 +1,5 @@
+from datetime import date
+
 import astropy.units as u
 import h5py
 import numpy as np
@@ -376,10 +378,14 @@ def test_multi_ramp_xline_summary_rendering(display_mode):
         te_std=np.ones_like(values) * u.eV,
         analysis_ok=np.ones_like(values, dtype=np.uint8),
         shape_factor=np.array([0.1, 0.2]) * u.m,
+        source_file="/experiment/scan.hdf5",
+        analysis_date="2026-11-20",
     )
 
     figure.canvas.draw()
     assert len(figure.axes) >= 6
+    assert figure._suptitle.get_text().splitlines()[1] == "scan.hdf5"
+    assert "Analyzed 2026-11-20" in figure._suptitle.get_text()
     plt.close(figure)
 
 
@@ -489,10 +495,13 @@ def test_xline_pipeline_exports_repeated_ramp_shapes(
         assert group.attrs["temporal_metadata_source"] == "manual"
         assert group.attrs["dt_s"] == 2.0e-6
         assert group.attrs["te_region_method"] == "linear_region"
+        analysis_date = group.attrs["analysis_date"]
+        assert date.fromisoformat(analysis_date).isoformat() == analysis_date
 
     npz_path = source_path.with_name(f"{source_path.stem}_langmuir_xline.npz")
     with np.load(npz_path, allow_pickle=False) as result:
         assert result["te_region_method"].item() == "linear_region"
+        assert result["analysis_date"].item() == analysis_date
 
 
 def test_xy_postprocessing_and_calibration_do_not_mix_ramps():
@@ -682,6 +691,8 @@ def test_xy_pipeline_exports_repeated_ramp_shapes(
         assert group.attrs["dt_s"] == 2.0e-6
         assert group.attrs["te_region_method"] == "linear_region"
         assert group.attrs["y_acquisition_order"] == "descending"
+        analysis_date = group.attrs["analysis_date"]
+        assert date.fromisoformat(analysis_date).isoformat() == analysis_date
 
     npz_path = source_path.with_name(f"{source_path.stem}_langmuir_xy.npz")
     with np.load(npz_path, allow_pickle=False) as result:
@@ -694,6 +705,7 @@ def test_xy_pipeline_exports_repeated_ramp_shapes(
         assert result["bmotion_config_name"].item() == ""
         assert result["temporal_metadata_source"].item() == "manual"
         assert result["y_acquisition_order"].item() == "descending"
+        assert result["analysis_date"].item() == analysis_date
 
 
 def test_select_xline_from_xy_map_uses_nearest_y_coordinate():
@@ -792,12 +804,13 @@ def test_xy_summary_annotations_stay_in_narrow_side_columns(empty):
         plt.close(figure)
 
 
-def test_xy_summary_title_fits_saved_figure_with_long_status():
+def test_xy_summary_title_fits_with_source_filename_date_and_long_status():
     import matplotlib.pyplot as plt
 
-    x_mesh, y_mesh = np.meshgrid([-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0])
+    x_mesh, y_mesh = np.meshgrid([-10.0, 0.0, 10.0], [-7.0, 0.0, 7.0])
     values = np.ones((3, 3))
-    title = "Experiment 2026-10-01 run 1234 - Langmuir XY-plane Summary"
+    title = "Langmuir XY-Plane Summary"
+    filename = "Experiment 2026-10-01 run 1234 with repeated XY scans and a long set of ramps.hdf5"
     status = (
         "Reported 120/140 finite per-shot fits; accepted 95/140 per-shot fits; "
         "top rejection (45): insufficient points in the selected electron "
@@ -806,6 +819,7 @@ def test_xy_summary_title_fits_saved_figure_with_long_status():
     figure = analysis.render_xy_summary_plot(
         x_mesh, y_mesh, values * u.eV, values * u.V, values * u.V,
         values * u.A, values * u.A, analysis_status=status, title=title,
+        source_file=f"/experiment/data/{filename}", analysis_date="2026-11-20",
     )
     try:
         figure.canvas.draw()
@@ -814,6 +828,15 @@ def test_xy_summary_title_fits_saved_figure_with_long_status():
         width, height = figure.canvas.get_width_height()
         assert 0 <= bounds.x0 < bounds.x1 <= width
         assert 0 <= bounds.y0 < bounds.y1 <= height
-        assert " ".join(figure._suptitle.get_text().split()) == f"{title} {status}"
+        panel_bounds = [ax.get_tightbbox(renderer) for ax in figure.axes]
+        assert bounds.y0 > max(panel.y1 for panel in panel_bounds if panel is not None)
+        for column in range(2):
+            top, middle, bottom = panel_bounds[3 * column::6]
+            assert top.y0 > middle.y1
+            assert middle.y0 > bottom.y1
+            assert bottom.y0 >= 0
+        assert " ".join(figure._suptitle.get_text().split()) == (
+            f"{title} | Analyzed 2026-11-20 {filename} {status}"
+        )
     finally:
         plt.close(figure)

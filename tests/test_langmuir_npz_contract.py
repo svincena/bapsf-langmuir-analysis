@@ -49,11 +49,12 @@ def test_combined_validator_detects_both_geometries(geometry):
 @pytest.mark.parametrize("geometry", ["x_line", "xy_plane"])
 def test_combined_loader_round_trips_both_geometries(tmp_path, geometry):
     path = tmp_path / f"langmuir_{geometry}.npz"
-    np.savez(path, **_minimal_schema(geometry))
+    np.savez(path, **_minimal_schema(geometry), analysis_date=np.array("2026-11-20"))
 
     loaded = load_langmuir_results_npz(path)
 
     assert get_langmuir_result_geometry(loaded) == geometry
+    assert loaded["analysis_date"].item() == "2026-11-20"
 
 
 def test_combined_validator_rejects_unknown_geometry():
@@ -112,6 +113,7 @@ def test_xline_reader_plots_multi_ramp_results(display_mode):
     figure = combined_reader.plot_xline_summary(data)
 
     assert len(figure.axes) >= 6
+    assert figure._suptitle.get_text().splitlines()[1] == "synthetic.hdf5"
     plt.close(figure)
 
 
@@ -124,7 +126,8 @@ def test_xy_reader_plots_one_summary_per_ramp():
     values = np.arange(12, dtype=float).reshape(2, 3, 2) + 1.0
     data = {
         "geometry": np.array("xy_plane"),
-        "source_file": np.array("synthetic.hdf5"),
+        "source_file": np.array("/experiment/synthetic.hdf5"),
+        "analysis_date": np.array("2026-11-20"),
         "x_cm": x,
         "y_cm": y,
         "X_cm": x_mesh,
@@ -139,8 +142,12 @@ def test_xy_reader_plots_one_summary_per_ramp():
     figures = combined_reader.plot_xy_summary(data)
 
     assert len(figures) == 2
-    for figure in figures:
+    for ramp_number, figure in enumerate(figures, start=1):
         assert len(figure.axes) >= 6
+        title = figure._suptitle.get_text()
+        assert title.splitlines()[1] == "synthetic.hdf5"
+        assert f"Ramp {ramp_number}" in title
+        assert "Analyzed 2026-11-20" in title
         plt.close(figure)
 
 

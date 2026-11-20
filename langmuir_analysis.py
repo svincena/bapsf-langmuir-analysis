@@ -22,9 +22,9 @@ import argparse
 import io
 import multiprocessing as mp
 import os
-import textwrap
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,7 @@ from langmuir_analysis_metadata import (
 from langmuir_diagnostics import (
     render_iv_diagnostic_plot as render_analysis_iv_diagnostic_plot,
 )
+from langmuir_diagnostics import set_summary_plot_title
 
 
 # %% Runtime configuration
@@ -357,17 +358,6 @@ def sanitize_filename_component(text):
         elif char.isspace():
             safe_chars.append("_")
     return "".join(safe_chars).strip("._") or "plot"
-
-
-def _summary_title(title, analysis_status=None):
-    """Wrap long run names and fit status within the summary figure width."""
-    parts = [title]
-    if analysis_status is not None:
-        parts.append(analysis_status)
-    return "\n".join(
-        textwrap.fill(part, width=70, break_long_words=True)
-        for part in parts
-    )
 
 
 def save_diagnostic_figure(fig, output_dir, filename_stem, dpi=600):
@@ -1159,6 +1149,9 @@ def render_xline_summary_plot(
     analysis_status=None,
     shape_factor=None,
     title="Langmuir X-Line Summary",
+    *,
+    source_file=None,
+    analysis_date=None,
 ):
     fig, axs = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
 
@@ -1327,8 +1320,10 @@ def render_xline_summary_plot(
     else:
         axs[2, 1].axis("off")
 
-    summary_title = _summary_title(title, analysis_status)
-    fig.suptitle(summary_title, fontsize=16)
+    set_summary_plot_title(
+        fig, title, source_file=source_file, analysis_date=analysis_date,
+        analysis_status=analysis_status,
+    )
     return fig
 
 
@@ -1353,6 +1348,8 @@ def render_xline_multi_ramp_summary_plot(
     analysis_ok=None,
     analysis_status=None,
     shape_factor=None,
+    source_file=None,
+    analysis_date=None,
 ):
     """Render multi-ramp x-line results as profiles or x/time maps."""
     x = np.asarray(x, dtype=float)
@@ -1459,9 +1456,9 @@ def render_xline_multi_ramp_summary_plot(
                 va="top",
                 bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"},
             )
-    fig.suptitle(
-        _summary_title("Langmuir X-Line Multi-Ramp Summary", analysis_status),
-        fontsize=16,
+    set_summary_plot_title(
+        fig, "Langmuir X-Line Multi-Ramp Summary", source_file=source_file,
+        analysis_date=analysis_date, analysis_status=analysis_status,
     )
     return fig
 
@@ -1884,8 +1881,13 @@ def render_xy_summary_plot(
     shape_factor=None,
     interferometer_profile_y_cm=None,
     title="Langmuir XY-Plane Summary",
+    *,
+    source_file=None,
+    analysis_date=None,
 ):
     fig = plt.figure(figsize=(14, 12), constrained_layout=True)
+    # The nested map grids need extra vertical padding between axis labels and titles.
+    fig.get_layout_engine().set(h_pad=0.12)
     panels = fig.add_gridspec(3, 2)
     axs = np.empty((3, 2), dtype=object)
     colorbar_axes, note_axes = {}, {}
@@ -1998,8 +2000,10 @@ def render_xy_summary_plot(
                 borderaxespad=0, handlelength=1, handletextpad=0.4, labelspacing=1,
             )
 
-    summary_title = _summary_title(title, analysis_status)
-    fig.suptitle(summary_title, fontsize=16)
+    set_summary_plot_title(
+        fig, title, source_file=source_file, analysis_date=analysis_date,
+        analysis_status=analysis_status,
+    )
     return fig
 
 
@@ -2132,6 +2136,7 @@ def render_xy_all_iv_curves_plot(x_coord, y_coord, iv_voltage_grid, iv_current_g
 # %% Geometry-specific pipeline runners
 def run_xline_analysis():
     """Run the configured x-line acquisition and analysis pipeline."""
+    analysis_date = datetime.now(UTC).astimezone().date().isoformat()
     # %%
     # Read data
 
@@ -2759,6 +2764,8 @@ def run_xline_analysis():
             "analysis_ok": analysis_ok,
             "analysis_status": analysis_status,
             "shape_factor": shape_factor,
+            "source_file": filename,
+            "analysis_date": analysis_date,
         }
         if nramps > 1:
             return render_xline_multi_ramp_summary_plot(
@@ -2983,6 +2990,7 @@ def run_xline_analysis():
                 )
 
             grp.attrs["source_file"] = str(filename)
+            grp.attrs["analysis_date"] = analysis_date
             grp.attrs["geometry"] = "x_line"
             grp.attrs["spatial_geometry_source"] = spatial_geometry_source
             grp.attrs["bmotion_config_name"] = bmotion_config_name
@@ -3111,6 +3119,7 @@ def run_xline_analysis():
         xline_y = np.zeros_like(x)
         xline_npz_data = {
             "source_file": np.array(str(filename)),
+            "analysis_date": np.array(analysis_date),
             "geometry": np.array("x_line"),
             "spatial_geometry_source": np.array(spatial_geometry_source),
             "bmotion_config_name": np.array(bmotion_config_name),
@@ -3287,6 +3296,7 @@ def run_xline_analysis():
 
 def run_xy_analysis():
     """Run the configured xy-plane acquisition and analysis pipeline."""
+    analysis_date = datetime.now(UTC).astimezone().date().isoformat()
     # %%
     # Read data
 
@@ -3942,7 +3952,8 @@ def run_xy_analysis():
             analysis_status=analysis_status,
             shape_factor=shape_factor,
             interferometer_profile_y_cm=interferometer_profile_y_selected_cm,
-            title=f"{Path(filename).stem} - Langmuir XY-plane Summary",
+            source_file=filename,
+            analysis_date=analysis_date,
         )
 
     if plot_results:
@@ -4180,6 +4191,7 @@ def run_xy_analysis():
                 )
 
             grp.attrs["source_file"] = str(filename)
+            grp.attrs["analysis_date"] = analysis_date
             grp.attrs["geometry"] = "xy_plane"
             grp.attrs["spatial_geometry_source"] = spatial_geometry_source
             grp.attrs["bmotion_config_name"] = bmotion_config_name
@@ -4312,6 +4324,7 @@ def run_xy_analysis():
 
         xy_npz_data = {
             "source_file": np.array(str(filename)),
+            "analysis_date": np.array(analysis_date),
             "geometry": np.array("xy_plane"),
             "spatial_geometry_source": np.array(spatial_geometry_source),
             "bmotion_config_name": np.array(bmotion_config_name),

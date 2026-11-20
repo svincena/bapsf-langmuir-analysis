@@ -1,6 +1,27 @@
 """Plotting helpers for results produced by :mod:`langmuir_analysis_core`."""
 
+import textwrap
+from pathlib import Path
+
 import numpy as np
+
+
+def set_summary_plot_title(
+    fig, title, *, source_file=None, analysis_date=None, analysis_status=None
+):
+    """Add a compact header that constrained layout keeps above the panels."""
+    if analysis_date:
+        title = f"{title}  |  Analyzed {analysis_date}"
+    lines = [title, Path(source_file).name if source_file else "", analysis_status]
+    # Wrap before layout so the figure reserves space for every header line.
+    fig.suptitle(
+        "\n".join(
+            textwrap.fill(line, width=78, break_on_hyphens=False)
+            for line in lines if line
+        ),
+        fontsize=12,
+        parse_math=False,
+    )
 
 
 def build_iv_diagnostic_summary(result):

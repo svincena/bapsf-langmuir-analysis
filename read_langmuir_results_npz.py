@@ -19,10 +19,10 @@ Show the matching one- or two-dimensional summary plot::
 
 import argparse
 from collections.abc import Mapping
-from pathlib import Path
 
 import numpy as np
 
+from langmuir_diagnostics import set_summary_plot_title
 
 SUPPORTED_LANGMUIR_GEOMETRIES = {"x_line", "xy_plane"}
 
@@ -107,6 +107,15 @@ def _scalar_text(value):
     if array.shape == ():
         return str(array.item())
     return str(array)
+
+
+def _set_result_plot_title(fig, title, data):
+    set_summary_plot_title(
+        fig,
+        title,
+        source_file=_scalar_text(data.get("source_file", "")),
+        analysis_date=_scalar_text(data.get("analysis_date", "")),
+    )
 
 
 def get_langmuir_result_geometry(data):
@@ -441,9 +450,7 @@ def plot_xline_summary(data):
         bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"},
     )
 
-    source_file = _scalar_text(data.get("source_file", "")).strip()
-    title = Path(source_file).name if source_file else "Langmuir X-Line NPZ Results"
-    fig.suptitle(title)
+    _set_result_plot_title(fig, "Langmuir X-Line Results", data)
     return fig
 
 
@@ -524,13 +531,11 @@ def plot_xline_multi_ramp_summary(data):
         axis.set_xlabel("X (cm)")
         axis.grid(True)
 
-    source_file = _scalar_text(data.get("source_file", "")).strip()
-    title = Path(source_file).name if source_file else "Langmuir X-Line Results"
-    fig.suptitle(title)
+    _set_result_plot_title(fig, "Langmuir X-Line Multi-Ramp Results", data)
     return fig
 
 
-def plot_xy_summary(data):
+def plot_xy_summary(data, *, figure_title="Langmuir XY-Plane Results"):
     """Make the six-panel spatial-map summary for xy-plane results."""
     import matplotlib.pyplot as plt
 
@@ -650,9 +655,7 @@ def plot_xy_summary(data):
             bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "0.7"},
         )
 
-    source_file = _scalar_text(data.get("source_file", "")).strip()
-    title = Path(source_file).name if source_file else "Langmuir XY-Plane NPZ Results"
-    fig.suptitle(title)
+    _set_result_plot_title(fig, figure_title, data)
     return fig
 
 
@@ -680,13 +683,11 @@ def plot_xy_multi_ramp_summaries(data):
                 nramps,
             ):
                 ramp_data[key] = array[ramp_index]
-        figure = plot_xy_summary(ramp_data)
-        base_title = figure._suptitle.get_text() if figure._suptitle else ""
-        figure.suptitle(
-            f"{base_title} - Ramp {ramp_index + 1} "
+        title = (
+            f"Langmuir XY-Plane Results - Ramp {ramp_index + 1} "
             f"(center {ramp_times[ramp_index]:.6g} s)"
         )
-        figures.append(figure)
+        figures.append(plot_xy_summary(ramp_data, figure_title=title))
     return figures
 
 
